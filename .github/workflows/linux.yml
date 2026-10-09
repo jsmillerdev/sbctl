@@ -22,32 +22,40 @@ concurrency:
   group: linux-${{ github.ref }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
+# Most jobs call .github/actions/linux-test: Go, the build, the test command, and the upload of the
+# test's logs. A job keeps its own name, which the release gate (deploy/release-gate.sh) reads: the
+# jobs named `upgrade...`, and the run as a whole.
 jobs:
+  # The architectures of the two-architecture jobs, worked out once (see the concurrency note above).
+  plan:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+    steps:
+      - id: plan
+        env:
+          MATRIX: ${{ startsWith(github.ref, 'refs/heads/ws/') && '[{"runner":"ubuntu-24.04","arch":"amd64"}]' || '[{"runner":"ubuntu-24.04","arch":"amd64"},{"runner":"ubuntu-24.04-arm","arch":"arm64"}]' }}
+        run: |
+          echo "matrix=$MATRIX" >>"$GITHUB_OUTPUT"
+          echo "$MATRIX"
+
   systemd-smoke:
+    needs: plan
     strategy:
       fail-fast: false
       matrix:
-        include: ${{ fromJSON(startsWith(github.ref, 'refs/heads/ws/') && '[{"runner":"ubuntu-24.04","arch":"amd64"}]' || '[{"runner":"ubuntu-24.04","arch":"amd64"},{"runner":"ubuntu-24.04-arm","arch":"arm64"}]') }}
+        include: ${{ fromJSON(needs.plan.outputs.matrix) }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: ./.github/actions/linux-test
         with:
-          go-version-file: go.mod
-      - name: build supavise
-        run: CGO_ENABLED=0 go build -trimpath -o /tmp/supavise ./cmd/supavise
-      - name: systemd smoke
-        run: sudo LOG_DIR=/tmp/supavise-linux-logs SUPAVISE_BIN=/tmp/supavise tests/linux/systemd-smoke.sh
-      - if: always()
-        name: collect logs
-        run: sudo chmod -R a+rX /tmp/supavise-linux-logs || true
-      - if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: systemd-smoke-${{ matrix.arch }}
-          path: /tmp/supavise-linux-logs
-          if-no-files-found: ignore
+          name: systemd smoke
+          run: sudo LOG_DIR=/tmp/supavise-linux-logs SUPAVISE_BIN=/tmp/supavise tests/linux/systemd-smoke.sh
+          logs: /tmp/supavise-linux-logs
+          artifact: systemd-smoke-${{ matrix.arch }}
 
   backup-integration:
     runs-on: ubuntu-24.04
@@ -83,62 +91,46 @@ jobs:
         run: internal/proxy/pebble-test.sh
 
   fleet-smoke:
+    needs: plan
     strategy:
       fail-fast: false
       matrix:
-        include: ${{ fromJSON(startsWith(github.ref, 'refs/heads/ws/') && '[{"runner":"ubuntu-24.04","arch":"amd64"}]' || '[{"runner":"ubuntu-24.04","arch":"amd64"},{"runner":"ubuntu-24.04-arm","arch":"arm64"}]') }}
+        include: ${{ fromJSON(needs.plan.outputs.matrix) }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: ./.github/actions/linux-test
         with:
-          go-version-file: go.mod
-      - name: build supavise
-        run: CGO_ENABLED=0 go build -trimpath -o /tmp/supavise ./cmd/supavise
-      - name: fleet smoke
-        run: sudo LOG_DIR=/tmp/supavise-fleet-logs SUPAVISE_BIN=/tmp/supavise tests/linux/fleet-smoke.sh
-      - if: always()
-        name: collect logs
-        run: sudo chmod -R a+rX /tmp/supavise-fleet-logs || true
-      - if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: fleet-smoke-${{ matrix.arch }}
-          path: /tmp/supavise-fleet-logs
-          if-no-files-found: ignore
+          name: fleet smoke
+          run: sudo LOG_DIR=/tmp/supavise-fleet-logs SUPAVISE_BIN=/tmp/supavise tests/linux/fleet-smoke.sh
+          logs: /tmp/supavise-fleet-logs
+          artifact: fleet-smoke-${{ matrix.arch }}
 
   # The shared services of a follower node on a hot standby of the system cluster, and Storage
   # uploading to Garage with credentials the daemon serves from an assumed role (replica design,
   # workstream E).
   fleet-follower:
+    needs: plan
     strategy:
       fail-fast: false
       matrix:
-        include: ${{ fromJSON(startsWith(github.ref, 'refs/heads/ws/') && '[{"runner":"ubuntu-24.04","arch":"amd64"}]' || '[{"runner":"ubuntu-24.04","arch":"amd64"},{"runner":"ubuntu-24.04-arm","arch":"arm64"}]') }}
+        include: ${{ fromJSON(needs.plan.outputs.matrix) }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/garage
-      - uses: actions/setup-go@v5
+      - uses: ./.github/actions/linux-test
         with:
-          go-version-file: go.mod
-      - name: build supavise and the follower test
-        run: |
-          CGO_ENABLED=0 go build -trimpath -o /tmp/supavise ./cmd/supavise
-          CGO_ENABLED=0 go test -c -tags fleetfollower -o /tmp/fleet-follower.test ./internal/fleet
-      - name: fleet follower
-        run: sudo LOG_DIR=/tmp/supavise-follower-logs SUPAVISE_BIN=/tmp/supavise FLEET_FOLLOWER_TEST=/tmp/fleet-follower.test tests/linux/fleet-follower.sh
-      - if: always()
-        name: collect logs
-        run: sudo chmod -R a+rX /tmp/supavise-follower-logs || true
-      - if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: fleet-follower-${{ matrix.arch }}
-          path: /tmp/supavise-follower-logs
-          if-no-files-found: ignore
+          build-name: build supavise and the follower test
+          build: |
+            CGO_ENABLED=0 go build -trimpath -o /tmp/supavise ./cmd/supavise
+            CGO_ENABLED=0 go test -c -tags fleetfollower -o /tmp/fleet-follower.test ./internal/fleet
+          name: fleet follower
+          run: sudo LOG_DIR=/tmp/supavise-follower-logs SUPAVISE_BIN=/tmp/supavise FLEET_FOLLOWER_TEST=/tmp/fleet-follower.test tests/linux/fleet-follower.sh
+          logs: /tmp/supavise-follower-logs
+          artifact: fleet-follower-${{ matrix.arch }}
       - if: failure()
         run: docker logs garage | tail -50
 
@@ -149,10 +141,11 @@ jobs:
   # under config.d and nowhere else, --rollback with what was written and deleted on the bucket, a
   # second migration and --cleanup.
   storage-migrate:
+    needs: plan
     strategy:
       fail-fast: false
       matrix:
-        include: ${{ fromJSON(startsWith(github.ref, 'refs/heads/ws/') && '[{"runner":"ubuntu-24.04","arch":"amd64"}]' || '[{"runner":"ubuntu-24.04","arch":"amd64"},{"runner":"ubuntu-24.04-arm","arch":"arm64"}]') }}
+        include: ${{ fromJSON(needs.plan.outputs.matrix) }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     steps:
@@ -160,53 +153,34 @@ jobs:
       - uses: ./.github/actions/garage
         with:
           bucket: supavise-objects
-      - uses: actions/setup-go@v5
+      - uses: ./.github/actions/linux-test
         with:
-          go-version-file: go.mod
-      - name: build supavise
-        run: CGO_ENABLED=0 go build -trimpath -o /tmp/supavise ./cmd/supavise
-      - name: storage migrate
-        run: sudo LOG_DIR=/tmp/supavise-storage-migrate-logs SUPAVISE_BIN=/tmp/supavise tests/linux/storage-migrate.sh
-      - if: always()
-        name: collect logs
-        run: sudo chmod -R a+rX /tmp/supavise-storage-migrate-logs || true
+          name: storage migrate
+          run: sudo LOG_DIR=/tmp/supavise-storage-migrate-logs SUPAVISE_BIN=/tmp/supavise tests/linux/storage-migrate.sh
+          logs: /tmp/supavise-storage-migrate-logs
+          artifact: storage-migrate-${{ matrix.arch }}
       - if: failure()
         run: docker logs garage | tail -50
-      - if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: storage-migrate-${{ matrix.arch }}
-          path: /tmp/supavise-storage-migrate-logs
-          if-no-files-found: ignore
 
   # Dashboard writes under systemd: settings saved through the Management API change the
   # behavior of GoTrue, PostgREST, Storage, Realtime and Postgres; keys, the database password
   # and persistence across a pause.
   settings-smoke:
+    needs: plan
     strategy:
       fail-fast: false
       matrix:
-        include: ${{ fromJSON(startsWith(github.ref, 'refs/heads/ws/') && '[{"runner":"ubuntu-24.04","arch":"amd64"}]' || '[{"runner":"ubuntu-24.04","arch":"amd64"},{"runner":"ubuntu-24.04-arm","arch":"arm64"}]') }}
+        include: ${{ fromJSON(needs.plan.outputs.matrix) }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: ./.github/actions/linux-test
         with:
-          go-version-file: go.mod
-      - name: build supavise
-        run: CGO_ENABLED=0 go build -trimpath -o /tmp/supavise ./cmd/supavise
-      - name: settings smoke
-        run: sudo LOG_DIR=/tmp/supavise-settings-logs SUPAVISE_BIN=/tmp/supavise tests/linux/settings-smoke.sh
-      - if: always()
-        name: collect logs
-        run: sudo chmod -R a+rX /tmp/supavise-settings-logs || true
-      - if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: settings-smoke-${{ matrix.arch }}
-          path: /tmp/supavise-settings-logs
-          if-no-files-found: ignore
+          name: settings smoke
+          run: sudo LOG_DIR=/tmp/supavise-settings-logs SUPAVISE_BIN=/tmp/supavise tests/linux/settings-smoke.sh
+          logs: /tmp/supavise-settings-logs
+          artifact: settings-smoke-${{ matrix.arch }}
 
   # Per-project compute sizes under systemd on an XFS data volume with prjquota: Micro to Small
   # through the Management API (RESIZING, the unit's MemoryMax and CPUQuota, Postgres's settings,
@@ -214,59 +188,41 @@ jobs:
   # the node cannot hold refused, a downsize Postgres cannot start on rolled back, the CLI beside
   # the daemon, and the project's disk size as an XFS quota that stops a write.
   compute-smoke:
+    needs: plan
     strategy:
       fail-fast: false
       matrix:
-        include: ${{ fromJSON(startsWith(github.ref, 'refs/heads/ws/') && '[{"runner":"ubuntu-24.04","arch":"amd64"}]' || '[{"runner":"ubuntu-24.04","arch":"amd64"},{"runner":"ubuntu-24.04-arm","arch":"arm64"}]') }}
+        include: ${{ fromJSON(needs.plan.outputs.matrix) }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: ./.github/actions/linux-test
         with:
-          go-version-file: go.mod
-      - name: build supavise
-        run: CGO_ENABLED=0 go build -trimpath -o /tmp/supavise ./cmd/supavise
-      - name: compute smoke
-        run: sudo LOG_DIR=/tmp/supavise-compute-logs SUPAVISE_BIN=/tmp/supavise tests/linux/compute-smoke.sh
-      - if: always()
-        name: collect logs
-        run: sudo chmod -R a+rX /tmp/supavise-compute-logs || true
-      - if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: compute-smoke-${{ matrix.arch }}
-          path: /tmp/supavise-compute-logs
-          if-no-files-found: ignore
+          name: compute smoke
+          run: sudo LOG_DIR=/tmp/supavise-compute-logs SUPAVISE_BIN=/tmp/supavise tests/linux/compute-smoke.sh
+          logs: /tmp/supavise-compute-logs
+          artifact: compute-smoke-${{ matrix.arch }}
 
   # Backups and point-in-time restore through the Management API under systemd: the backup list
   # and the PITR add-on, a restore to a time between two writes (RESTORING, a second restore refused,
   # ACTIVE_HEALTHY, the data of that time), then a restore from the listed base backup.
   backups-smoke:
+    needs: plan
     strategy:
       fail-fast: false
       matrix:
-        include: ${{ fromJSON(startsWith(github.ref, 'refs/heads/ws/') && '[{"runner":"ubuntu-24.04","arch":"amd64"}]' || '[{"runner":"ubuntu-24.04","arch":"amd64"},{"runner":"ubuntu-24.04-arm","arch":"arm64"}]') }}
+        include: ${{ fromJSON(needs.plan.outputs.matrix) }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: ./.github/actions/linux-test
         with:
-          go-version-file: go.mod
-      - name: build supavise
-        run: CGO_ENABLED=0 go build -trimpath -o /tmp/supavise ./cmd/supavise
-      - name: backups smoke
-        run: sudo LOG_DIR=/tmp/supavise-backups-logs SUPAVISE_BIN=/tmp/supavise tests/linux/backups-smoke.sh
-      - if: always()
-        name: collect logs
-        run: sudo chmod -R a+rX /tmp/supavise-backups-logs || true
-      - if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: backups-smoke-${{ matrix.arch }}
-          path: /tmp/supavise-backups-logs
-          if-no-files-found: ignore
+          name: backups smoke
+          run: sudo LOG_DIR=/tmp/supavise-backups-logs SUPAVISE_BIN=/tmp/supavise tests/linux/backups-smoke.sh
+          logs: /tmp/supavise-backups-logs
+          artifact: backups-smoke-${{ matrix.arch }}
 
   # Project upgrades under systemd through the Management API and the CLI: projects created on
   # older GoTrue and PostgREST releases than the node's pins (real slim-services releases), kept on
@@ -274,30 +230,21 @@ jobs:
   # upgrade that works (versions, processes, data and the auth user intact, PostgreSQL untouched),
   # the CLI's `projects upgrade --all`, and artifact garbage collection.
   upgrade-smoke:
+    needs: plan
     strategy:
       fail-fast: false
       matrix:
-        include: ${{ fromJSON(startsWith(github.ref, 'refs/heads/ws/') && '[{"runner":"ubuntu-24.04","arch":"amd64"}]' || '[{"runner":"ubuntu-24.04","arch":"amd64"},{"runner":"ubuntu-24.04-arm","arch":"arm64"}]') }}
+        include: ${{ fromJSON(needs.plan.outputs.matrix) }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: ./.github/actions/linux-test
         with:
-          go-version-file: go.mod
-      - name: build supavise
-        run: CGO_ENABLED=0 go build -trimpath -o /tmp/supavise ./cmd/supavise
-      - name: upgrade smoke
-        run: sudo LOG_DIR=/tmp/supavise-upgrade-logs SUPAVISE_BIN=/tmp/supavise tests/linux/upgrade-smoke.sh
-      - if: always()
-        name: collect logs
-        run: sudo chmod -R a+rX /tmp/supavise-upgrade-logs || true
-      - if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: upgrade-smoke-${{ matrix.arch }}
-          path: /tmp/supavise-upgrade-logs
-          if-no-files-found: ignore
+          name: upgrade smoke
+          run: sudo LOG_DIR=/tmp/supavise-upgrade-logs SUPAVISE_BIN=/tmp/supavise tests/linux/upgrade-smoke.sh
+          logs: /tmp/supavise-upgrade-logs
+          artifact: upgrade-smoke-${{ matrix.arch }}
 
   # The node upgrade on a node the installer set up from the previous release (origin/main with older
   # pins): `supavise upgrade --check`, `--plan` and the refusals, the upgrade to a release served by a
@@ -306,10 +253,11 @@ jobs:
   # status 3), and `supavise rollback` with the registry rule. The job's name starts with `upgrade`:
   # the release gate (deploy/release-gate.sh) requires the jobs of this name.
   upgrade-e2e:
+    needs: plan
     strategy:
       fail-fast: false
       matrix:
-        include: ${{ fromJSON(startsWith(github.ref, 'refs/heads/ws/') && '[{"runner":"ubuntu-24.04","arch":"amd64"}]' || '[{"runner":"ubuntu-24.04","arch":"amd64"},{"runner":"ubuntu-24.04-arm","arch":"arm64"}]') }}
+        include: ${{ fromJSON(needs.plan.outputs.matrix) }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
     steps:
@@ -317,37 +265,27 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - uses: actions/setup-go@v5
+      - uses: ./.github/actions/linux-test
         with:
-          go-version-file: go.mod
-      - name: build the previous release and the releases it is upgraded to
-        run: tests/linux/upgrade-e2e-build.sh /tmp/upgrade-bins
-      - name: upgrade end to end
-        run: sudo LOG_DIR=/tmp/supavise-upgrade-e2e-logs UPGRADE_E2E_BIN_DIR=/tmp/upgrade-bins tests/linux/upgrade-e2e.sh
-      - if: always()
-        name: collect logs
-        run: sudo chmod -R a+rX /tmp/supavise-upgrade-e2e-logs || true
-      - if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: upgrade-e2e-${{ matrix.arch }}
-          path: /tmp/supavise-upgrade-e2e-logs
-          if-no-files-found: ignore
+          build-name: build the previous release and the releases it is upgraded to
+          build: tests/linux/upgrade-e2e-build.sh /tmp/upgrade-bins
+          name: upgrade end to end
+          run: sudo LOG_DIR=/tmp/supavise-upgrade-e2e-logs UPGRADE_E2E_BIN_DIR=/tmp/upgrade-bins tests/linux/upgrade-e2e.sh
+          logs: /tmp/supavise-upgrade-e2e-logs
+          artifact: upgrade-e2e-${{ matrix.arch }}
 
   # Members and roles under systemd: users with each role, Studio's permission list, a Read-only
   # PAT refused writes through the API, the real MCP server and Supabase CLI, invitations by mail.
   roles-smoke:
+    needs: plan
     strategy:
       fail-fast: false
       matrix:
-        include: ${{ fromJSON(startsWith(github.ref, 'refs/heads/ws/') && '[{"runner":"ubuntu-24.04","arch":"amd64"}]' || '[{"runner":"ubuntu-24.04","arch":"amd64"},{"runner":"ubuntu-24.04-arm","arch":"arm64"}]') }}
+        include: ${{ fromJSON(needs.plan.outputs.matrix) }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
-        with:
-          go-version-file: go.mod
       - uses: actions/setup-node@v4
         with:
           node-version: 22
@@ -355,19 +293,12 @@ jobs:
         run: |
           npm install --prefix /tmp/sbcli supabase@2.119.0
           /tmp/sbcli/node_modules/.bin/supabase --version
-      - name: build supavise
-        run: CGO_ENABLED=0 go build -trimpath -o /tmp/supavise ./cmd/supavise
-      - name: roles smoke
-        run: sudo env "PATH=$PATH" LOG_DIR=/tmp/supavise-roles-logs SUPAVISE_BIN=/tmp/supavise SUPABASE_CLI=/tmp/sbcli/node_modules/.bin/supabase REQUIRE_CLIENTS=1 tests/linux/roles-smoke.sh
-      - if: always()
-        name: collect logs
-        run: sudo chmod -R a+rX /tmp/supavise-roles-logs || true
-      - if: always()
-        uses: actions/upload-artifact@v4
+      - uses: ./.github/actions/linux-test
         with:
-          name: roles-smoke-${{ matrix.arch }}
-          path: /tmp/supavise-roles-logs
-          if-no-files-found: ignore
+          name: roles smoke
+          run: sudo env "PATH=$PATH" LOG_DIR=/tmp/supavise-roles-logs SUPAVISE_BIN=/tmp/supavise SUPABASE_CLI=/tmp/sbcli/node_modules/.bin/supabase REQUIRE_CLIENTS=1 tests/linux/roles-smoke.sh
+          logs: /tmp/supavise-roles-logs
+          artifact: roles-smoke-${{ matrix.arch }}
 
   # OAuth sign-in for MCP clients under systemd, without Studio (tests/linux/oauth/oauth-walk.mjs, steps
   # L-01 to L-14, the contract of docs/design.md section 13): dynamic registration, authorize and consent, the token
@@ -376,33 +307,24 @@ jobs:
   # that no secret sits in a table, an audit event or the journal. The real stdio MCP server runs with an
   # OAuth access token. The /mcp checks that need Studio run in the `mcp-e2e` job of studio.yml.
   oauth-smoke:
+    needs: plan
     strategy:
       fail-fast: false
       matrix:
-        include: ${{ fromJSON(startsWith(github.ref, 'refs/heads/ws/') && '[{"runner":"ubuntu-24.04","arch":"amd64"}]' || '[{"runner":"ubuntu-24.04","arch":"amd64"},{"runner":"ubuntu-24.04-arm","arch":"arm64"}]') }}
+        include: ${{ fromJSON(needs.plan.outputs.matrix) }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
-        with:
-          go-version-file: go.mod
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-      - name: build supavise
-        run: CGO_ENABLED=0 go build -trimpath -o /tmp/supavise ./cmd/supavise
-      - name: oauth smoke
-        run: sudo env "PATH=$PATH" LOG_DIR=/tmp/supavise-oauth-logs SUPAVISE_BIN=/tmp/supavise REQUIRE_CLIENTS=1 tests/linux/oauth-smoke.sh
-      - if: always()
-        name: collect logs
-        run: sudo chmod -R a+rX /tmp/supavise-oauth-logs || true
-      - if: always()
-        uses: actions/upload-artifact@v4
+      - uses: ./.github/actions/linux-test
         with:
-          name: oauth-smoke-${{ matrix.arch }}
-          path: /tmp/supavise-oauth-logs
-          if-no-files-found: ignore
+          name: oauth smoke
+          run: sudo env "PATH=$PATH" LOG_DIR=/tmp/supavise-oauth-logs SUPAVISE_BIN=/tmp/supavise REQUIRE_CLIENTS=1 tests/linux/oauth-smoke.sh
+          logs: /tmp/supavise-oauth-logs
+          artifact: oauth-smoke-${{ matrix.arch }}
 
   # Single sign-on under systemd against a real SAML identity provider (SimpleSAMLphp in a
   # container; the image is amd64 only): the dashboard's providers and default roles, a person
@@ -413,9 +335,6 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
-        with:
-          go-version-file: go.mod
       - uses: actions/setup-node@v4
         with:
           node-version: 22
@@ -427,52 +346,38 @@ jobs:
       # it with sudo, so a changed tag must not change what runs. tests/linux/sso-smoke.sh names the same digest.
       - name: identity provider image
         run: docker pull kristophjunge/test-saml-idp@sha256:02a6e56c01f94b9ba3f2151f33acedf4606ac9b7eeb62a874c5a6b032c0fa9cc
-      - name: build supavise
-        run: CGO_ENABLED=0 go build -trimpath -o /tmp/supavise ./cmd/supavise
-      - name: sso smoke
-        run: sudo env "PATH=$PATH" LOG_DIR=/tmp/supavise-sso-logs SUPAVISE_BIN=/tmp/supavise SUPABASE_CLI=/tmp/sbcli/node_modules/.bin/supabase tests/linux/sso-smoke.sh
-      - if: always()
-        name: collect logs
-        run: sudo chmod -R a+rX /tmp/supavise-sso-logs || true
-      - if: always()
-        uses: actions/upload-artifact@v4
+      - uses: ./.github/actions/linux-test
         with:
-          name: sso-smoke
-          path: /tmp/supavise-sso-logs
-          if-no-files-found: ignore
+          name: sso smoke
+          run: sudo env "PATH=$PATH" LOG_DIR=/tmp/supavise-sso-logs SUPAVISE_BIN=/tmp/supavise SUPABASE_CLI=/tmp/sbcli/node_modules/.bin/supabase tests/linux/sso-smoke.sh
+          logs: /tmp/supavise-sso-logs
+          artifact: sso-smoke
 
   # The installer on a fresh VM: deploy/install.sh, the claim flow, a project through the
   # Management API with a PAT, REST through the proxy, the pooler, a re-run, self-update.
   install-e2e:
+    needs: plan
     strategy:
       fail-fast: false
       matrix:
-        include: ${{ fromJSON(startsWith(github.ref, 'refs/heads/ws/') && '[{"runner":"ubuntu-24.04","arch":"amd64"}]' || '[{"runner":"ubuntu-24.04","arch":"amd64"},{"runner":"ubuntu-24.04-arm","arch":"arm64"}]') }}
+        include: ${{ fromJSON(needs.plan.outputs.matrix) }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: ./.github/actions/linux-test
         with:
-          go-version-file: go.mod
-      - name: build supavise v0.0.1, v0.0.2 (installer upgrade) and v0.0.3 (self-update target)
-        run: |
-          CGO_ENABLED=0 go build -trimpath -ldflags "-X main.version=v0.0.1" -o /tmp/supavise ./cmd/supavise
-          CGO_ENABLED=0 go build -trimpath -ldflags "-X main.version=v0.0.2" -o /tmp/supavise-v2 ./cmd/supavise
-          CGO_ENABLED=0 go build -trimpath -ldflags "-X main.version=v0.0.3" -o /tmp/supavise-v3 ./cmd/supavise
-          # deploy/release-assets.sh writes the signed release manifest with this (root has no Go toolchain).
-          go build -o /tmp/releasetool ./deploy/releasetool
-      - name: install end to end
-        run: sudo LOG_DIR=/tmp/supavise-install-logs SUPAVISE_BIN=/tmp/supavise SUPAVISE_BIN_V2=/tmp/supavise-v2 SUPAVISE_BIN_V3=/tmp/supavise-v3 SUPAVISE_RELEASETOOL=/tmp/releasetool tests/linux/install-e2e.sh
-      - if: always()
-        name: collect logs
-        run: sudo chmod -R a+rX /tmp/supavise-install-logs || true
-      - if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: install-e2e-${{ matrix.arch }}
-          path: /tmp/supavise-install-logs
-          if-no-files-found: ignore
+          build-name: build supavise v0.0.1, v0.0.2 (installer upgrade) and v0.0.3 (self-update target)
+          build: |
+            CGO_ENABLED=0 go build -trimpath -ldflags "-X main.version=v0.0.1" -o /tmp/supavise ./cmd/supavise
+            CGO_ENABLED=0 go build -trimpath -ldflags "-X main.version=v0.0.2" -o /tmp/supavise-v2 ./cmd/supavise
+            CGO_ENABLED=0 go build -trimpath -ldflags "-X main.version=v0.0.3" -o /tmp/supavise-v3 ./cmd/supavise
+            # deploy/release-assets.sh writes the signed release manifest with this (root has no Go toolchain).
+            go build -o /tmp/releasetool ./deploy/releasetool
+          name: install end to end
+          run: sudo LOG_DIR=/tmp/supavise-install-logs SUPAVISE_BIN=/tmp/supavise SUPAVISE_BIN_V2=/tmp/supavise-v2 SUPAVISE_BIN_V3=/tmp/supavise-v3 SUPAVISE_RELEASETOOL=/tmp/releasetool tests/linux/install-e2e.sh
+          logs: /tmp/supavise-install-logs
+          artifact: install-e2e-${{ matrix.arch }}
 
   # Unattended OS security updates on the distributions we support: the apt configuration that
   # `supavise system os-updates` writes, read back through apt-config and through unattended-upgrade
@@ -487,39 +392,27 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: ./.github/actions/linux-test
         with:
-          go-version-file: go.mod
-      - name: build supavise
-        run: CGO_ENABLED=0 go build -trimpath -o /tmp/supavise ./cmd/supavise
-      - name: os-updates in ${{ matrix.image }}
-        run: docker run --rm -v /tmp/supavise:/supavise:ro -v "$PWD":/repo:ro "${{ matrix.image }}" bash /repo/tests/linux/os-updates.sh
+          name: os-updates in ${{ matrix.image }}
+          run: docker run --rm -v /tmp/supavise:/supavise:ro -v "$PWD":/repo:ro "${{ matrix.image }}" bash /repo/tests/linux/os-updates.sh
 
   functions-smoke:
+    needs: plan
     strategy:
       fail-fast: false
       matrix:
-        include: ${{ fromJSON(startsWith(github.ref, 'refs/heads/ws/') && '[{"runner":"ubuntu-24.04","arch":"amd64"}]' || '[{"runner":"ubuntu-24.04","arch":"amd64"},{"runner":"ubuntu-24.04-arm","arch":"arm64"}]') }}
+        include: ${{ fromJSON(needs.plan.outputs.matrix) }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: ./.github/actions/linux-test
         with:
-          go-version-file: go.mod
-      - name: build supavise
-        run: CGO_ENABLED=0 go build -trimpath -o /tmp/supavise ./cmd/supavise
-      - name: functions smoke
-        run: sudo LOG_DIR=/tmp/supavise-functions-logs SUPAVISE_BIN=/tmp/supavise tests/linux/functions-smoke.sh
-      - if: always()
-        name: collect logs
-        run: sudo chmod -R a+rX /tmp/supavise-functions-logs || true
-      - if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: functions-smoke-${{ matrix.arch }}
-          path: /tmp/supavise-functions-logs
-          if-no-files-found: ignore
+          name: functions smoke
+          run: sudo LOG_DIR=/tmp/supavise-functions-logs SUPAVISE_BIN=/tmp/supavise tests/linux/functions-smoke.sh
+          logs: /tmp/supavise-functions-logs
+          artifact: functions-smoke-${{ matrix.arch }}
 
   # Branch clones on real filesystems: copy-on-write on XFS (a loop file with reflink=1) and
   # the base-backup fallback on the runner's ext4 root, each with a parent of about 1 GB; then
@@ -564,10 +457,11 @@ jobs:
   # without the failure converges and restarts no project), and the refusals of install.sh
   # --join-token-file and install --aws-first-boot off EC2.
   converge-e2e:
+    needs: plan
     strategy:
       fail-fast: false
       matrix:
-        include: ${{ fromJSON(startsWith(github.ref, 'refs/heads/ws/') && '[{"runner":"ubuntu-24.04","arch":"amd64"}]' || '[{"runner":"ubuntu-24.04","arch":"amd64"},{"runner":"ubuntu-24.04-arm","arch":"arm64"}]') }}
+        include: ${{ fromJSON(needs.plan.outputs.matrix) }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     steps:
@@ -575,59 +469,52 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - uses: actions/setup-go@v5
+      - uses: ./.github/actions/linux-test
         with:
-          go-version-file: go.mod
-      - name: build the previous release and this checkout
-        run: |
-          git fetch --no-tags origin main
-          base=$(git merge-base HEAD FETCH_HEAD)
-          git worktree add --detach /tmp/prev-tree "$base"
-          (cd /tmp/prev-tree && CGO_ENABLED=0 go build -trimpath -ldflags "-X main.version=v0.1.1" -o /tmp/supavise-prev ./cmd/supavise)
-          CGO_ENABLED=0 go build -trimpath -ldflags "-X main.version=v0.2.0" -o /tmp/supavise-new ./cmd/supavise
-          CGO_ENABLED=0 go build -trimpath -ldflags "-X main.version=v0.2.1" -o /tmp/supavise-next ./cmd/supavise
-          go build -o /tmp/releasetool ./deploy/releasetool
-      - name: converge end to end
-        run: sudo LOG_DIR=/tmp/supavise-converge-logs SUPAVISE_BIN_PREV=/tmp/supavise-prev SUPAVISE_BIN=/tmp/supavise-new SUPAVISE_BIN_NEXT=/tmp/supavise-next SUPAVISE_RELEASETOOL=/tmp/releasetool tests/linux/converge-e2e.sh
-      - if: always()
-        name: collect logs
-        run: sudo chmod -R a+rX /tmp/supavise-converge-logs || true
-      - if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: converge-e2e-${{ matrix.arch }}
-          path: /tmp/supavise-converge-logs
-          if-no-files-found: ignore
+          build-name: build the previous release and this checkout
+          build: |
+            git fetch --no-tags origin main
+            base=$(git merge-base HEAD FETCH_HEAD)
+            git worktree add --detach /tmp/prev-tree "$base"
+            (cd /tmp/prev-tree && CGO_ENABLED=0 go build -trimpath -ldflags "-X main.version=v0.1.1" -o /tmp/supavise-prev ./cmd/supavise)
+            CGO_ENABLED=0 go build -trimpath -ldflags "-X main.version=v0.2.0" -o /tmp/supavise-new ./cmd/supavise
+            CGO_ENABLED=0 go build -trimpath -ldflags "-X main.version=v0.2.1" -o /tmp/supavise-next ./cmd/supavise
+            go build -o /tmp/releasetool ./deploy/releasetool
+          name: converge end to end
+          run: sudo LOG_DIR=/tmp/supavise-converge-logs SUPAVISE_BIN_PREV=/tmp/supavise-prev SUPAVISE_BIN=/tmp/supavise-new SUPAVISE_BIN_NEXT=/tmp/supavise-next SUPAVISE_RELEASETOOL=/tmp/releasetool tests/linux/converge-e2e.sh
+          logs: /tmp/supavise-converge-logs
+          artifact: converge-e2e-${{ matrix.arch }}
 
   # First boot of an EC2 instance (`supavise install --aws-first-boot`) on loop devices with the real
   # blkid, lsblk, findmnt, mkfs.xfs, mount and xfs_quota: a blank device found through udev-style
   # links and made XFS with enforced project quotas, the bind mount of /etc/supavise, fstab and the
   # mount drop-ins, a repeat run that changes nothing, and a device with ext4 that is left alone.
   firstboot-e2e:
+    needs: plan
     strategy:
       fail-fast: false
       matrix:
-        include: ${{ fromJSON(startsWith(github.ref, 'refs/heads/ws/') && '[{"runner":"ubuntu-24.04","arch":"amd64"}]' || '[{"runner":"ubuntu-24.04","arch":"amd64"},{"runner":"ubuntu-24.04-arm","arch":"arm64"}]') }}
+        include: ${{ fromJSON(needs.plan.outputs.matrix) }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: ./.github/actions/linux-test
         with:
-          go-version-file: go.mod
-      - name: build the test binary
-        run: go test -c -o /tmp/hostsetup.test ./internal/hostsetup
-      - name: first boot on loop devices
-        run: sudo SUPAVISE_HOSTSETUP_TEST=/tmp/hostsetup.test tests/linux/firstboot-e2e.sh
+          build-name: build the test binary
+          build: go test -c -o /tmp/hostsetup.test ./internal/hostsetup
+          name: first boot on loop devices
+          run: sudo SUPAVISE_HOSTSETUP_TEST=/tmp/hostsetup.test tests/linux/firstboot-e2e.sh
 
   # The replica data plane on real clusters, one machine playing two nodes: a standby seeded from a
   # base backup, streaming, PostgREST on the standby seeing DDL within the reload interval, a
   # switchover (promote and demote in place), pg_cron and pg_net idle on a standby.
   replica-blocks:
+    needs: plan
     strategy:
       fail-fast: false
       matrix:
-        include: ${{ fromJSON(startsWith(github.ref, 'refs/heads/ws/') && '[{"runner":"ubuntu-24.04","arch":"amd64"}]' || '[{"runner":"ubuntu-24.04","arch":"amd64"},{"runner":"ubuntu-24.04-arm","arch":"arm64"}]') }}
+        include: ${{ fromJSON(needs.plan.outputs.matrix) }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
     steps:
@@ -653,26 +540,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/garage
-      - uses: actions/setup-go@v5
+      - uses: ./.github/actions/linux-test
         with:
-          go-version-file: go.mod
-      - name: build supavise
-        run: CGO_ENABLED=0 go build -trimpath -o /tmp/supavise ./cmd/supavise
-      - name: cluster identity
-        run: |
-          sudo LOG_DIR=/tmp/supavise-cluster-logs SUPAVISE_BIN=/tmp/supavise \
-            S3_ENDPOINT=http://127.0.0.1:9000 S3_BUCKET=supavise-test \
-            S3_ACCESS_KEY=GK0123456789abcdef01234567 \
-            S3_SECRET_KEY=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef \
-            tests/linux/cluster-identity.sh
-      - if: always()
-        name: collect logs
-        run: sudo chmod -R a+rX /tmp/supavise-cluster-logs || true
-      - if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: cluster-identity
-          path: /tmp/supavise-cluster-logs
-          if-no-files-found: ignore
+          name: cluster identity
+          run: |
+            sudo LOG_DIR=/tmp/supavise-cluster-logs SUPAVISE_BIN=/tmp/supavise \
+              S3_ENDPOINT=http://127.0.0.1:9000 S3_BUCKET=supavise-test \
+              S3_ACCESS_KEY=GK0123456789abcdef01234567 \
+              S3_SECRET_KEY=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef \
+              tests/linux/cluster-identity.sh
+          logs: /tmp/supavise-cluster-logs
+          artifact: cluster-identity
       - if: failure()
         run: docker logs garage | tail -50

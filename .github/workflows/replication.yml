@@ -35,12 +35,28 @@ defaults:
     shell: bash
 
 jobs:
+  # The architectures of the job below, worked out once: amd64 only for a push to a ws/** branch, both otherwise
+  # (a dispatch on a ws/** branch included, as the header says).
+  plan:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+    steps:
+      - id: plan
+        env:
+          MATRIX: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/heads/ws/') && '[{"runner":"ubuntu-24.04","arch":"amd64"}]' || '[{"runner":"ubuntu-24.04","arch":"amd64"},{"runner":"ubuntu-24.04-arm","arch":"arm64"}]' }}
+        run: |
+          echo "matrix=$MATRIX" >>"$GITHUB_OUTPUT"
+          echo "$MATRIX"
+
   two-servers:
     name: two-servers (${{ matrix.arch }})
+    needs: plan
     strategy:
       fail-fast: false
       matrix:
-        include: ${{ fromJSON(github.event_name == 'push' && startsWith(github.ref, 'refs/heads/ws/') && '[{"runner":"ubuntu-24.04","arch":"amd64"}]' || '[{"runner":"ubuntu-24.04","arch":"amd64"},{"runner":"ubuntu-24.04-arm","arch":"arm64"}]') }}
+        include: ${{ fromJSON(needs.plan.outputs.matrix) }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 150
     steps:
