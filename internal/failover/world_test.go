@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"os"
 	"sort"
 	"strings"
 	"sync"
@@ -19,6 +20,7 @@ import (
 	"github.com/supavise/supavise/internal/failover/fenced"
 	"github.com/supavise/supavise/internal/mesh/peerapi"
 	"github.com/supavise/supavise/internal/registry"
+	"github.com/supavise/supavise/internal/units"
 )
 
 // world is a cluster of fake nodes for the tests of the orchestrator: it implements every port,
@@ -252,7 +254,13 @@ func (w *world) log(format string, args ...any) {
 // the file the orchestrator wrote, on another by the hold the fake peer took.
 func (w *world) noteHold(node, ref string) {
 	held := false
-	if node == w.self {
+	if node == w.self && ref == config.SystemRef {
+		// The system cluster is held by its launcher: moved aside, since systemd starts the cluster by itself.
+		files := units.FilesFor(w.cfg, units.Spec{Service: config.SvcPostgres, Ref: ref})
+		_, runErr := os.Stat(files.Run)
+		_, heldErr := os.Stat(files.Held())
+		held = errors.Is(runErr, os.ErrNotExist) && heldErr == nil
+	} else if node == w.self {
 		r, err := fenced.Project(w.cfg.Paths(), ref)
 		held = err == nil && r != nil && r.Planned
 	} else {

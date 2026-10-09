@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -130,12 +131,16 @@ func Rejoin(ctx context.Context, o RejoinOptions) (*RejoinResult, error) {
 	if err := markFollower(dir, creds.NodeID, addr, firstNonEmpty(resp.System.Leader, want), now()); err != nil {
 		return nil, fmt.Errorf("cluster: writing %s: %w", FollowerFile, err)
 	}
-	st := &JoinState{NodeID: creds.NodeID, Leader: addr, System: resp.System, At: now().UTC()}
+	st := &JoinState{NodeID: creds.NodeID, Leader: addr, System: resp.System, At: now().UTC(), Rebuild: refsOfDiverged(o.Cfg, moved)}
+	// A rejoin that runs again finds no project data to set aside (the first run moved it): the projects
+	// it named are in the state it left.
+	if prev, perr := ReadJoinState(dir); perr == nil && prev.NodeID == st.NodeID {
+		st.Rebuild = unionRefs(prev.Rebuild, st.Rebuild)
+	}
 	if err := writeJSON(filepath.Join(dir, JoinStateFile), st); err != nil {
 		return nil, err
 	}
-	jo := &JoinOptions{Cfg: o.Cfg, ConfigPath: o.ConfigPath, Seed: o.Seed, DSNs: o.DSNs, StreamTimeout: o.StreamTimeout, Streaming: o.Streaming, Log: log, Now: o.Now,
-		Rebuild: refsOfDiverged(o.Cfg, moved)}
+	jo := &JoinOptions{Cfg: o.Cfg, ConfigPath: o.ConfigPath, Seed: o.Seed, DSNs: o.DSNs, StreamTimeout: o.StreamTimeout, Streaming: o.Streaming, Log: log, Now: o.Now}
 	if err := jo.stream(ctx, dir, st); err != nil {
 		return nil, fmt.Errorf("%w; run `supavise node join --resume` to continue (the old data is kept under data.diverged-*)", err)
 	}
@@ -158,6 +163,20 @@ func refsOfDiverged(cfg *config.Config, moved []string) []string {
 		refs = append(refs, ref)
 	}
 	return refs
+}
+
+// unionRefs is the sorted union of two lists of refs.
+func unionRefs(a, b []string) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, r := range append(append([]string{}, a...), b...) {
+		if !seen[r] {
+			seen[r] = true
+			out = append(out, r)
+		}
+	}
+	sort.Strings(out)
+	return out
 }
 
 // divergedMark is the infix of the directories MoveDiverged creates.

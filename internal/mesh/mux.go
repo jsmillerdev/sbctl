@@ -99,12 +99,25 @@ func newSession(conn net.Conn, client bool, cfg *smux.Config) (Session, error) {
 	return session{s}, nil
 }
 
+// ownedWrites hands smux a buffer of its own for every write. smux queues the caller's slice for its
+// send loop and returns from Write, with an error, when the session dies or the write times out before
+// the loop has sent it; the loop then still reads the slice while the caller (net/http's bufio writer, an
+// io.Copy buffer) reuses it. That is a data race and, on the wire, the wrong bytes in a frame of a session
+// that is already lost. TestForwardingSurvivesASessionLoss found it under -race.
+type ownedWrites struct{ net.Conn }
+
+func (o ownedWrites) Write(p []byte) (int, error) {
+	b := make([]byte, len(p))
+	copy(b, p)
+	return o.Conn.Write(b)
+}
+
 func (m session) OpenStream() (net.Conn, error) {
 	st, err := m.s.OpenStream()
 	if err != nil {
 		return nil, err
 	}
-	return st, nil
+	return ownedWrites{st}, nil
 }
 
 func (m session) AcceptStream() (net.Conn, error) {
@@ -112,7 +125,7 @@ func (m session) AcceptStream() (net.Conn, error) {
 	if err != nil {
 		return nil, err
 	}
-	return st, nil
+	return ownedWrites{st}, nil
 }
 
 func (m session) Close() error               { return m.s.Close() }

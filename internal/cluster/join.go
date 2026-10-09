@@ -95,6 +95,10 @@ type JoinState struct {
 	Leader string                  `json:"leader"` // host:port of the leader's peer listener
 	System peerapi.SystemBootstrap `json:"system"` // how to seed the standby
 	At     time.Time               `json:"at"`
+	// Rebuild lists the projects a rejoin set aside, kept here so that `node join --resume` and a second
+	// `node rejoin` hand them to the leader too: the data is under data.diverged-* by then, and nothing
+	// else says which projects the node had.
+	Rebuild []string `json:"rebuild,omitempty"`
 }
 
 // JoinResult is what a finished join tells the caller.
@@ -442,7 +446,7 @@ func (o *JoinOptions) stream(ctx context.Context, dir string, st *JoinState) err
 	if err != nil {
 		return err
 	}
-	if err := c.Call(ctx, "POST", peerapi.PathJoinConfirm, peerapi.JoinConfirm{NodeID: st.NodeID, ReplayLSN: lsn, Rebuild: o.Rebuild}, nil); err != nil {
+	if err := c.Call(ctx, "POST", peerapi.PathJoinConfirm, peerapi.JoinConfirm{NodeID: st.NodeID, ReplayLSN: lsn, Rebuild: unionRefs(o.Rebuild, st.Rebuild)}, nil); err != nil {
 		return fmt.Errorf("cluster: the leader did not confirm the join: %w", err)
 	}
 	return nil

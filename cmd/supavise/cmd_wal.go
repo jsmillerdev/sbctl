@@ -59,8 +59,9 @@ func init() {
 		Use:   "fetch --ref <ref> <name> <dest>",
 		Short: "Restore one WAL file from the archive (restore_command; %f %p)",
 		Long: "Writes the archived WAL file <name> of <ref> to <dest>. A file that is not in the\n" +
-			"archive exits 1; an archive that cannot be read exits 126, which aborts recovery,\n" +
-			"and so does a daemon that does not answer on --socket.",
+			"archive exits 1; an archive that cannot be read exits 126, which aborts recovery.\n" +
+			"A daemon that does not answer on --socket is waited for (up to two minutes, so that a standby\n" +
+			"survives a restart of the daemon); one that is still silent aborts recovery too.",
 		Args: cobra.ExactArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx, cancel := context.WithTimeout(cmd.Context(), walFetchTimeout)

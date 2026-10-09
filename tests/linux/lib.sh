@@ -393,6 +393,12 @@ assert_os_updates() { # on|off
       run=$(timeout 240 unattended-upgrade --dry-run --debug 2>&1 || true)
       origins=$(grep -m1 'Allowed origins are' <<<"$run" || true)
       [[ -n $origins ]] && break
+      # A run of the distribution's apt-daily-upgrade that takes the first security updates of a fresh runner can hold the lock
+      # for longer than this wait ("Lock file is already taken"). After a minute of that it is stopped (SIGTERM: unattended-upgrade
+      # ends the package it is on, which leaves dpkg consistent) and the dry run asks again; the timers stay as the step set them.
+      if ((n >= 6)) && grep -q 'Lock file is already taken' <<<"$run"; then
+        systemctl stop apt-daily-upgrade.service apt-daily.service >/dev/null 2>&1 || true
+      fi
       sleep 10
     done
     [[ -n $origins ]] || fail "unattended-upgrade printed no allowed origins: $(tail -15 <<<"$run")"

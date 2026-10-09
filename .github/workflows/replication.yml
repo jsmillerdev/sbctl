@@ -13,8 +13,8 @@ name: replication
 # runs amd64 only, as linux.yml does; integrate/** and a dispatch run both architectures.
 #
 # deploy/release-gate.sh requires it (the jobs named two-servers). The gate accepts a workflow_dispatch run on the
-# tagged commit: `gh workflow run replication.yml --ref <branch>`, then tag. A run takes 35 to 75 minutes when every
-# check passes and is cut off at 150 when a wait times out; the gate waits for three hours (GATE_TIMEOUT_SECONDS).
+# tagged commit: `gh workflow run replication.yml --ref <branch>`, then tag. A run took 9 to 15 minutes per job in the three
+# runs measured (the architectures run in parallel) and is cut off at 150 when a wait times out; the gate waits for three hours (GATE_TIMEOUT_SECONDS).
 on:
   push:
     branches: ["ws/rep-x2", "ws/rep-fx", "integrate/**"]

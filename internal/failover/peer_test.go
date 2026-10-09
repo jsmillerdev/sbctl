@@ -384,6 +384,9 @@ func (brokenStore) ListReplicas(context.Context, string) ([]registry.Replica, er
 func TestQuiesceStopsEverythingInOrderAndReportsWhereEachStopped(t *testing.T) {
 	w := newWorld(t) // n1 leads
 	o := w.orch()
+	sysFiles := units.FilesFor(w.cfg, units.Spec{Service: config.SvcPostgres, Ref: config.SystemRef})
+	must(t, os.MkdirAll(filepath.Dir(sysFiles.Run), 0o755))
+	must(t, os.WriteFile(sysFiles.Run, []byte("#!/bin/sh\n"), 0o750))
 	var res QuiesceResult
 	rec := serve(t, o, "POST "+PathQuiesce, PathQuiesce, "n2", QuiesceRequest{Epoch: 2, To: "n2"}, &res)
 	if rec.Code != http.StatusOK {
@@ -406,7 +409,7 @@ func TestQuiesceStopsEverythingInOrderAndReportsWhereEachStopped(t *testing.T) {
 		t.Fatalf("maintenance: %+v", cl.Maintenance)
 	}
 	// Each project is held before it stops, so that a restart of the daemon between the stop and the move of
-	// the home does not start it again; the system cluster is no project's primary and is not held.
+	// the home does not start it again.
 	for _, ref := range []string{refA, refB} {
 		if !w.heldAtStop[w.self+"/"+ref] {
 			t.Errorf("%s was not held when it stopped", ref)
@@ -415,8 +418,17 @@ func TestQuiesceStopsEverythingInOrderAndReportsWhereEachStopped(t *testing.T) {
 			t.Errorf("the hold of %s: %+v", ref, r)
 		}
 	}
-	if w.heldAtStop[w.self+"/"+config.SystemRef] {
-		t.Error("the system cluster was held")
+	// The system cluster is held by its launcher, which systemd needs to start the unit: a restart of the
+	// daemon (supavise.service wants the cluster) or a reboot between the stop and the new leader's
+	// epoch must not start it as a second writable primary.
+	if !w.heldAtStop[w.self+"/"+config.SystemRef] {
+		t.Error("the launcher of the system cluster was still in place when the cluster stopped")
+	}
+	if _, err := os.Stat(sysFiles.Run); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("the launcher of the system cluster is back in place after the quiesce: %v", err)
+	}
+	if _, err := os.Stat(sysFiles.Held()); err != nil {
+		t.Errorf("the held launcher of the system cluster: %v", err)
 	}
 }
 

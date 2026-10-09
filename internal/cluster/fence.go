@@ -50,6 +50,10 @@ func FenceLocal(ctx context.Context, cfg *config.Config, sup units.Supervisor, l
 			if err := os.Remove(run); err != nil && !errors.Is(err, fs.ErrNotExist) {
 				note(err)
 			}
+			// A launcher that a planned stop held (moved aside) goes too, or a later start would put it back.
+			if err := os.Remove(run + ".held"); err != nil && !errors.Is(err, fs.ErrNotExist) {
+				note(err)
+			}
 			st, err := sup.Status(ctx, unit)
 			if err != nil || !running(st) {
 				continue

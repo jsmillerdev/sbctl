@@ -256,3 +256,53 @@ func TestStartSystemDatabaseNeedsNoRegistryAndNoCredentials(t *testing.T) {
 		t.Fatalf("a fenced node started its system cluster: %v", err)
 	}
 }
+
+// A planned stop moves the launcher of the system cluster aside so that systemd does not start it
+// again; starting the cluster puts the launcher back, and a fenced node does not.
+func TestStartSystemDatabasePutsAHeldLauncherBack(t *testing.T) {
+	ctx := context.Background()
+	f := newReplicaFixture(t)
+	pl := NewPostgresPlane(f.cfg, f.sup, fakeArts{}, registry.NewMemory(), PlaneOptions{PostgresReadyTimeout: 200 * time.Millisecond})
+	files := units.FilesFor(f.cfg, units.Spec{Service: config.SvcPostgres, Ref: config.SystemRef})
+	if err := os.MkdirAll(filepath.Dir(files.Run), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(files.Run, []byte("#!/bin/sh\n"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	for range 2 { // the hold is repeatable
+		if err := files.Hold(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := os.Stat(files.Run); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("the launcher is still in place: %v", err)
+	}
+
+	if err := fenced.WriteNode(f.cfg.Paths(), fenced.Record{Epoch: 4, Leader: "n2", Reason: "replaced by n2"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := pl.StartSystemDatabase(ctx); !errors.Is(err, ErrFenced) {
+		t.Fatalf("a fenced node started its system cluster: %v", err)
+	}
+	if _, err := os.Stat(files.Run); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("a fenced node got its launcher back: %v", err)
+	}
+	if err := fenced.ClearNode(f.cfg.Paths()); err != nil {
+		t.Fatal(err)
+	}
+
+	// The unit is started; nothing answers on the socket of a test, so the wait ends in its own error.
+	if err := pl.StartSystemDatabase(ctx); err == nil || !strings.Contains(err.Error(), "not ready") {
+		t.Fatalf("StartSystemDatabase = %v", err)
+	}
+	if _, err := os.Stat(files.Run); err != nil {
+		t.Fatalf("the launcher was not put back: %v", err)
+	}
+	if _, err := os.Stat(files.Held()); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("the held copy is still there: %v", err)
+	}
+	if !strings.Contains(f.sup.ops(), "start supavise-postgres@system.service") {
+		t.Fatalf("the system unit was not started:\n%s", f.sup.ops())
+	}
+}

@@ -448,9 +448,11 @@ func (o *Orchestrator) fencePrimaries(ctx context.Context, refs []string, record
 // removeLauncher deletes <ref>/postgres.run, which supavise-postgres@<ref> needs to exist
 // (ConditionPathExists): without it systemd will not start the cluster, not even at boot.
 func removeLauncher(cfg *config.Config, ref string) error {
-	run := units.FilesFor(cfg, units.Spec{Service: config.SvcPostgres, Ref: ref}).Run
-	if err := os.Remove(run); err != nil && !errors.Is(err, fs.ErrNotExist) {
-		return fmt.Errorf("removing %s: %w", run, err)
+	files := units.FilesFor(cfg, units.Spec{Service: config.SvcPostgres, Ref: ref})
+	for _, f := range []string{files.Run, files.Held()} {
+		if err := os.Remove(f); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return fmt.Errorf("removing %s: %w", f, err)
+		}
 	}
 	return nil
 }
@@ -595,6 +597,14 @@ func (o *Orchestrator) quiesceLocal(ctx context.Context, req QuiesceRequest, rec
 		if err := o.d.LocalServices.Stop(ctx); err != nil {
 			return QuiesceResult{}, fmt.Errorf("stopping the shared services: %w", err)
 		}
+	}
+	// The system cluster is held the way the projects are, but by its launcher: systemd starts it by
+	// itself (supavise.service wants it when the daemon restarts, and it starts at boot), which a
+	// record that only the plane reads would not stop. Without the launcher the unit's condition
+	// fails and the old leader's system cluster stays down until the move ends or is undone
+	// (StartSystemDatabase puts the launcher back).
+	if err := units.FilesFor(o.d.Cfg, units.Spec{Service: config.SvcPostgres, Ref: config.SystemRef}).Hold(); err != nil {
+		return QuiesceResult{}, fmt.Errorf("keeping the system cluster from starting again: %w", err)
 	}
 	lsn, err := o.d.LocalPrimaries.Stop(ctx, config.SystemRef)
 	if err != nil {

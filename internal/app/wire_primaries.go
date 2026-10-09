@@ -84,6 +84,10 @@ func (l *localPrimaries) Stop(ctx context.Context, ref string) (string, error) {
 // standby that has not yet read the tail of that segment (the switch record) finds it gone, its walreceiver ends,
 // and the shutdown checkpoint never reaches it: the move then refuses to promote a replica that is behind the old
 // primary's final position. A busy or slow machine loses that race now and then; keeping a few segments closes it.
+// The failure was seen once, on arm64 (replication run 37886326567): the standby's log says "could not receive data from
+// WAL stream: ERROR: requested WAL segment 000000020000000000000008 has already been removed", and the move refused the replica,
+// which had replayed to 0/9000000 while the old primary stopped at 0/9000028. A rare race, so the setting is a mitigation
+// whose effect the arm64 runs that followed (none refused) support but cannot prove.
 const standbyWALKeep = "64MB"
 
 // keepWALForStandbys sets wal_keep_size on the running primary of ref just before it stops (ALTER SYSTEM and a

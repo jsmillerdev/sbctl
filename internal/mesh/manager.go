@@ -622,7 +622,7 @@ func (m *Manager) serveOneShot(conn net.Conn, node string) {
 	// A short call is short: the session is not in the table, so the sweep that closes the sessions of a
 	// node the registry stopped admitting does not see it.
 	defer time.AfterFunc(m.o.OneShotLife, func() { _ = sess.Close() }).Stop()
-	m.serveStreams(sess, node, "")
+	m.serveStreams(sess, node, "", true)
 }
 
 // serveAnonymous serves the streams of a caller that presented no certificate until its session
@@ -649,7 +649,7 @@ func (m *Manager) serveAnonymous(conn net.Conn, remote string) {
 	}
 	sess := &streamSeen{Session: s}
 	go m.reapAnonymous(sess)
-	m.serveStreams(sess, "", remote)
+	m.serveStreams(sess, "", remote, false)
 	_ = sess.Close()
 }
 
@@ -743,7 +743,7 @@ func (m *Manager) register(pc *peerConn) {
 	} else {
 		go m.retire(pc)
 	}
-	go m.serveStreams(pc.sess, pc.node, "")
+	go m.serveStreams(pc.sess, pc.node, "", false)
 }
 
 // preferred reports whether the existing session a beats the new one b.
@@ -806,9 +806,9 @@ func (m *Manager) watch(pc *peerConn) {
 }
 
 // serveStreams handles every stream the peer opens on sess until the session ends. remote is the
-// peer's IP address, for a caller that has no node. Such a caller has at most maxAnonStreams streams
+// peer's IP address, for a caller that has no node. short marks the one-shot session of a command-line tool. Such a caller has at most maxAnonStreams streams
 // open at a time; the others are closed unread.
-func (m *Manager) serveStreams(sess Session, node, remote string) {
+func (m *Manager) serveStreams(sess Session, node, remote string, short bool) {
 	var open atomic.Int32
 	for {
 		st, err := sess.AcceptStream()
@@ -817,7 +817,12 @@ func (m *Manager) serveStreams(sess Session, node, remote string) {
 			// else (its CloseChan fires on a local Close or the keepalive timeout), so the session is
 			// closed now: watch then drops it from the table, and a node that restarted is not shut out
 			// by its own dead session when the tie-break prefers it.
-			if node != "" {
+			// A short call of a command-line tool (short) ends its session in seconds and many times an hour:
+			// only the sessions of the daemons say something worth counting at Info.
+			switch {
+			case node != "" && short:
+				m.o.Log.Debug("mesh: a short session ended", "node", node, "error", err)
+			case node != "":
 				m.o.Log.Info("mesh: a session ended", "node", node, "error", err)
 			}
 			_ = sess.Close()

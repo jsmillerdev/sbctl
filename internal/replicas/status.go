@@ -116,7 +116,10 @@ func (c *Controller) monitor(ctx context.Context, r *registry.Replica, project r
 	if ok {
 		o = &obs
 	}
-	if ok && obs.Role == "absent" {
+	// A project in a move has its old home's row added before the old home follows the new primary
+	// (demote-old), and the data directory there still holds the old primary: a setup on top of it is
+	// refused, and every move would raise replica_unhealthy for it. The move sets the replica up.
+	if ok && obs.Role == "absent" && project != registry.StatusRestarting {
 		c.recreateActive(ctx, r)
 	}
 	status, reason := c.health(ctx, r, o)

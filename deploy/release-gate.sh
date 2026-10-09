@@ -20,8 +20,9 @@
 # which runs both architectures. Rename the upgrade test's job and this gate fails closed, with a message that names
 # what it did not find: change the prefix here.
 #
-# GATE_TIMEOUT_SECONDS (default 10800: a replication run takes 35 to 75 minutes when it passes and is cut
-# off at 150 when a wait times out) bounds the wait for runs in progress, GATE_POLL_SECONDS
+# GATE_TIMEOUT_SECONDS (default 10800: a replication run took 9 to 15 minutes per job in the
+# three runs measured, the two architectures in parallel, and is cut off at 150 when a wait times out; the gate job of
+# release.yml has to outlast this wait) bounds the wait for runs in progress, GATE_POLL_SECONDS
 # (60) is the pause between looks, GATE_GRACE_SECONDS (300) is how long a workflow with no
 # run yet is waited for, because a tag pushed right after a merge can arrive before its runs start.
 set -euo pipefail

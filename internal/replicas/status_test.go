@@ -231,6 +231,29 @@ func TestMonitorRecreatesALostInstance(t *testing.T) {
 	}
 }
 
+// A project in a move has the row of its old home before that node follows the new primary, and the node
+// reports no replica there: the controller does not set one up over the old primary's data directory.
+func TestMonitorLeavesAnInstanceAloneWhileItsProjectMoves(t *testing.T) {
+	e := newEnv(t)
+	r := e.activeReplica()
+	e.nodes.mu.Lock()
+	delete(e.nodes.inst["n2"], r.Identifier)
+	e.nodes.mu.Unlock()
+	e.setProject(refA, registry.StatusRestarting)
+	before := e.nodes.callsMatching("ensure n2")
+	e.clock.Advance(15 * time.Second)
+	e.tick(2)
+	if got := e.nodes.callsMatching("ensure n2"); got != before {
+		t.Fatalf("a replica was set up while the project moves: %d -> %d ensure calls", before, got)
+	}
+	e.setProject(refA, registry.StatusActiveHealthy)
+	e.clock.Advance(15 * time.Second)
+	e.tick(1)
+	if got := e.nodes.callsMatching("ensure n2"); got != before+1 {
+		t.Fatalf("not asked after the move: %d -> %d", before, got)
+	}
+}
+
 // Statuses gives each replica's step and estimations while it sets up, and the failure after it failed.
 func TestStatusesTellTheSetupProgress(t *testing.T) {
 	e := newEnv(t)

@@ -670,6 +670,67 @@ func TestRejoinRepeatsAfterAFailureOnTheNode(t *testing.T) {
 	}
 }
 
+// A rejoin whose standby does not stream the first time still asks the leader for the replicas of the
+// projects it set aside: `node join --resume` and a second `node rejoin` find them in join.json, because
+// the data is under data.diverged-* by then and nothing else says which projects the node had.
+func TestARejoinThatFailsToStreamStillRebuildsTheReplicas(t *testing.T) {
+	for _, how := range []string{"resume", "rejoin again"} {
+		t.Run(how, func(t *testing.T) {
+			l := newLeader(t)
+			ctx := context.Background()
+			j := l.joiner(t, "n2")
+			seed, _ := okSeed(t)
+			if _, err := Join(ctx, j.joinOptions(l.token(t, TokenOptions{}), "second", seed)); err != nil {
+				t.Fatal(err)
+			}
+			if err := l.reg.SetNodeState(ctx, "n2", registry.NodeFenced); err != nil {
+				t.Fatal(err)
+			}
+			l.live.Refresh(ctx)
+			const ref = "aaaaaaaaaaaaaaaaaaaa"
+			if err := l.reg.CreateProject(ctx, &registry.Project{Ref: ref, Name: "a", Status: registry.StatusActiveHealthy, NodeID: "n1"}); err != nil {
+				t.Fatal(err)
+			}
+			for _, r := range []string{"system", ref} {
+				if err := os.MkdirAll(j.cfg.Paths().PostgresData(r), 0o700); err != nil {
+					t.Fatal(err)
+				}
+			}
+			var rebuilt []string
+			l.auth.Rebuild = func(_ context.Context, ref, node string) error { rebuilt = append(rebuilt, ref+"@"+node); return nil }
+			if err := WriteFenced(j.cfg, FencedRecord{Epoch: 2, Leader: "n1", Reason: "replaced", At: time.Now(), Peers: map[string]string{"n1": l.cfg.PeerAddr()}}); err != nil {
+				t.Fatal(err)
+			}
+			broken := errors.New("the standby does not stream")
+			o := RejoinOptions{Cfg: j.cfg, ConfigPath: j.confPath, Version: "v0.2.0", Pins: testPins, Seed: seed, Log: quiet(),
+				StopLocal: func(context.Context) error { return nil },
+				Streaming: func(context.Context) (string, error) { return "", broken }}
+			if _, err := Rejoin(ctx, o); !errors.Is(err, broken) {
+				t.Fatalf("the first rejoin: %v", err)
+			}
+			if len(rebuilt) != 0 {
+				t.Fatalf("replicas were set up before the node was active: %v", rebuilt)
+			}
+			streaming := func(context.Context) (string, error) { return "0/4000000", nil }
+			if how == "resume" {
+				jo := j.joinOptions(Token{}, "", seed)
+				jo.Resume, jo.Streaming = true, streaming
+				if _, err := Join(ctx, jo); err != nil {
+					t.Fatalf("join --resume: %v", err)
+				}
+			} else {
+				o.Streaming = streaming
+				if _, err := Rejoin(ctx, o); err != nil {
+					t.Fatalf("the rejoin run again: %v", err)
+				}
+			}
+			if len(rebuilt) != 1 || rebuilt[0] != ref+"@n2" {
+				t.Fatalf("replicas set up after the retry: %v", rebuilt)
+			}
+		})
+	}
+}
+
 // The preflight of a join or a rejoin runs before anything is spent, asked or moved.
 func TestPreflightRefusesBeforeAnythingChanges(t *testing.T) {
 	l := newLeader(t)
