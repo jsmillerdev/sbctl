@@ -40,7 +40,8 @@ type Principal struct {
 }
 
 // UserEmail is the address of the user. For an OAuth principal it is read from the store on the
-// first call and kept; for the others it is Email.
+// first call and kept; for the others it is Email. Like the access a handler loads, it belongs to the
+// goroutine that serves the request: no handler hands the principal to another.
 func (p *Principal) UserEmail() string {
 	if p.loadEmail != nil {
 		p.Email, p.loadEmail = p.loadEmail(), nil
