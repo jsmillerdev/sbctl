@@ -45,6 +45,7 @@ type primaryPlane interface {
 	Stop(ctx context.Context, ref string) error
 	Health(ctx context.Context, p *registry.Project, keys *secrets.ProjectKeys) []lifecycle.ServiceHealth
 	FinalCheckpoint(ref string) (lifecycle.ControlInfo, error)
+	SetWALKeepSize(ctx context.Context, p *registry.Project, size string) error
 }
 
 var (
@@ -58,6 +59,7 @@ var (
 // knowing how far it must replay. Stopping a project that is not running answers with the control
 // file as it is.
 func (l *localPrimaries) Stop(ctx context.Context, ref string) (string, error) {
+	l.keepWALForStandbys(ctx, ref)
 	if l.timers != nil {
 		if err := l.timers.StopTimer(ctx, ref); err != nil {
 			l.log.Warn("backup timer did not stop", "ref", ref, "error", err)
@@ -74,6 +76,34 @@ func (l *localPrimaries) Stop(ctx context.Context, ref string) (string, error) {
 		return "", fmt.Errorf("%s did not shut down cleanly (state %q), so it has no final position", ref, ci.State)
 	}
 	return ci.Checkpoint, nil
+}
+
+// standbyWALKeep is the WAL a primary keeps on disk for its standbys while it is stopped for a move: four
+// segments. A clean shutdown with archiving on switches to a new segment and writes the shutdown checkpoint at the
+// start of the next, and the checkpoint recycles the segment it closed. Standbys use no replication slots, so a
+// standby that has not yet read the tail of that segment (the switch record) finds it gone, its walreceiver ends,
+// and the shutdown checkpoint never reaches it: the move then refuses to promote a replica that is behind the old
+// primary's final position. A busy or slow machine loses that race now and then; keeping a few segments closes it.
+const standbyWALKeep = "64MB"
+
+// keepWALForStandbys sets wal_keep_size on the running primary of ref just before it stops (ALTER SYSTEM and a
+// reload, which the checkpointer reads before the shutdown checkpoint). It is best effort: a cluster that is not
+// running, or a registry that cannot say what the project is, is stopped all the same. The setting stays in
+// postgresql.auto.conf and so goes with the cluster to the standby that replaces it.
+func (l *localPrimaries) keepWALForStandbys(ctx context.Context, ref string) {
+	reg := l.reg()
+	if reg == nil {
+		return
+	}
+	cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	p, err := reg.GetProject(cctx, ref)
+	if err != nil {
+		return
+	}
+	if err := l.plane.SetWALKeepSize(cctx, p, standbyWALKeep); err != nil {
+		l.log.Debug("could not keep WAL for the standbys of a primary that is about to stop", "ref", ref, "error", err)
+	}
 }
 
 // Start starts ref's units as a primary and its backup timer. A project the node is fenced for does

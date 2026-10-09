@@ -57,6 +57,11 @@ func (f *fakePlane) FinalCheckpoint(ref string) (lifecycle.ControlInfo, error) {
 	return f.info, f.infoErr
 }
 
+func (f *fakePlane) SetWALKeepSize(_ context.Context, p *registry.Project, size string) error {
+	f.rec("keep-wal " + p.Ref + " " + size)
+	return nil
+}
+
 const primaryRef = "abcdefghijklmnopqrst"
 
 func primariesFixture(t *testing.T) (*localPrimaries, *fakePlane, *recTimers, *registry.Memory) {
@@ -85,7 +90,9 @@ func TestLocalPrimariesStopReturnsTheShutdownCheckpoint(t *testing.T) {
 	if err != nil || lsn != "0/3000060" {
 		t.Fatalf("Stop = %q, %v", lsn, err)
 	}
-	if strings.Join(pl.calls, ",") != "stop "+primaryRef+",checkpoint "+primaryRef || strings.Join(tm.calls, ",") != "stop "+primaryRef {
+	// The primary keeps WAL for its standbys before it stops (the shutdown checkpoint would recycle the segment a
+	// lagging walsender still has to read).
+	if strings.Join(pl.calls, ",") != "keep-wal "+primaryRef+" 64MB,stop "+primaryRef+",checkpoint "+primaryRef || strings.Join(tm.calls, ",") != "stop "+primaryRef {
 		t.Fatalf("plane %v, timers %v", pl.calls, tm.calls)
 	}
 	pl.info = lifecycle.ControlInfo{State: "in production", Checkpoint: "0/1000000"}

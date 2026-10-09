@@ -348,8 +348,10 @@ func standbyConfigured(dataDir string) bool {
 // SetWALKeepSize makes the primary of p keep size of WAL for its standbys (wal_keep_size, for example
 // "2GB"; empty removes the setting) with ALTER SYSTEM and a reload. Standbys use no replication slots
 // (the archive covers any gap), so this is an option for a deployment whose standbys fall behind the
-// archive's reach; it is never part of the unit's arguments, which keeps a primary's units as they
-// were. The setting survives restarts in postgresql.auto.conf. A settings save through the
+// archive's reach, and what a planned stop sets just before it stops the primary (internal/app
+// localPrimaries.Stop): the shutdown checkpoint recycles the segment it closed, and a standby that has not read
+// its tail yet would never get the checkpoint. It is never part of the unit's arguments, which keeps a primary's
+// units as they were. The setting survives restarts in postgresql.auto.conf. A settings save through the
 // Management API does not touch it.
 func (pl *PostgresPlane) SetWALKeepSize(ctx context.Context, p *registry.Project, size string) error {
 	return pl.sql().AlterSystem(ctx, addrOf(pl.paths(p)), "wal_keep_size", size)

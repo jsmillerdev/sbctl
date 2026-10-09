@@ -410,7 +410,13 @@ wait_fenced() {
     [[ $(unit_state "$u") != active ]] || fail "$u started on a fenced node although its launcher is gone"
     [[ $(systemctl show -p ConditionResult --value "$u") == no ]] || fail "$u: the unit's condition is '$(systemctl show -p ConditionResult --value "$u")', want no"
   done
-  [[ $(http_code http://127.0.0.1/) == 503 ]] || fail "a fenced node answers $(http_code http://127.0.0.1/) on port 80, want 503"
+  # The record is written before the daemon listens (it decides the boot first, then serves the 503), so the listener is
+  # waited for as well: a node that never answers 503 fails after a minute.
+  for ((i = 0; i < 60; i += 2)); do
+    [[ $(http_code http://127.0.0.1/) == 503 ]] && break
+    sleep 2
+  done
+  [[ $(http_code http://127.0.0.1/) == 503 ]] || fail "a fenced node answers $(http_code http://127.0.0.1/) on port 80 after a minute, want 503"
   log "fenced.json: leader and epoch $(python3 -c 'import json; d=json.load(open("/var/lib/supavise/fenced.json")); print(d.get("leader", ""), d.get("epoch", ""))')"
 }
 
