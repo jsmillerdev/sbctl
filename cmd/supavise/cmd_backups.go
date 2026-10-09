@@ -119,6 +119,9 @@ func init() {
 			"uploaded, and the snapshot it writes lists every object, so a restore matches the source.\n" +
 			"The nightly timer runs this command. A node whose Storage uses its S3 backend keeps its\n" +
 			"objects in your own bucket, which is not copied.\n\n" +
+			"In a cluster a base backup reads the data directory of the project's home, so this command\n" +
+			"takes the database of a project homed on this server only; for one homed on another server\n" +
+			"the leader's daemon takes it in its nightly round, and --files-only works on the leader.\n\n" +
 			"  --skip-files   the database only\n" +
 			"  --files-only   Storage objects and Edge Functions only",
 		Args: cobra.ExactArgs(1),
@@ -128,6 +131,11 @@ func init() {
 			}
 			if createSkipFiles && createFilesOnly {
 				return errors.New("--skip-files and --files-only exclude each other")
+			}
+			if !createFilesOnly {
+				if err := requireHomeForBase(cmd.Context(), args[0]); err != nil {
+					return err
+				}
 			}
 			svc, closeFn, err := openBackupService(cmd.Context(), false, []string{args[0]})
 			if err != nil {
@@ -441,6 +449,45 @@ func restoreRelayRefs(source, as string) []string {
 		return []string{source}
 	}
 	return []string{source, as}
+}
+
+// requireHomeForBase opens the registry for baseBackupHome.
+func requireHomeForBase(ctx context.Context, ref string) error {
+	cfg, err := loadConfig()
+	if err != nil {
+		return err
+	}
+	reg, err := openRegistry(ctx, cfg)
+	if err != nil {
+		return err
+	}
+	defer reg.Close()
+	return baseBackupHome(ctx, reg, cfg, ref)
+}
+
+// baseBackupHome refuses a base backup of a project that is homed on another node. A base backup reads
+// the data directory of the project's home, which this server does not have, and this command has no
+// session with that node; the daemon of the cluster's leader takes those backups (placement.RoutedBackups)
+// in its nightly round. Without it the command would fail on a missing data directory, or, worse, take
+// the Storage objects and then fail.
+func baseBackupHome(ctx context.Context, reg registry.Registry, cfg *config.Config, ref string) error {
+	p, err := reg.GetProject(ctx, ref)
+	if err != nil || p.NodeID == "" {
+		return nil // a project that is not there is the backup service's to report
+	}
+	self, err := lifecycle.SelfNode(ctx, reg, cfg, false)
+	if err != nil {
+		return err
+	}
+	if p.NodeID == self {
+		return nil
+	}
+	home := p.NodeID
+	if n, err := reg.GetNode(ctx, p.NodeID); err == nil && n.Name != "" {
+		home = n.Name
+	}
+	return fmt.Errorf("project %s is homed on node %s, and a base backup reads the data directory of its home: this command cannot take it from here. "+
+		"The leader's daemon backs the project up in its nightly round; on the leader, --files-only backs up its Storage objects and Edge Functions", ref, home)
 }
 
 // openBackupService wires a Service from config, the registry and the master key.

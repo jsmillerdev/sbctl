@@ -343,6 +343,51 @@ func TestPrepareInPlaceRestoreChecksTheProjectBeforeItsReplicas(t *testing.T) {
 	}
 }
 
+// `backups create` takes the base backup of a project homed on this server. For one homed elsewhere it
+// stops before it snapshots any files and says where the project lives, instead of failing on a data
+// directory this server does not have.
+func TestBaseBackupOfAProjectHomedElsewhereIsRefused(t *testing.T) {
+	reg, _ := replicaTestEnv(t)
+	ctx := context.Background()
+	const here, away = "hhhhhhhhhhhhhhhhhhhh", "dddddddddddddddddddd"
+	for ref, node := range map[string]string{here: "n1", away: "n2"} {
+		if err := reg.CreateProject(ctx, &registry.Project{Ref: ref, Name: ref, Status: registry.StatusActiveHealthy, NodeID: node}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	asNode := func(name string) *config.Config {
+		cfg := config.Default()
+		cfg.Node.Name = name
+		return cfg
+	}
+
+	leader := asNode("primary") // n1
+	// Homed here, no home recorded, not a project at all: the backup service goes on and reports what it finds.
+	for _, ref := range []string{here, replicaTestRef, "zzzzzzzzzzzzzzzzzzzz"} {
+		if err := baseBackupHome(ctx, reg, leader, ref); err != nil {
+			t.Errorf("%s on its home: %v", ref, err)
+		}
+	}
+	err := baseBackupHome(ctx, reg, leader, away)
+	if err == nil || !strings.Contains(err.Error(), "homed on node eu") || !strings.Contains(err.Error(), "--files-only") {
+		t.Fatalf("a project homed on another node: %v", err)
+	}
+
+	follower := asNode("eu") // n2
+	if err := baseBackupHome(ctx, reg, follower, away); err != nil {
+		t.Errorf("on its own home: %v", err)
+	}
+	if err := baseBackupHome(ctx, reg, follower, here); err == nil || !strings.Contains(err.Error(), "homed on node primary") {
+		t.Errorf("a leader's project, seen from a follower: %v", err)
+	}
+
+	// A server that never joined a cluster has no node row of its own and is the founder (n1).
+	alone := asNode("not-in-the-registry")
+	if err := baseBackupHome(ctx, reg, alone, here); err != nil {
+		t.Errorf("a single server: %v", err)
+	}
+}
+
 // The delete never reaches the Engine while a replica remains (a nil Engine would stop the test).
 func TestDeleteProjectStopsWhileReplicasRemain(t *testing.T) {
 	reg, _ := replicaTestEnv(t)
