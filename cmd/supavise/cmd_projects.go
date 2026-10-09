@@ -180,7 +180,7 @@ func init() {
 			// relay; serve the sockets nobody answers while the daemon is down.
 			_, stopRelay := app.StartWALRelay(cmd.Context(), n.Cfg, newLogger(n.Cfg), true, a[0])
 			defer stopRelay()
-			if err := n.Engine.DeleteWith(cmd.Context(), a[0], lifecycle.DeleteOptions{SkipFinalBackup: pSkipBackup}); err != nil {
+			if err := deleteProject(cmd.Context(), n, a[0], pSkipBackup); err != nil {
 				return err
 			}
 			// The Edge Functions tree lives in the runtime's state directory, not in the

@@ -31,11 +31,21 @@ const envRegistryDSN = "SUPAVISE_REGISTRY_DSN"
 // openRegistry connects to the registry for commands that do not need the lifecycle engine.
 func openRegistry(ctx context.Context, cfg *config.Config) (registry.Registry, error) {
 	warnEnvFileMode(os.Stderr, backup.EnvFile)
+	var reg registry.Registry
+	var err error
 	dsn := os.Getenv(envRegistryDSN)
+	standby := false
 	if dsn == "" {
-		dsn = lifecycle.RegistryDSN(cfg)
+		if dsn, standby = localRegistry(ctx, cfg); dsn == "" {
+			dsn = lifecycle.RegistryDSN(cfg)
+		}
 	}
-	reg, err := registry.Open(ctx, dsn)
+	// A server that follows a leader reads a copy of the registry it cannot write, nor migrate.
+	if standby {
+		reg, err = registry.OpenReadOnly(ctx, dsn)
+	} else {
+		reg, err = registry.Open(ctx, dsn)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("cannot reach the registry (is supavise-postgres@system running? run `supavise system init`; set %s to use another one): %w", envRegistryDSN, err)
 	}
@@ -298,6 +308,12 @@ func init() {
 			if (restoreAs == "" || restoreAs == args[0]) && !restoreForce {
 				return backup.ErrForceRequired
 			}
+			// A standby cannot follow a restored primary: the project's replicas go first.
+			if restoresInPlace(args[0], restoreAs) {
+				if err := removeReplicasBeforeRestore(cmd.Context(), args[0]); err != nil {
+					return err
+				}
+			}
 			svc, closeFn, err := openBackupService(cmd.Context(), true, restoreRelayRefs(args[0], restoreAs))
 			if err != nil {
 				return err
@@ -451,7 +467,7 @@ func openBackupService(ctx context.Context, withManager bool, relayRefs []string
 	}
 	if withManager {
 		// A restore creates a project, so the Engine registers it with the shared services.
-		node, err := lifecycle.Open(ctx, cfg, app.LifecycleOptions(cfg, opts))
+		node, err := openLifecycle(ctx, cfg, app.LifecycleOptions(cfg, opts))
 		if err != nil {
 			stopRelay()
 			return nil, nil, err

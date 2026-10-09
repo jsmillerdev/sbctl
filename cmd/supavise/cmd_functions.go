@@ -365,7 +365,7 @@ func runFunctionsDev(cmd *cobra.Command, _ []string) error {
 	lz := fleet.NewLazy(fleet.Deps{Cfg: cfg, Log: log})
 	oo := openOptions(cfg)
 	oo.Fleet = lz.Fleet()
-	n, err := lifecycle.Open(cmd.Context(), cfg, oo)
+	n, err := openLifecycle(cmd.Context(), cfg, oo)
 	if err != nil {
 		return err
 	}

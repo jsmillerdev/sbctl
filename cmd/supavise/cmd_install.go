@@ -123,6 +123,8 @@ type installer struct {
 	ctx      context.Context
 	out, err io.Writer
 	cfg      *config.Config
+	// runCmd, when set, replaces the process run starts (tests).
+	runCmd func(name string, args ...string) error
 }
 
 func (in *installer) step(format string, a ...any) { fmt.Fprintf(in.out, "==> "+format+"\n", a...) }
@@ -132,12 +134,21 @@ func (in *installer) warn(format string, a ...any) {
 
 // run runs a command, streaming its output.
 func (in *installer) run(name string, args ...string) error {
+	if in.runCmd != nil {
+		return in.runCmd(name, args...)
+	}
 	c := exec.CommandContext(in.ctx, name, args...)
 	c.Stdout, c.Stderr = in.out, in.err
 	if err := c.Run(); err != nil {
 		return fmt.Errorf("%s %s: %w", name, strings.Join(args, " "), err)
 	}
 	return nil
+}
+
+// converge brings the host layer to this release: the unit files, the directories and their owner, the
+// firewall rule of the mesh port and, on a server that holds a cluster identity, the cluster settings.
+func (in *installer) converge() error {
+	return in.run(in.cfg.BinPath, "--config", config.DefaultPath, "system", "converge")
 }
 
 // asSupavise runs the installed binary as the supavise user (the owner of the state directory
@@ -288,7 +299,7 @@ func runInstall(cmd *cobra.Command, o installOptions) error {
 	}
 
 	in.step("converging the host (systemd units, directories, mount protection, firewall rule for the mesh port)")
-	if err := in.run(cfg.BinPath, "--config", config.DefaultPath, "system", "converge"); err != nil {
+	if err := in.converge(); err != nil {
 		return err
 	}
 	if stackName != "" {
@@ -302,7 +313,7 @@ func runInstall(cmd *cobra.Command, o installOptions) error {
 	}
 	if o.Firewall != "none" {
 		// ufw may have been switched on just now; converge opens the mesh port in it.
-		if err := in.run(cfg.BinPath, "--config", config.DefaultPath, "system", "converge"); err != nil {
+		if err := in.converge(); err != nil {
 			return err
 		}
 	}

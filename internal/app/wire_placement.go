@@ -87,6 +87,8 @@ func placementWiring(ctx context.Context, w *Wire, handle func(pattern string, f
 	// A resize restarts the replicas of the project in the right order; one that does not come back alerts.
 	node.Engine.SetReplicaFleet(&placement.Fleet{Registry: node.Registry, Ops: ops, Epoch: mem.Epoch, OnFailure: replicaFailed})
 
+	routeBackups(w, mem, res, ops, self)
+
 	Provide[placement.Resolver](w, res)
 	Provide[placement.PlaneRouter](w, router)
 	Provide[placement.InstanceOps](w, ops)
@@ -127,6 +129,33 @@ func placementWiring(ctx context.Context, w *Wire, handle func(pattern string, f
 		return nil
 	})
 	return nil
+}
+
+// scheduledBackupsRound is how often the leader looks for projects homed on other nodes whose newest
+// base backup is a day old.
+const scheduledBackupsRound = 15 * time.Minute
+
+// routeBackups lets the leader's backup service work for the projects homed on other nodes. A base backup
+// reads the data directory of the project's home, and a follower's registry takes no write, so the home
+// takes the backup and writes it to the store (placement.BackupOps) and the leader records it
+// (backup.Service.RecordBase): the Ops record what a node took for them, the service takes the base backup
+// of a replica's seed on the home (TakeBase), the Engine takes the final backup of a delete there
+// (SetRemoteBackups), and the leader takes the nightly backup of those projects, whose timers do not run
+// on a follower (placement.ScheduledBackups). The leader's service is the one Serve provides; without
+// it, which is a backend that does not open, none of this works and the node says so.
+func routeBackups(w *Wire, mem cluster.Membership, res placement.Resolver, ops *placement.Ops, self func() string) {
+	bs, ok := Get[*backup.Service](w)
+	if !ok {
+		w.Off("placement.RoutedBackups", "the backup service did not open: the base backups of projects homed on other nodes are not taken or recorded, and a delete of one is refused")
+		return
+	}
+	routed := &placement.RoutedBackups{Self: self, Resolver: res, Ops: ops, Local: bs}
+	ops.Recorder = bs
+	bs.SetTakeBase(routed.TakeBase)
+	w.Node.Engine.SetRemoteBackups(routed)
+	Provide(w, routed)
+	sched := &placement.ScheduledBackups{Registry: w.Node.Registry, Self: self, Routed: routed, Leader: mem.IsLeader, Log: w.Log.With("component", "scheduled-backups")}
+	w.Go("scheduled backups", func(ctx context.Context) error { sched.Run(ctx, scheduledBackupsRound); return nil })
 }
 
 // portHolder is what the mesh's forwarders (*mesh.Forwarders) offer a promotion: Suspend closes the

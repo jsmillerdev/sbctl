@@ -301,3 +301,39 @@ func TestFollowsALeaderAndAnUnfinishedJoin(t *testing.T) {
 		t.Error("a join state file is not an unfinished join")
 	}
 }
+
+// The converge that follows the join is the one that has the node's cluster identity: it comes after the
+// join, and never when the join failed.
+func TestJoinAndConvergeConvergesAfterTheJoin(t *testing.T) {
+	src := tokenFile(t, "svj1.secret\n", 0o600)
+	cfgPath := filepath.Join(t.TempDir(), "config.toml")
+	var calls []string
+	in := &installer{ctx: context.Background(), out: &bytes.Buffer{}, cfg: &config.Config{BinPath: "/usr/local/bin/supavise"},
+		runCmd: func(name string, args ...string) error {
+			calls = append(calls, name+" "+strings.Join(args, " "))
+			return nil
+		}}
+	j := fakeJoiner{do: func(string, bool) error { calls = append(calls, "join"); return nil }}
+	if err := in.joinAndConverge(j, src, cfgPath, os.Getuid(), os.Getgid()); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"join", "/usr/local/bin/supavise --config " + config.DefaultPath + " system converge"}
+	if strings.Join(calls, "|") != strings.Join(want, "|") {
+		t.Fatalf("calls = %q, want %q", calls, want)
+	}
+
+	calls = nil
+	boom := errors.New("pin mismatch")
+	j.do = func(string, bool) error { return boom }
+	if err := in.joinAndConverge(j, src, cfgPath, os.Getuid(), os.Getgid()); !errors.Is(err, boom) || len(calls) != 0 {
+		t.Fatalf("a failed join: err = %v, converge calls = %q", err, calls)
+	}
+
+	// A failed converge fails the install: the host would not be what the installer promises.
+	failing := errors.New("converge failed")
+	in.runCmd = func(string, ...string) error { return failing }
+	j.do = func(string, bool) error { return nil }
+	if err := in.joinAndConverge(j, src, cfgPath, os.Getuid(), os.Getgid()); !errors.Is(err, failing) {
+		t.Fatalf("err = %v", err)
+	}
+}

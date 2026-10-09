@@ -747,3 +747,91 @@ func TestRecordBaseWritesTheRowAndTheEventOnce(t *testing.T) {
 		}
 	}
 }
+
+// listHook wraps a registry so that a test can fail or slow down the listing of a ref's backups.
+type listHook struct {
+	registry.Registry
+	err   error
+	after func()
+}
+
+func (h listHook) ListBackups(ctx context.Context, ref string) ([]registry.Backup, error) {
+	if h.err != nil {
+		return nil, h.err
+	}
+	rows, err := h.Registry.ListBackups(ctx, ref)
+	if h.after != nil {
+		h.after()
+	}
+	return rows, err
+}
+
+// writeReported stores the manifest of the backup b reports, so that RecordBase accepts it.
+func writeReported(t *testing.T, e *testEnv, b RemoteBase) {
+	t.Helper()
+	m := &Manifest{Version: manifestVersion, ID: b.ID, Ref: testRef, Timeline: b.Timeline, StartLSN: b.StartLSN, StopLSN: b.StopLSN,
+		StartTime: e.now, StoredBytes: 4096}
+	if err := e.svc.writeManifest(context.Background(), m); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A registry that cannot list the backups cannot tell whether the report was recorded: RecordBase
+// stops, and writes neither a row nor an event.
+func TestRecordBaseStopsWhenTheBackupsCannotBeListed(t *testing.T) {
+	e := newTestEnv(t)
+	ctx := context.Background()
+	if err := e.reg.CreateProject(ctx, &registry.Project{Ref: testRef, Name: "demo"}); err != nil {
+		t.Fatal(err)
+	}
+	b := RemoteBase{ID: "20261008T120000Z-abcdef", Timeline: 3, StartLSN: "0/3000028", StopLSN: "0/3000120"}
+	writeReported(t, e, b)
+	boom := errors.New("registry: connection reset")
+	e.svc.opt.Registry = listHook{Registry: e.reg, err: boom}
+	if _, err := e.svc.RecordBase(ctx, testRef, b); !errors.Is(err, boom) {
+		t.Fatalf("RecordBase = %v, want the listing's error", err)
+	}
+	if rows, _ := e.reg.ListBackups(ctx, testRef); len(rows) != 0 {
+		t.Fatalf("%d rows after a report that could not be checked", len(rows))
+	}
+	if evs, _ := e.reg.ListEvents(ctx, testRef, 10); len(evs) != 0 {
+		t.Fatalf("events = %+v", evs)
+	}
+}
+
+// Two reports of one backup that overlap (each lists the backups before either writes) record it once.
+func TestRecordBaseRecordsOnceWhenReportsOverlap(t *testing.T) {
+	e := newTestEnv(t)
+	ctx := context.Background()
+	if err := e.reg.CreateProject(ctx, &registry.Project{Ref: testRef, Name: "demo"}); err != nil {
+		t.Fatal(err)
+	}
+	b := RemoteBase{ID: "20261008T120000Z-abcdef", Reason: ReasonFinal, Timeline: 3, StartLSN: "0/3000028", StopLSN: "0/3000120"}
+	writeReported(t, e, b)
+	e.svc.opt.Registry = listHook{Registry: e.reg, after: func() { time.Sleep(50 * time.Millisecond) }}
+	var wg sync.WaitGroup
+	ids := make([]int64, 4)
+	for i := range ids {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if row, err := e.svc.RecordBase(ctx, testRef, b); err != nil {
+				t.Error(err)
+			} else {
+				ids[i] = row.ID
+			}
+		}()
+	}
+	wg.Wait()
+	if rows, _ := e.reg.ListBackups(ctx, testRef); len(rows) != 1 {
+		t.Fatalf("%d rows after overlapping reports", len(rows))
+	}
+	if evs, _ := e.reg.ListEvents(ctx, testRef, 10); len(evs) != 1 {
+		t.Fatalf("%d events after overlapping reports", len(evs))
+	}
+	for _, id := range ids {
+		if id == 0 || id != ids[0] {
+			t.Fatalf("the reports got rows %v", ids)
+		}
+	}
+}

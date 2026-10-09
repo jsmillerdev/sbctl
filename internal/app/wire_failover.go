@@ -96,6 +96,12 @@ func wireFailover(ctx context.Context, w *Wire) error {
 	} else {
 		w.Off("failover.Marker", "the backup service did not open: no leader marker is written or read, so a node that cannot reach its peers cannot learn that it was replaced")
 	}
+	// A fence of the whole node stops every cluster and shared service of the supervisor at once and
+	// removes their launchers, the system cluster's too.
+	if sup := w.Node.Supervisor; sup != nil {
+		log := w.Log.With("component", "fence")
+		d.FenceNode = func(ctx context.Context) ([]string, error) { return cluster.FenceLocal(ctx, cfg, sup, log) }
+	}
 	d.Provider = failoverProvider(w, members, store)
 	d.PublicProbe = failover.PublicProbe(cfg.APIHost(), func(ctx context.Context) string {
 		if cl, err := store().GetCluster(ctx); err == nil {
@@ -109,6 +115,9 @@ func wireFailover(ctx context.Context, w *Wire) error {
 		return err
 	}
 	Provide[failover.Service](w, o)
+	if lf, ok := Get[*lateFencer](w); ok {
+		lf.set(o) // the running leader's membership asks it before it fences the node (cluster.LiveOptions.Fence)
+	}
 	w.API.Failover = o
 	for pattern, h := range o.PeerHandlers() {
 		mesh.Handle(pattern, h)

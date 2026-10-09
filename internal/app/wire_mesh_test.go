@@ -19,6 +19,7 @@ import (
 	"golang.org/x/sync/errgroup"
 
 	"github.com/supavise/supavise/internal/api"
+	"github.com/supavise/supavise/internal/backup"
 	"github.com/supavise/supavise/internal/cluster"
 	"github.com/supavise/supavise/internal/config"
 	"github.com/supavise/supavise/internal/lifecycle"
@@ -371,5 +372,71 @@ func TestRetireWhenRemoved(t *testing.T) {
 	defer cancel()
 	if err := retireWhenRemoved(cctx, w, lead, w.Log); err != nil {
 		t.Fatalf("a leader retired: %v", err)
+	}
+}
+
+// A backup store that does not open (the bucket is unreachable when the daemon starts) is tried again at
+// the next read of the leader marker; only a store that opened is kept.
+func TestLazyMarkerOpensTheStoreAgainAfterAFailure(t *testing.T) {
+	cfg := config.Default()
+	cfg.Backup.Backend = "s3:///no-bucket"
+	m := &lazyMarker{cfg: cfg}
+	ctx := context.Background()
+	if _, err := m.ReadLeaderMarker(ctx); err == nil {
+		t.Fatal("a backend that does not open was read")
+	}
+	if err := m.WriteLeaderMarker(ctx, backup.LeaderMarker{Epoch: 2, Leader: "n2"}); err == nil {
+		t.Fatal("a backend that does not open was written")
+	}
+	// The backend is fixed (the bucket is back): the same marker reads and writes.
+	cfg.Backup.Backend = "file://" + t.TempDir()
+	if mk, err := m.ReadLeaderMarker(ctx); err != nil || mk != nil {
+		t.Fatalf("read after the store opened = %+v, %v", mk, err)
+	}
+	if err := m.WriteLeaderMarker(ctx, backup.LeaderMarker{Epoch: 2, Leader: "n2"}); err != nil {
+		t.Fatal(err)
+	}
+	mk, err := m.ReadLeaderMarker(ctx)
+	if err != nil || mk == nil || mk.Epoch != 2 || mk.Leader != "n2" {
+		t.Fatalf("marker = %+v, %v", mk, err)
+	}
+	// A store that opened stays: the backend named later changes nothing.
+	cfg.Backup.Backend = "s3:///no-bucket"
+	if mk, err := m.ReadLeaderMarker(ctx); err != nil || mk == nil {
+		t.Fatalf("a store that opened was opened again: %+v, %v", mk, err)
+	}
+}
+
+type epochVerdict struct {
+	fenced bool
+	err    error
+	got    []any
+}
+
+func (e *epochVerdict) FenceOnHigherEpoch(_ context.Context, source string, epoch int64, leader string) (bool, error) {
+	e.got = []any{source, epoch, leader}
+	return e.fenced, e.err
+}
+
+// The membership asks the orchestrator once it exists, and its verdict decides; before that, or when the
+// failover hook left the orchestrator off, the node is fenced all the same.
+func TestLateFencerAsksTheOrchestratorOnceItExists(t *testing.T) {
+	ctx := context.Background()
+	l := &lateFencer{}
+	if fenced, err := l.fence(ctx, "node n2", 3, "n2"); !fenced || err != nil {
+		t.Fatalf("without an orchestrator = %v, %v", fenced, err)
+	}
+	v := &epochVerdict{}
+	l.set(v)
+	if fenced, err := l.fence(ctx, "node n2", 3, "n2"); fenced || err != nil {
+		t.Fatalf("the orchestrator said no: %v, %v", fenced, err)
+	}
+	if len(v.got) != 3 || v.got[0] != "node n2" || v.got[1] != int64(3) || v.got[2] != "n2" {
+		t.Fatalf("the orchestrator was asked %v", v.got)
+	}
+	boom := errors.New("a primary did not stop")
+	v.fenced, v.err = true, boom
+	if fenced, err := l.fence(ctx, "the leader marker", 4, "n3"); !fenced || !errors.Is(err, boom) {
+		t.Fatalf("the orchestrator fenced with an error: %v, %v", fenced, err)
 	}
 }
