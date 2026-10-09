@@ -12,10 +12,9 @@ name: replication
 # hardening and the instance metadata block need either (tests/linux/multi/README.md). A push to a ws/** branch
 # runs amd64 only, as linux.yml does; integrate/** and a dispatch run both architectures.
 #
-# It is not in deploy/release-gate.sh's list yet. The gate accepts a workflow_dispatch run on the tagged commit, so
-# this workflow can be listed as it stands: `gh workflow run replication.yml --ref <branch>`, then tag. A run is
-# expected to take 60 to 75 minutes when every check passes and is cut off at 150 when a wait times out, so the run
-# is dispatched before the tag, or the gate's GATE_TIMEOUT_SECONDS is raised above 150 minutes.
+# deploy/release-gate.sh requires it (the jobs named two-servers). The gate accepts a workflow_dispatch run on the
+# tagged commit: `gh workflow run replication.yml --ref <branch>`, then tag. A run takes 35 to 75 minutes when every
+# check passes and is cut off at 150 when a wait times out; the gate waits for three hours (GATE_TIMEOUT_SECONDS).
 on:
   push:
     branches: ["ws/rep-x2", "ws/rep-fx", "integrate/**"]

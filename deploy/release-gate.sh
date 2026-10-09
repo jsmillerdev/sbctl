@@ -13,11 +13,15 @@
 # needs its newest run on the commit to succeed. With a prefix, at least one job of that run
 # whose name starts with it (any case) must exist and every such job must have succeeded. The
 # default list is the whole of ci.yml and linux.yml, the conformance suite (the job `suites` of
-# conformance.yml, both architectures) and the upgrade test (the jobs of linux.yml named
-# `upgrade...`). Rename the upgrade test's job and this gate fails closed, with a message that names
+# conformance.yml, both architectures), the upgrade test (the jobs of linux.yml named
+# `upgrade...`) and the two-server release test (the jobs `two-servers` of replication.yml). That
+# workflow runs on pushes to integrate/** (both architectures) and ws/** branches listed in it (amd64
+# only), not on main: dispatch it on the commit to tag, `gh workflow run replication.yml --ref <branch>`,
+# which runs both architectures. Rename the upgrade test's job and this gate fails closed, with a message that names
 # what it did not find: change the prefix here.
 #
-# GATE_TIMEOUT_SECONDS (default 7200) bounds the wait for runs in progress, GATE_POLL_SECONDS
+# GATE_TIMEOUT_SECONDS (default 10800: a replication run takes 35 to 75 minutes when it passes and is cut
+# off at 150 when a wait times out) bounds the wait for runs in progress, GATE_POLL_SECONDS
 # (60) is the pause between looks, GATE_GRACE_SECONDS (300) is how long a workflow with no
 # run yet is waited for, because a tag pushed right after a merge can arrive before its runs start.
 set -euo pipefail
@@ -25,8 +29,8 @@ set -euo pipefail
 sha=${1:-}
 [[ $sha =~ ^[0-9a-f]{40}$ ]] || { echo "usage: $0 COMMIT_SHA (40 hex characters)" >&2; exit 2; }
 repo=${GITHUB_REPOSITORY:?GITHUB_REPOSITORY is not set}
-required=${REQUIRED:-"ci.yml linux.yml conformance.yml:suites linux.yml:upgrade"}
-timeout=${GATE_TIMEOUT_SECONDS:-7200}
+required=${REQUIRED:-"ci.yml linux.yml conformance.yml:suites linux.yml:upgrade replication.yml:two-servers"}
+timeout=${GATE_TIMEOUT_SECONDS:-10800}
 poll=${GATE_POLL_SECONDS:-60}
 grace=${GATE_GRACE_SECONDS:-300}
 begin=$(date +%s)
