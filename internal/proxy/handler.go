@@ -89,11 +89,38 @@ func (s *Server) serveAPI(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusNotFound, "Not Found")
 		return
 	}
+	// The remote MCP endpoint is Studio's, behind the Management API's gate. It is decided before the
+	// follower check: the gate reads the registry like any request and Studio's port on a follower is a
+	// forwarder to the leader's (mesh.KindStudio), so every node serves it.
+	if s.opts.MCPGate != nil && path.Clean("/"+r.URL.Path) == "/mcp" {
+		s.serveMCP(w, r)
+		return
+	}
 	if forwarded {
 		s.forwardAPI(w, r)
 		return
 	}
 	s.opts.APIHandler.ServeHTTP(w, r)
+}
+
+// mcpTimeout bounds the wait for the headers of Studio's MCP answer: a tool may deploy a function or
+// run a long query.
+const mcpTimeout = 120 * time.Second
+
+// serveMCP serves api.<domain>/mcp. Options.MCPGate authenticates the bearer, answers CORS preflights and
+// every refusal, and returns the query to forward, which replaces the client's; nothing reaches Studio
+// before it has said yes. The request goes to Studio's /api/mcp, which serves the tools by calling the
+// Management API with the same bearer. Cookies are not Studio's to read here; the Authorization header
+// is, and the gate's CORS headers are the only ones in the answer (forward drops the upstream's).
+func (s *Server) serveMCP(w http.ResponseWriter, r *http.Request) {
+	query, ok := s.opts.MCPGate(w, r)
+	if !ok {
+		return
+	}
+	s.forward(w, r, &target{
+		addr: s.upstream(svcStudio, project{}), path: "/api/mcp", rawQuery: query,
+		fwdHost: r.Host, timeout: mcpTimeout, del: []string{"Cookie"},
+	})
 }
 
 // apiTimeout bounds the wait for the headers of the Management API's answer on a node that forwards it:
@@ -112,12 +139,17 @@ func (s *Server) forwardAPI(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) serveStudio(w http.ResponseWriter, r *http.Request) {
+	// Studio's own MCP route is reached through api.<domain>/mcp and its gate only.
+	if isStudioMCPPath(r.URL.Path) {
+		writeJSON(w, http.StatusNotFound, "Not Found")
+		return
+	}
 	if s.answerCNAMECheck(w, r) || s.answerStudioLocally(w, r) {
 		return
 	}
 	s.forward(w, r, &target{
 		addr: s.upstream(svcStudio, project{}), path: r.URL.Path, rawPath: r.URL.EscapedPath(), rawQuery: r.URL.RawQuery,
-		fwdHost: r.Host, timeout: 60 * time.Second, studio: true,
+		fwdHost: r.Host, timeout: 60 * time.Second, studio: true, noFraming: isStudioConsentPath(r.URL.Path),
 	})
 }
 
@@ -353,6 +385,8 @@ type target struct {
 	del       []string
 	timeout   time.Duration
 	studio    bool
+	// noFraming, for a Studio page that approves something (isStudioConsentPath), forbids framing it.
+	noFraming bool
 	// dashboardAuth marks the dashboard GoTrue route: its own CORS headers are replaced
 	// like the project API's, but the policy is set by serveDashboardAuth.
 	dashboardAuth bool
@@ -436,6 +470,9 @@ func (s *Server) forward(w http.ResponseWriter, r *http.Request, tg *target) {
 		ModifyResponse: func(res *http.Response) error {
 			if tg.studio {
 				rewriteStudioResponse(res.Header)
+				if tg.noFraming {
+					denyFraming(res.Header)
+				}
 			} else if !tg.keepCORS {
 				// One CORS policy, ours: upstream services add their own and the browser rejects duplicates.
 				for name := range res.Header {
@@ -458,9 +495,13 @@ func (s *Server) forward(w http.ResponseWriter, r *http.Request, tg *target) {
 				return
 			}
 			var ne net.Error
+			var tooLarge *http.MaxBytesError
 			switch {
 			case errors.Is(err, context.Canceled):
 				// The client went away; nothing to answer.
+			case errors.As(err, &tooLarge):
+				// A gate capped the body (the /mcp gate does) and the client sent more.
+				writeJSON(w, http.StatusRequestEntityTooLarge, "Request body too large")
 			case errors.As(err, &ne) && ne.Timeout():
 				s.log.Warn("proxy: upstream timeout", "upstream", tg.addr, "err", err)
 				writeJSON(w, http.StatusGatewayTimeout, "Upstream timed out")
