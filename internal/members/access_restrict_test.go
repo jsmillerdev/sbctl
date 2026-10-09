@@ -6,10 +6,13 @@ import (
 	"testing"
 )
 
-// U7: Restrict removes every organization but one from the questions an Access answers.
-func TestAccessRestrict(t *testing.T) {
+// U7: Restrict removes every organization but one from the questions an Access answers. The
+// Postgres variant runs in CI (SUPAVISE_TEST_DATABASE_URL) and skips without it.
+func TestAccessRestrict(t *testing.T)   { testAccessRestrict(t, newMemEnv(t)) }
+func TestAccessRestrictPG(t *testing.T) { testAccessRestrict(t, newPGEnv(t)) }
+
+func testAccessRestrict(t *testing.T, e *env) {
 	ctx := context.Background()
-	e := newMemEnv(t)
 	owner := e.owner(t, e.a)
 	ownerA := e.access(t, owner)
 

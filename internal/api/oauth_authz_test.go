@@ -126,9 +126,9 @@ func (f *oauthAuthzFake) lookupCount() int {
 }
 
 const (
-	otherRef = "cccccccccccccccccccc"
-	// someAuthID is the id of an authorization request the routes under test never find.
-	someAuthID = "0f0c8e8a-7b3d-4c55-9a5e-2d6a1b7c9e10"
+	authzOtherRef = "cccccccccccccccccccc"
+	// authzSomeAuthID is the id of an authorization request the routes under test never find.
+	authzSomeAuthID = "0f0c8e8a-7b3d-4c55-9a5e-2d6a1b7c9e10"
 )
 
 // oauthAuthzFixture is the roles fixture (one user per role in the organization "default") with a
@@ -150,7 +150,7 @@ func newOAuthAuthzFixture(t testing.TB) *oauthAuthzFixture {
 	if err := rf.srv.members.EnsureOwner(ctx, members.OrgRef{ID: other.ID, Slug: other.Slug}, rf.userID); err != nil {
 		t.Fatal(err)
 	}
-	rf.mgr.addProject(t, otherRef, "Project of the other organization", other.ID, registry.StatusActiveHealthy)
+	rf.mgr.addProject(t, authzOtherRef, "Project of the other organization", other.ID, registry.StatusActiveHealthy)
 	x := &oauthAuthzFixture{rolesFixture: rf, fake: newOAuthAuthzFake(), other: other}
 	rf.srv.oauth = x.fake
 	return x
@@ -166,10 +166,10 @@ func (x *oauthAuthzFixture) req(token, method, path string, body any) *httptest.
 	return x.doAs(token, method, path, body)
 }
 
-func refused(rec *httptest.ResponseRecorder) bool { return rec.Code == 401 || rec.Code == 403 }
+func authzRefused(rec *httptest.ResponseRecorder) bool { return rec.Code == 401 || rec.Code == 403 }
 
-// mcpScopes are the scopes of a dynamic app: what Claude Code and the other MCP clients get.
-var mcpScopes = oauth.AdvertisedScopes
+// authzMCPScopes are the scopes of a dynamic app: what Claude Code and the other MCP clients get.
+var authzMCPScopes = oauth.AdvertisedScopes
 
 func TestOAuthTokenCannotReachPlatform(t *testing.T) { // U1
 	x := newOAuthAuthzFixture(t)
@@ -182,9 +182,9 @@ func TestOAuthTokenCannotReachPlatform(t *testing.T) { // U1
 		{"GET", "/platform/projects"},
 		{"GET", "/platform/projects/" + testRef},
 		{"POST", "/platform/pg-meta/" + testRef + "/query"},
-		{"GET", "/platform/oauth/authorizations/" + someAuthID},
-		{"POST", "/platform/organizations/default/oauth/authorizations/" + someAuthID},
-		{"DELETE", "/platform/organizations/default/oauth/authorizations/" + someAuthID},
+		{"GET", "/platform/oauth/authorizations/" + authzSomeAuthID},
+		{"POST", "/platform/organizations/default/oauth/authorizations/" + authzSomeAuthID},
+		{"DELETE", "/platform/organizations/default/oauth/authorizations/" + authzSomeAuthID},
 		{"GET", "/platform/organizations/default/oauth/apps"},
 		{"POST", "/platform/organizations/default/oauth/apps"},
 	}
@@ -196,6 +196,14 @@ func TestOAuthTokenCannotReachPlatform(t *testing.T) { // U1
 	}
 	if n := x.fake.lookupCount(); n != 0 {
 		t.Errorf("a /platform route looked the token up %d times; it must be refused before any lookup", n)
+	}
+	// Nor can a personal access token decide an authorization request: approving mints a credential, so
+	// it takes a signed-in session (K5).
+	pat := x.pat("owner")
+	for _, c := range routes[7:10] {
+		if rec := x.req(pat, c.method, c.path, map[string]any{}); rec.Code != 401 {
+			t.Errorf("%s %s with a personal access token: %d, want 401", c.method, c.path, rec.Code)
+		}
 	}
 	// The dashboard's own session still works on the same routes.
 	if rec := x.doAs(x.jwt, "GET", "/platform/profile", nil); rec.Code != 200 {
@@ -269,7 +277,7 @@ func TestOAuthScopeEnforced(t *testing.T) { // U2
 			challenge := rec.Header().Get("WWW-Authenticate")
 			switch {
 			case c.want == "":
-				if refused(rec) {
+				if authzRefused(rec) {
 					t.Fatalf("%s %s refused: %d %s", c.method, c.path, rec.Code, rec.Body)
 				}
 			case c.want == "na":
@@ -304,7 +312,7 @@ func TestOAuthScopeEnforced(t *testing.T) { // U2
 	}
 	// Shrinking the app's scopes applies to the next request (the service's intersection).
 	narrow := x.token("owner", "projects:read", "database:read")
-	if rec := x.req(narrow, "POST", p+"/database/query/read-only", sql); refused(rec) {
+	if rec := x.req(narrow, "POST", p+"/database/query/read-only", sql); authzRefused(rec) {
 		t.Fatalf("before narrowing: %d", rec.Code)
 	}
 	x.fake.edit(narrow, func(i *oauth.AccessInfo) { i.Scopes = []string{"projects:read"} })
@@ -316,16 +324,16 @@ func TestOAuthScopeEnforced(t *testing.T) { // U2
 	pat := x.pat("owner")
 	for name, cred := range map[string]string{"session": x.jwt, "personal access token": pat} {
 		for _, path := range []string{"/v1/profile", p + "/config/disk", "/v1/organizations"} {
-			if rec := x.req(cred, "GET", path, nil); refused(rec) {
+			if rec := x.req(cred, "GET", path, nil); authzRefused(rec) {
 				t.Errorf("%s on GET %s: %d %s", name, path, rec.Code, rec.Body)
 			}
 		}
 	}
 }
 
-// goldenScopes renders the table that gates OAuth tokens: one line per operation that a scope opens,
+// authzGoldenScopes renders the table that gates OAuth tokens: one line per operation that a scope opens,
 // sorted, with the two operations the specs leave unannotated marked.
-func goldenScopes(t *testing.T) string {
+func authzGoldenScopes(t *testing.T) string {
 	t.Helper()
 	ops, err := Operations()
 	if err != nil {
@@ -351,7 +359,7 @@ func goldenScopes(t *testing.T) string {
 }
 
 func TestOAuthScopeGolden(t *testing.T) { // U2
-	got := goldenScopes(t)
+	got := authzGoldenScopes(t)
 	path := filepath.Join("testdata", "oauth_scopes.golden")
 	if os.Getenv("SUPAVISE_UPDATE_GOLDEN") != "" {
 		if err := os.WriteFile(path, []byte(got), 0o644); err != nil {
@@ -363,7 +371,7 @@ func TestOAuthScopeGolden(t *testing.T) { // U2
 		t.Fatal(err)
 	}
 	if got != string(want) {
-		t.Errorf("the scopes of the operations changed (a new Supabase spec?). Review the diff, then regenerate %s with SUPAVISE_UPDATE_GOLDEN=1.\n%s", path, firstDifference(string(want), got))
+		t.Errorf("the scopes of the operations changed (a new Supabase spec?). Review the diff, then regenerate %s with SUPAVISE_UPDATE_GOLDEN=1.\n%s", path, authzFirstDifference(string(want), got))
 	}
 	// Every scope is one the vocabulary knows, so no spec value silently becomes an unusable one.
 	for _, l := range strings.Split(got, "\n") {
@@ -381,8 +389,8 @@ func TestOAuthScopeGolden(t *testing.T) { // U2
 	}
 }
 
-// firstDifference names the first line two texts differ at.
-func firstDifference(want, got string) string {
+// authzFirstDifference names the first line two texts differ at.
+func authzFirstDifference(want, got string) string {
 	w, g := strings.Split(want, "\n"), strings.Split(got, "\n")
 	for i := 0; i < len(w) || i < len(g); i++ {
 		var a, b string
@@ -422,10 +430,10 @@ func TestOAuthScopeOverrides(t *testing.T) {
 	}
 }
 
-// mcpCalls is every Management API call the Supabase MCP server (packages/mcp-server-supabase,
+// authzMCPCalls is every Management API call the Supabase MCP server (packages/mcp-server-supabase,
 // platform/api-platform.ts) makes for its tools, by the route the server registers. Read-only mode
 // uses the read-only SQL route. Unlike a project-scoped tool, the account tools run with no project.
-var mcpCalls = []string{
+var authzMCPCalls = []string{
 	"GET /v1/organizations",
 	"GET /v1/organizations/{slug}",
 	"GET /v1/projects",
@@ -466,7 +474,7 @@ func TestMCPCallsAreCoveredByAdvertisedScopes(t *testing.T) { // U2
 		inSpec[op.Key()] = true
 	}
 	used := map[string]bool{}
-	for _, key := range mcpCalls {
+	for _, key := range authzMCPCalls {
 		if !inSpec[key] {
 			t.Errorf("%s is not an operation of the pinned specs", key)
 		}
@@ -486,15 +494,15 @@ func TestMCPCallsAreCoveredByAdvertisedScopes(t *testing.T) { // U2
 			t.Errorf("%s is advertised but no call of the MCP server needs it", s)
 		}
 	}
-	if n := len(mcpCalls); n != 31 {
+	if n := len(authzMCPCalls); n != 31 {
 		t.Errorf("the list holds %d calls; update it together with the MCP server's tools and this count", n)
 	}
 }
 
 func TestOAuthOrgBound(t *testing.T) { // U3
 	x := newOAuthAuthzFixture(t)
-	inA := x.token("owner", mcpScopes...)
-	inB := x.fake.issue(x.userID, x.other.ID, x.other.Slug, mcpScopes...)
+	inA := x.token("owner", authzMCPScopes...)
+	inB := x.fake.issue(x.userID, x.other.ID, x.other.Slug, authzMCPScopes...)
 
 	// The same user, with their session, belongs to both: the restriction is the token's.
 	both := x.doAs(x.jwt, "GET", "/v1/organizations", nil).Body.String()
@@ -514,14 +522,14 @@ func TestOAuthOrgBound(t *testing.T) { // U3
 	if !strings.Contains(orgs, `"default"`) || strings.Contains(orgs, `"other"`) {
 		t.Errorf("a token for default lists organizations: %s", orgs)
 	}
-	if !strings.Contains(projs, testRef) || !strings.Contains(projs, secondRef) || strings.Contains(projs, otherRef) {
+	if !strings.Contains(projs, testRef) || !strings.Contains(projs, secondRef) || strings.Contains(projs, authzOtherRef) {
 		t.Errorf("a token for default lists projects: %s", projs)
 	}
 	orgs, projs = listsOf(inB)
 	if strings.Contains(orgs, `"default"`) || !strings.Contains(orgs, `"other"`) {
 		t.Errorf("a token for other lists organizations: %s", orgs)
 	}
-	if strings.Contains(projs, testRef) || strings.Contains(projs, secondRef) || !strings.Contains(projs, otherRef) {
+	if strings.Contains(projs, testRef) || strings.Contains(projs, secondRef) || !strings.Contains(projs, authzOtherRef) {
 		t.Errorf("a token for other lists projects: %s", projs)
 	}
 
@@ -532,14 +540,14 @@ func TestOAuthOrgBound(t *testing.T) { // U3
 		method, path string
 		body         any
 	}{
-		{"GET", "/v1/projects/" + otherRef, nil},
-		{"GET", "/v1/projects/" + otherRef + "/api-keys", nil},
-		{"GET", "/v1/projects/" + otherRef + "/functions", nil},
-		{"POST", "/v1/projects/" + otherRef + "/database/query", sql},
-		{"POST", "/v1/projects/" + otherRef + "/database/query/read-only", sql},
-		{"GET", "/v1/projects/" + otherRef + "/types/typescript", nil},
-		{"POST", "/v1/projects/" + otherRef + "/pause", nil},
-		{"GET", "/v1/projects/" + otherRef + "/branches", nil},
+		{"GET", "/v1/projects/" + authzOtherRef, nil},
+		{"GET", "/v1/projects/" + authzOtherRef + "/api-keys", nil},
+		{"GET", "/v1/projects/" + authzOtherRef + "/functions", nil},
+		{"POST", "/v1/projects/" + authzOtherRef + "/database/query", sql},
+		{"POST", "/v1/projects/" + authzOtherRef + "/database/query/read-only", sql},
+		{"GET", "/v1/projects/" + authzOtherRef + "/types/typescript", nil},
+		{"POST", "/v1/projects/" + authzOtherRef + "/pause", nil},
+		{"GET", "/v1/projects/" + authzOtherRef + "/branches", nil},
 		{"GET", "/v1/organizations/other", nil},
 		{"GET", "/v1/organizations/other/members", nil},
 		{"GET", "/v1/organizations/other/entitlements", nil},
@@ -557,8 +565,8 @@ func TestOAuthOrgBound(t *testing.T) { // U3
 		t.Errorf("a token for other on a project of default: %d", rec.Code)
 	}
 	// Its own organization works, so the refusals above are about the organization.
-	for _, path := range []string{"/v1/projects/" + otherRef, "/v1/organizations/other", "/v1/organizations/other/members"} {
-		if rec := x.req(inB, "GET", path, nil); refused(rec) {
+	for _, path := range []string{"/v1/projects/" + authzOtherRef, "/v1/organizations/other", "/v1/organizations/other/members"} {
+		if rec := x.req(inB, "GET", path, nil); authzRefused(rec) {
 			t.Errorf("a token for other on GET %s: %d %s", path, rec.Code, rec.Body)
 		}
 	}
@@ -621,7 +629,7 @@ func TestOAuthRoleCap(t *testing.T) { // U4
 	}
 	// A Developer scoped to one project reaches that project only.
 	scoped := x.token("scoped", all...)
-	if rec := x.req(scoped, "GET", p+"/functions", nil); refused(rec) {
+	if rec := x.req(scoped, "GET", p+"/functions", nil); authzRefused(rec) {
 		t.Errorf("scoped Developer token on its project: %d %s", rec.Code, rec.Body)
 	}
 	if rec := x.req(scoped, "GET", "/v1/projects/"+secondRef+"/functions", nil); rec.Code != 403 {
@@ -652,7 +660,7 @@ func TestOAuthRoleCap(t *testing.T) { // U4
 	}
 	// A token for the Owner of a second organization is not Owner of the first: its grant's organization decides.
 	inOther := x.fake.issue(x.userID, x.other.ID, x.other.Slug, all...)
-	if rec := x.req(inOther, "PATCH", "/v1/projects/"+otherRef+"/postgrest", map[string]any{"max_rows": 5}); refused(rec) {
+	if rec := x.req(inOther, "PATCH", "/v1/projects/"+authzOtherRef+"/postgrest", map[string]any{"max_rows": 5}); authzRefused(rec) {
 		t.Errorf("Owner token in its own organization: %d %s", rec.Code, rec.Body)
 	}
 }
@@ -661,7 +669,7 @@ func TestOAuthRevocationMatrix(t *testing.T) { // U5
 	const path = "/v1/organizations"
 	setup := func(t *testing.T) (*oauthAuthzFixture, string) {
 		x := newOAuthAuthzFixture(t)
-		tok := x.token("dev", mcpScopes...)
+		tok := x.token("dev", authzMCPScopes...)
 		if rec := x.req(tok, "GET", path, nil); rec.Code != 200 {
 			t.Fatalf("baseline: %d %s", rec.Code, rec.Body)
 		}
@@ -718,7 +726,7 @@ func TestOAuthRevocationMatrix(t *testing.T) { // U5
 	t.Run("member of another organization only", func(t *testing.T) {
 		// A grant for an organization the user does not belong to (never admitted) is refused the same way.
 		x := newOAuthAuthzFixture(t)
-		tok := x.fake.issue(x.ids["dev"], x.other.ID, x.other.Slug, mcpScopes...)
+		tok := x.fake.issue(x.ids["dev"], x.other.ID, x.other.Slug, authzMCPScopes...)
 		want(t, x, tok, 401)
 	})
 	for _, why := range []string{"grant revoked", "app deleted", "organization deleted", "token expired"} {
@@ -750,20 +758,22 @@ func TestOAuthRevocationMatrix(t *testing.T) { // U5
 	})
 	t.Run("a lookup that answers nothing", func(t *testing.T) {
 		x, _ := setup(t)
-		x.srv.oauth = nilLookup{}
-		want(t, x, x.fake.issue(x.ids["dev"], x.org.ID, "default", mcpScopes...), 401)
+		x.srv.oauth = authzNilLookup{}
+		want(t, x, x.fake.issue(x.ids["dev"], x.org.ID, "default", authzMCPScopes...), 401)
 	})
 }
 
-// nilLookup answers "no error, no token info".
-type nilLookup struct{ oauth.Authority }
+// authzNilLookup answers "no error, no token info".
+type authzNilLookup struct{ oauth.Authority }
 
-func (nilLookup) LookupAccess(context.Context, string) (*oauth.AccessInfo, error) { return nil, nil }
+func (authzNilLookup) LookupAccess(context.Context, string) (*oauth.AccessInfo, error) {
+	return nil, nil
+}
 
 func TestOAuthTokensNeverInAccessTokens(t *testing.T) { // U6
 	x := newOAuthAuthzFixture(t)
 	ctx := context.Background()
-	tok := x.token("owner", mcpScopes...)
+	tok := x.token("owner", authzMCPScopes...)
 	before, err := x.reg.ListAccessTokens(ctx, x.userID)
 	if err != nil {
 		t.Fatal(err)
@@ -808,7 +818,7 @@ func TestOAuthTokensNeverInAccessTokens(t *testing.T) { // U6
 
 func TestOAuthTokenShape(t *testing.T) {
 	x := newOAuthAuthzFixture(t)
-	good := x.token("owner", mcpScopes...)
+	good := x.token("owner", authzMCPScopes...)
 	for name, tok := range map[string]string{
 		"prefix only":      oauth.AccessTokenPrefix,
 		"short":            good[:len(good)-1],
@@ -863,7 +873,7 @@ func TestOAuthPrincipal(t *testing.T) {
 	if err := x.srv.members.Store.SetMFAEnforced(context.Background(), x.org.ID, true); err != nil {
 		t.Fatal(err)
 	}
-	if rec := x.req(tok, "GET", "/v1/projects/"+testRef, nil); refused(rec) {
+	if rec := x.req(tok, "GET", "/v1/projects/"+testRef, nil); authzRefused(rec) {
 		t.Errorf("an organization that requires MFA refused an OAuth token: %d %s", rec.Code, rec.Body)
 	}
 	if rec := x.doAs(x.jwt, "GET", "/v1/projects/"+testRef, nil); rec.Code != 403 {
@@ -875,9 +885,9 @@ func TestOAuthLastUsedIsThrottled(t *testing.T) {
 	x := newOAuthAuthzFixture(t)
 	clock := time.Now()
 	x.srv.auth.now = func() time.Time { return clock }
-	tok := x.token("owner", mcpScopes...)
+	tok := x.token("owner", authzMCPScopes...)
 	x.fake.edit(tok, func(i *oauth.AccessInfo) { i.ExpiresAt = clock.Add(24 * time.Hour) })
-	other := x.token("owner", mcpScopes...)
+	other := x.token("owner", authzMCPScopes...)
 	x.fake.edit(other, func(i *oauth.AccessInfo) { i.ExpiresAt = clock.Add(24 * time.Hour) })
 	hit := func(tok string) {
 		if rec := x.req(tok, "GET", "/v1/projects", nil); rec.Code != 200 {
@@ -929,7 +939,7 @@ func TestOAuthLastUsedIsThrottled(t *testing.T) {
 
 func TestOAuthDisabledRefusesTokens(t *testing.T) {
 	x := newOAuthAuthzFixture(t)
-	tok := x.token("owner", mcpScopes...)
+	tok := x.token("owner", authzMCPScopes...)
 	if rec := x.req(tok, "GET", "/v1/projects", nil); rec.Code != 200 {
 		t.Fatalf("enabled: %d", rec.Code)
 	}
@@ -957,7 +967,7 @@ func TestOAuthDisabledRefusesTokens(t *testing.T) {
 // A server built without the OAuth wiring (an authenticator with no resolver) refuses every OAuth token.
 func TestOAuthWithoutResolver(t *testing.T) {
 	x := newOAuthAuthzFixture(t)
-	tok := x.token("owner", mcpScopes...)
+	tok := x.token("owner", authzMCPScopes...)
 	x.srv.auth.oauth = nil
 	if rec := x.req(tok, "GET", "/v1/projects", nil); rec.Code != 401 {
 		t.Errorf("%d", rec.Code)
