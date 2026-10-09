@@ -123,12 +123,6 @@ func (j *journal) record(ctx context.Context, name, detail string) error {
 	return nil
 }
 
-// note reports a line to the operator without making it a step: progress that a resume does not need.
-func (j *journal) note(ctx context.Context, name, detail string) {
-	reportStep(ctx, registry.MoveStep{Name: name, At: j.o.d.Now().UTC(), Detail: detail})
-	j.o.d.Log.Info("failover note", "move", j.label(), "step", name, "detail", detail)
-}
-
 func (j *journal) label() string {
 	if j.move.ID != 0 {
 		return fmt.Sprintf("%d", j.move.ID)
@@ -159,12 +153,6 @@ func (j *journal) snapshot() registry.Move {
 	m := j.move
 	m.Steps = append([]registry.MoveStep(nil), j.move.Steps...)
 	return m
-}
-
-func (j *journal) inRegistry() bool {
-	j.mu.Lock()
-	defer j.mu.Unlock()
-	return j.file == ""
 }
 
 // adopt moves the log from failover.json into a row of the moves table, step by step with the
@@ -242,58 +230,48 @@ func readStateFile(path string) (*stateFile, error) {
 	return &st, nil
 }
 
-// findServerMove returns the newest server move to the node at the epoch, or nil. A server move
-// that was adopted into the registry carries its epoch, which no other move of that node has.
-func findServerMove(ctx context.Context, st Store, to string, epoch int64) (*registry.Move, error) {
+// newestMove returns the newest move that pred accepts, or nil. The registry lists moves newest first.
+func newestMove(ctx context.Context, st Store, pred func(*registry.Move) bool) (*registry.Move, error) {
 	ms, err := st.ListMoves(ctx, "", 100)
 	if err != nil {
 		return nil, fmt.Errorf("failover: listing moves: %w", err)
 	}
 	for i := range ms {
 		m := ms[i]
-		if m.Scope == registry.MoveServer && m.ToNode == to && m.Epoch == epoch {
+		if pred(&m) {
 			return &m, nil
 		}
 	}
 	return nil, nil
 }
 
-// unfinished returns the newest move of the project when it is not done or aborted, or nil.
-func unfinishedProjectMove(ctx context.Context, st Store, ref string) (*registry.Move, error) {
-	ms, err := st.ListMoves(ctx, "", 100)
-	if err != nil {
-		return nil, fmt.Errorf("failover: listing moves: %w", err)
-	}
-	for i := range ms {
-		m := ms[i]
-		if m.Scope != registry.MoveProject || m.Ref != ref {
-			continue
-		}
-		if m.State == registry.MoveRunning || m.State == registry.MoveFailed {
-			return &m, nil
-		}
-		return nil, nil
+// unfinished passes on m from newestMove when it is running or failed, and answers nil for one that
+// is done or aborted.
+func unfinished(m *registry.Move, err error) (*registry.Move, error) {
+	if err != nil || m == nil || m.State == registry.MoveRunning || m.State == registry.MoveFailed {
+		return m, err
 	}
 	return nil, nil
+}
+
+// findServerMove returns the newest server move to the node at the epoch, or nil. A server move
+// that was adopted into the registry carries its epoch, which no other move of that node has.
+func findServerMove(ctx context.Context, st Store, to string, epoch int64) (*registry.Move, error) {
+	return newestMove(ctx, st, func(m *registry.Move) bool {
+		return m.Scope == registry.MoveServer && m.ToNode == to && m.Epoch == epoch
+	})
+}
+
+// unfinishedProjectMove returns the newest move of the project when it is not done or aborted, or nil.
+func unfinishedProjectMove(ctx context.Context, st Store, ref string) (*registry.Move, error) {
+	return unfinished(newestMove(ctx, st, func(m *registry.Move) bool {
+		return m.Scope == registry.MoveProject && m.Ref == ref
+	}))
 }
 
 // unfinishedServerMove returns the newest server move that is running or failed.
 func unfinishedServerMove(ctx context.Context, st Store) (*registry.Move, error) {
-	ms, err := st.ListMoves(ctx, "", 100)
-	if err != nil {
-		return nil, fmt.Errorf("failover: listing moves: %w", err)
-	}
-	for i := range ms {
-		m := ms[i]
-		if m.Scope != registry.MoveServer {
-			continue
-		}
-		if m.State == registry.MoveRunning || m.State == registry.MoveFailed {
-			return &m, nil
-		}
-		return nil, nil
-	}
-	return nil, nil
+	return unfinished(newestMove(ctx, st, func(m *registry.Move) bool { return m.Scope == registry.MoveServer }))
 }
 
 // journalFor wraps a registry move that already exists.
