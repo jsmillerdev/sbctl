@@ -291,8 +291,13 @@ c_replica_setup() {
 
 c_replica_shapes() {
   needs replica-setup
-  local ref key
-  for ref in $(refs); do onl n1 check_database_shapes "$ref" 1; done
+  local ref key i
+  # A replica's status can leave ACTIVE_HEALTHY for a moment while its PostgREST reloads its schema right after the
+  # setup; the shapes are looked at again, up to a minute, and the last look decides.
+  for ref in $(refs); do
+    for i in 1 2 3 4 5 6; do onl n1 check_database_shapes "$ref" 1 2>/dev/null && continue 2; sleep 10; done
+    onl n1 check_database_shapes "$ref" 1
+  done
   # `replicas ls` is a command of the leader (its help says so): it opens the registry for writing, which a follower's
   # standby refuses. It lists each replica on the other node.
   onl "$(lead)" supavise replicas ls

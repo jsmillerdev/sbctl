@@ -286,6 +286,11 @@ func (o *Orchestrator) Follow(ctx context.Context, from int, epoch int64) Server
 	if ok {
 		return st
 	}
+	// This node stopped for the switchover and has not heard from the node it stopped for yet (its daemon
+	// has just restarted, as a follower of it): the move is running there, and the client waits for it.
+	if rec, err := o.currentQuiesce(); err == nil && rec != nil && rec.Epoch == epoch {
+		return ServerStatus{State: "running", Next: from}
+	}
 	return ServerStatus{State: "idle"}
 }
 

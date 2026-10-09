@@ -1165,8 +1165,8 @@ func TestLiveFollowsTheSuccessorItStoppedFor(t *testing.T) {
 	if lead, ok := l.Leader(); !ok || lead.ID != "n2" {
 		t.Fatalf("the successor does not lead: %+v %v", lead, ok)
 	}
-	if l.Epoch() != 1 || l.Role() != RoleLeader || l.Fenced() != nil {
-		t.Fatalf("epoch %d, role %s, fenced %v: the snapshot keeps all but the leader", l.Epoch(), l.Role(), l.Fenced())
+	if l.Epoch() != 2 || l.Role() != RoleLeader || l.Fenced() != nil {
+		t.Fatalf("epoch %d, role %s, fenced %v: the snapshot takes the leader and its epoch and keeps the role", l.Epoch(), l.Role(), l.Fenced())
 	}
 	// A refresh with an unreadable registry (the database is still stopped) leaves it so.
 	l.o.Reg = unreadable{l.o.Reg}
@@ -1200,5 +1200,39 @@ func TestARegistryCopyBehindTheBootDecisionDoesNotTakeTheLeaderBack(t *testing.T
 	l.Refresh(ctx)
 	if lead, _ := l.Leader(); lead.ID != "n2" || l.Epoch() != 2 {
 		t.Fatalf("leader %+v at epoch %d after the copy caught up", lead, l.Epoch())
+	}
+}
+
+// The old leader of a planned switchover restarts as a follower with a copy of the registry that has not
+// replayed the move. It hears who leads from its peers and believes only the node its record says it
+// stopped for: the forwarders its standby streams through are bound from the leader the membership names.
+func TestAFollowerWithAStaleCopyFollowsTheSuccessorItStoppedFor(t *testing.T) {
+	cfg := config.Default()
+	cfg.StateDir = t.TempDir()
+	reg := registry.NewMemory()
+	ctx := context.Background()
+	if err := reg.CreateNode(ctx, &registry.Node{Name: "second", State: registry.NodeActive}); err != nil {
+		t.Fatal(err)
+	}
+	p := &probe{rec: true}
+	boot := BootDecision{Role: RoleFollower, SelfID: "n1", Joined: true}
+	l := NewLive(LiveOptions{Cfg: cfg, Reg: reg, SelfID: "n1", Boot: boot, InRecovery: p.InRecovery, Poll: 10 * time.Millisecond,
+		Successor: func(node string, epoch int64) bool { return node == "n2" && epoch >= 2 }})
+	l.Refresh(ctx) // the copy says: epoch 1, led by n1
+	if lead, _ := l.Leader(); lead.ID != "n1" || l.Epoch() != 1 {
+		t.Fatalf("the stale copy: leader %s at epoch %d", lead.ID, l.Epoch())
+	}
+	l.ObserveEpoch("n2", 1, "n2") // not a higher epoch
+	l.ObserveEpoch("n3", 2, "n3") // not the node this one stopped for
+	if lead, _ := l.Leader(); lead.ID != "n1" || l.Epoch() != 1 {
+		t.Fatalf("a claim nobody vouches for took the leadership: %s at %d", lead.ID, l.Epoch())
+	}
+	l.ObserveEpoch("n2", 2, "n2")
+	if lead, ok := l.Leader(); !ok || lead.ID != "n2" || l.Epoch() != 2 || l.Role() != RoleFollower {
+		t.Fatalf("leader %+v (%v) at epoch %d, role %s", lead, ok, l.Epoch(), l.Role())
+	}
+	l.Refresh(ctx) // the copy is still behind: it does not take the leader back
+	if lead, _ := l.Leader(); lead.ID != "n2" || l.Epoch() != 2 {
+		t.Fatalf("a refresh took the leadership back: %s at %d", lead.ID, l.Epoch())
 	}
 }

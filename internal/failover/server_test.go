@@ -1278,3 +1278,21 @@ func TestAuthorizesSuccessorFollowsTheRecordOfTheQuiesce(t *testing.T) {
 		}
 	}
 }
+
+// The old leader of a switchover has just restarted as a follower: it keeps no log of the move, and it
+// has not heard from the node it stopped for. Its record of the quiesce says the move is running there,
+// so a client that follows it waits instead of being told that nothing runs.
+func TestFollowWaitsWhileTheRecordOfTheQuiesceSaysTheMoveRunsElsewhere(t *testing.T) {
+	w := newWorld(t)
+	o := w.orch()
+	if st := o.Follow(w.ctx, 0, 2); st.State != "idle" {
+		t.Fatalf("with no record and no move: %+v", st)
+	}
+	must(t, o.saveQuiesce(&quiesceRecord{To: "n2", Epoch: 2, At: w.now()}))
+	if st := o.Follow(w.ctx, 0, 2); st.State != "running" {
+		t.Fatalf("with the record of the quiesce: %+v", st)
+	}
+	if st := o.Follow(w.ctx, 0, 3); st.State != "idle" {
+		t.Fatalf("the record of another epoch: %+v", st)
+	}
+}
