@@ -50,6 +50,8 @@ type Config struct {
 	BuiltinAuth *BuiltinAuth `json:"builtin_auth"`
 	// Projects are served in the order given. There must be at least one.
 	Projects []Project `json:"projects"`
+	// Authorizations are pending OAuth authorization requests for Studio's /authorize page.
+	Authorizations []Authorization `json:"authorizations"`
 }
 
 // BuiltinAuth is the single user of the built-in token endpoint.
@@ -117,6 +119,17 @@ func (c *Config) normalize() error {
 		if p.JWTSecret == "" {
 			p.JWTSecret = secrets.NewJWTSecret()
 		}
+	}
+	seenAuth := map[string]bool{}
+	for i := range c.Authorizations {
+		a := &c.Authorizations[i]
+		if err := a.normalize(); err != nil {
+			return err
+		}
+		if seenAuth[a.ID] {
+			return fmt.Errorf("duplicate authorization %s", a.ID)
+		}
+		seenAuth[a.ID] = true
 	}
 	return nil
 }

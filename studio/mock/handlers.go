@@ -38,6 +38,7 @@ func (s *server) registerReal() {
 		w.json(200, s.projectSettings(p))
 	}))
 	s.handle("POST", "/platform/pg-meta/{ref}/query", s.pgMetaQuery)
+	s.handle("POST", "/v1/projects/{ref}/database/query", s.managementQuery)
 
 	s.handle("POST", "/platform/projects/{ref}/api-keys/temporary", s.withProject(func(w *respWriter, r *http.Request, c *reqCtx, p *Project, n int) {
 		w.json(201, map[string]any{"api_key": s.legacyKey(p, "service_role")})
@@ -76,6 +77,7 @@ func (s *server) registerReal() {
 	s.handle("GET", "/v1/projects/{ref}/branches", s.withProject(func(w *respWriter, r *http.Request, c *reqCtx, p *Project, n int) {
 		w.json(200, []any{})
 	}))
+	s.registerOAuth()
 	s.handle("GET", "/v1/projects/{ref}/health", s.withProject(func(w *respWriter, r *http.Request, c *reqCtx, p *Project, n int) {
 		var out []map[string]any
 		for _, name := range []string{"auth", "db", "pooler", "realtime", "rest", "storage"} {
