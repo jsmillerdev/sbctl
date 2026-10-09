@@ -159,14 +159,22 @@ The server move writes the new leader and epoch to `_node/leader.json` in the ba
 
 | Case | Data lost (RPO) | Label |
 |---|---|---|
-| Planned switchover | none: the old primary stops cleanly and the replica replays to its final checkpoint before it is promoted | Designed, covered by tests that run real clusters for the replica steps; no recorded run of a full move |
-| Unplanned, replica streaming | the replication lag at the failure. The lag alert opens at 60 seconds, and a move refuses a replica over `max_lag_seconds` without `--force`. | Designed; lag p99 was 0.10 to 0.41 s at 20 MB/s of WAL over 2 to 70 ms of round trip (**Measured** in spike S6) |
+| Planned switchover | none: the old primary stops cleanly and the replica replays to its final checkpoint before it is promoted | **Measured** by the two-server release test (`replication` workflow): a continuous writer lost no acknowledged row in any project or server move of the runs below |
+| Unplanned, replica streaming | the replication lag at the failure. The lag alert opens at 60 seconds, and a move refuses a replica over `max_lag_seconds` without `--force`. | **Measured**: the test stopped the leader at once under a writer of 20 rows a second (the replay lag before the stop was 1 to 5 ms) and no acknowledged row was lost (0.000 s of writes) in five runs. Lag p99 was 0.10 to 0.41 s at 20 MB/s of WAL over 2 to 70 ms of round trip (spike S6) |
 | Unplanned, stream broken | up to `archive_timeout` (**Setting**, `[backup] archive_timeout_seconds`, 300 s) plus the upload time | Designed |
 | Project with no replica, `--restore-missing` | the same bound | Designed |
 | Storage objects | none on S3. The file backend refuses a server move. | As built |
 | Realtime events in flight | lost | Designed |
 
-RTO is the time to promote and re-register. The design expects tens of seconds for the control plane and one to three minutes for tens of projects (**Designed**). No run records it. A move reports each step, so a run on your servers gives your own figure.
+RTO is the time to promote and re-register. The release test measures it as the time from the stop of the old leader to the first write that a client sees acknowledged on the new primary, with two small projects and a client that sends 20 inserts a second through the proxy:
+
+| Case | amd64 (virtual machines) | arm64 (system containers) |
+|---|---|---|
+| `supavise failover --force` after the leader stopped at once (the whole server, two projects) | 74 to 85 s | 51 to 56 s |
+| Planned switchover of the server (`supavise failover --to`): the longest gap the writer saw | 34 to 58 s | 34 to 47 s |
+| Planned switchover of one project (`supavise projects failover`): the longest gap the writer saw | 1.4 to 3.7 s | 1.2 to 2.0 s |
+
+These are **Measured** on two-core machines with 5 GiB each, over a bridge with 0.2 to 0.4 ms of round trip, and are what a cluster of that size does, not a promise: the figure grows with the number of projects (each promoted replica starts its own services) and with the time the old leader's last WAL needs to reach the store. A move reports each step, so a run on your servers gives your own figure.
 
 ## Configuration
 
