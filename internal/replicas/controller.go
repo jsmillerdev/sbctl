@@ -173,16 +173,6 @@ func (c *Controller) interval() time.Duration {
 	return 10 * time.Second
 }
 
-// reportSlack is how late a node's report may come, past the period nodes send them at, and still be the
-// latest word on a replica.
-const reportSlack = 3 * time.Second
-
-// reportWindow is how old a node's report may be before monitor asks the node itself: the period nodes
-// report at (cluster.ReportEvery) plus slack, and never less than a pass interval less a second.
-func (c *Controller) reportWindow() time.Duration {
-	return max(cluster.ReportEvery+reportSlack, c.interval()-time.Second)
-}
-
 func (c *Controller) minGap() time.Duration {
 	if c.o.MinGap > 0 {
 		return c.o.MinGap
@@ -420,7 +410,10 @@ func (c *Controller) work(ctx context.Context, r *registry.Replica, project regi
 // the pass at once; one that repeats it only refreshes the observations, which the periodic pass reads.
 func (c *Controller) HandleReport(ctx context.Context, rep peerapi.Report) {
 	if len(rep.Instances) == 0 {
-		c.reportChanged(rep.Node, nil) // the next report with instances is news
+		// Instances that are gone from a node's report are news once; a node with none, every time, is not.
+		if c.reportChanged(rep.Node, nil) {
+			c.kick()
+		}
 		return
 	}
 	// The intake runs this in its own goroutine and must not wait long: one query for the node's
@@ -453,7 +446,8 @@ func (c *Controller) HandleReport(ctx context.Context, rep peerapi.Report) {
 
 // reportChanged remembers the instances node reported and says whether they differ from the ones it
 // reported before: the first report of a node does, and so does a change of any field but the time of
-// the observation.
+// the observation, and so does the first empty report after one with instances. (Empty reports after
+// that say nothing new.)
 func (c *Controller) reportChanged(node string, instances []peerapi.InstanceStatus) bool {
 	next := slices.Clone(instances)
 	for i := range next {
@@ -465,10 +459,10 @@ func (c *Controller) reportChanged(node string, instances []peerapi.InstanceStat
 	prev, seen := c.lastReport[node]
 	if len(next) == 0 {
 		delete(c.lastReport, node)
-	} else {
-		c.lastReport[node] = next
+		return seen
 	}
-	return len(next) > 0 && (!seen || !reflect.DeepEqual(prev, next))
+	c.lastReport[node] = next
+	return !seen || !reflect.DeepEqual(prev, next)
 }
 
 // nodeLabel is how a message names a node: the operator's name for it.

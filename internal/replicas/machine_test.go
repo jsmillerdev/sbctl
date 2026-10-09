@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/supavise/supavise/internal/alerts"
-	"github.com/supavise/supavise/internal/cluster"
 	"github.com/supavise/supavise/internal/lifecycle"
 	"github.com/supavise/supavise/internal/mesh"
 	"github.com/supavise/supavise/internal/placement"
@@ -580,35 +579,39 @@ func TestHandleReportWakesThePassOnlyForNews(t *testing.T) {
 	if !woken() {
 		t.Fatal("a report with another field changed did not wake the pass")
 	}
-	// An instance that dropped out of the reports and came back is news.
+	// An instance that dropped out of the reports is news once, and so is its return.
 	e.ctrl.HandleReport(e.ctx, reportOf("n2"))
+	if !woken() {
+		t.Fatal("an instance that dropped out of the reports did not wake the pass")
+	}
+	e.ctrl.HandleReport(e.ctx, reportOf("n2"))
+	if woken() {
+		t.Fatal("a second empty report woke the pass")
+	}
 	e.ctrl.HandleReport(e.ctx, reportOf("n2", changed))
 	if !woken() {
 		t.Fatal("an instance that came back did not wake the pass")
 	}
 }
 
-// The monitor takes a node's report for current for as long as the nodes' reporting period and some
-// slack, so that a pass between two reports does not ask the node.
-func TestMonitorTrustsAReportForThePeriodPlusSlack(t *testing.T) {
+// The monitor takes a node's report for current for a pass interval less a second, and asks the node
+// itself for anything older: a node that stops reporting is found by the first pass after that.
+func TestMonitorAsksTheNodeOnceItsReportIsOlderThanTheInterval(t *testing.T) {
 	e := newEnv(t)
 	id := e.activeReplica().Identifier
-	report := func() {
-		e.ctrl.HandleReport(e.ctx, reportOf("n2", fakeStatus(id, refA)))
-	}
+	e.ctrl.HandleReport(e.ctx, reportOf("n2", fakeStatus(id, refA)))
 	polls := func() int { return e.nodes.callsMatching("observe n2 " + id) }
-
-	report()
 	before := polls()
-	e.clock.Advance(cluster.ReportEvery + time.Second) // the next report is due: the pass comes first
+
+	e.clock.Advance(e.ctrl.interval() - 2*time.Second)
 	e.tick(1)
 	if got := polls(); got != before {
-		t.Fatalf("asked the node although its report was %s old: %d -> %d", cluster.ReportEvery+time.Second, before, got)
+		t.Fatalf("asked the node although its report was %s old: %d -> %d", e.ctrl.interval()-2*time.Second, before, got)
 	}
-	e.clock.Advance(cluster.ReportEvery) // a report that never came
+	e.clock.Advance(2 * time.Second)
 	e.tick(1)
 	if got := polls(); got != before+1 {
-		t.Fatalf("a report from two periods ago was taken for current: %d -> %d", before, got)
+		t.Fatalf("a report as old as the interval was taken for current: %d -> %d", before, got)
 	}
 }
 
