@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -10,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/supavise/supavise/internal/api"
 	"github.com/supavise/supavise/internal/config"
 	"github.com/supavise/supavise/internal/lifecycle"
 	"github.com/supavise/supavise/internal/registry"
@@ -278,6 +280,55 @@ func TestDeleteProjectStopsWhileReplicasRemain(t *testing.T) {
 	n := &lifecycle.Node{Registry: reg, Cfg: config.Default()}
 	if err := deleteProject(ctx, n, replicaTestRef, false); err == nil || !strings.Contains(err.Error(), id) {
 		t.Fatalf("delete with a replica: %v", err)
+	}
+}
+
+// `orgs delete` removes each project's replicas before the project, as the API's organization delete does:
+// the organization and the project stay, the replica is marked GOING_DOWN, and the Engine is never
+// reached (a nil Engine would stop the test). Deleting the project row would take the replica rows with
+// it and leave their instances on the other nodes.
+func TestOrgDeleteStopsAtAProjectWhoseReplicasRemain(t *testing.T) {
+	reg, _ := replicaTestEnv(t)
+	ctx := context.Background()
+	if _, err := reg.CreateOrganization(ctx, "keep", "Keep"); err != nil {
+		t.Fatal(err)
+	}
+	scrap, err := reg.CreateOrganization(ctx, "scrap", "Scrap")
+	if err != nil {
+		t.Fatal(err)
+	}
+	const ref = "bbbbbbbbbbbbbbbbbbbb"
+	if err := reg.CreateProject(ctx, &registry.Project{Ref: ref, OrgID: scrap.ID, Name: "scrap app", Status: registry.StatusActiveHealthy}); err != nil {
+		t.Fatal(err)
+	}
+	id := registry.ReplicaIdentifier(ref, "eu-west-1", "abc123")
+	if err := reg.CreateReplica(ctx, &registry.Replica{Identifier: id, Ref: ref, NodeID: "n2", Origin: registry.ReplicaManual,
+		Status: "ACTIVE_HEALTHY"}); err != nil {
+		t.Fatal(err)
+	}
+
+	var out, errw bytes.Buffer
+	n := &lifecycle.Node{Registry: reg, Cfg: config.Default()}
+	d := &api.OrgDeleter{Reg: reg, DeleteProject: orgProjectDeleter(n, func(context.Context, string) error {
+		t.Error("a branch is not what this organization holds")
+		return nil
+	}, &out, &errw)}
+	_, err = d.Delete(ctx, nil, scrap)
+	var oe *api.OrgDeleteError
+	if !errors.As(err, &oe) || oe.Ref != ref || !strings.Contains(err.Error(), id) || !strings.Contains(err.Error(), "still being removed") {
+		t.Fatalf("org delete with a replica that cannot be reached: %v", err)
+	}
+	if out.Len() != 0 {
+		t.Errorf("the project is reported deleted: %q", out.String())
+	}
+	if _, err := reg.GetOrganization(ctx, "scrap"); err != nil {
+		t.Errorf("the organization went with a project that was not deleted: %v", err)
+	}
+	if _, err := reg.GetProject(ctx, ref); err != nil {
+		t.Errorf("the project: %v", err)
+	}
+	if r, err := reg.GetReplica(ctx, id); err != nil || r.Status != "GOING_DOWN" {
+		t.Errorf("the replica after the refusal: %+v, %v", r, err)
 	}
 }
 
