@@ -159,7 +159,9 @@ func New(o Options) *Manager {
 		Handler:           http.HandlerFunc(m.serveRPC),
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       30 * time.Second,
-		ErrorLog:          slog.NewLogLogger(o.Log.Handler(), slog.LevelDebug),
+		// A handler that panics or a connection the server drops is logged at warning: the caller sees only a stream
+		// that closed without an answer ("unexpected EOF"), and the reason is here or nowhere.
+		ErrorLog: slog.NewLogLogger(o.Log.Handler(), slog.LevelWarn),
 		ConnContext: func(ctx context.Context, c net.Conn) context.Context {
 			if rc, ok := c.(*rpcConn); ok {
 				return WithPeer(ctx, rc.peer)
@@ -835,7 +837,7 @@ func (m *Manager) handleStream(st net.Conn, node, remote string) {
 	h, err := ReadHeader(st)
 	_ = st.SetReadDeadline(time.Time{})
 	if err != nil {
-		m.o.Log.Debug("mesh: bad stream header", "node", node, "error", err)
+		m.o.Log.Warn("mesh: a stream was closed because its header could not be read", "node", node, "error", err)
 		_ = st.Close()
 		return
 	}
@@ -846,6 +848,7 @@ func (m *Manager) handleStream(st net.Conn, node, remote string) {
 		select {
 		case m.rpcCh <- &rpcConn{Conn: st, peer: peer}:
 		case <-time.After(10 * time.Second):
+			m.o.Log.Warn("mesh: an rpc stream was closed unanswered because the peer API server did not take it for 10 s", "node", node)
 			_ = st.Close()
 		}
 	case StreamForward:
