@@ -208,6 +208,26 @@ The Infrastructure page, the SQL editor's source selector and the reports read t
 
 Not a Studio call: `GET /supavise/v1/failover/readiness` (Owners and Administrators) returns what the failover block of `supavise status` shows. A server that is not part of a cluster answers `404`.
 
+## OAuth sign-in for MCP clients
+
+The consent page (`pages/authorize.tsx`), the organization's OAuth Apps page (`pages/org/[slug]/apps.tsx`) and the Connect > MCP panel work with the pinned Studio unchanged. Supavise answers their calls from `internal/api` (`oauth_consent.go`, `oauth_apps_api.go`) over `internal/oauth`, with the shapes of the platform spec. [design.md](../design.md#13-oauth-sign-in-and-the-remote-mcp-endpoint) section 13 has the rules.
+
+| Call | What Studio does with it | What Supavise answers |
+|---|---|---|
+| (not Studio) `GET /v1/oauth/authorize` | The MCP client opens it. | `302` to `studio.<domain>/authorize?auth_id=<uuid>[&organization_slug=<slug>]`, where Studio's `withAuth` signs the user in through `api.<domain>/auth/v1` and returns to the page. Whether that return works through SSO and MFA sign-in is unverified. |
+| `GET /platform/oauth/authorizations/{id}` | The page shows the client's name, the redirect host, the scopes and an organization picker. | `200 {name, website, icon?, domain, redirect_uri, expires_at, approved_at?, approved_organization_slug?, scopes, registration_type}`. `domain` is the host of the requested redirect URI, and `icon` is left out for a dynamic app. An unknown id is `404`. An expired request still answers `200`, because Studio computes "expired" from `expires_at`. Owners and Administrators only, so a Developer gets `403` (how Studio shows that is unverified). |
+| `POST /platform/organizations/{slug}/oauth/authorizations/{id}?skip_browser_redirect=true` | Approve. Studio sets `window.location.href` to the returned `url`. | `201 {url}` with `<redirect_uri>?code=…&state=…&iss=…`, and `Cache-Control: no-store`. `409` for a request decided already, `410` for an expired one, `403` when `{slug}` differs from the request's `organization_slug` or the caller is not an Owner or Administrator of it. A session below aal2 is refused when the caller belongs to an organization that enforces MFA. |
+| `DELETE /platform/organizations/{slug}/oauth/authorizations/{id}` | Decline. Studio shows a toast and goes to `/organizations`. | `200 {id}`. The client is not told and waits for its own timeout; hosted behaves the same way. |
+| `GET /platform/organizations/{slug}/oauth/apps?type=authorized` | The Authorized tab. | One item per app with a live grant in the organization: `id`, `app_id` and `client_id` are the app's UUID; `authorized_at` is the newest live grant's creation time; `scopes` are the union of the grants' effective scopes. A dynamic app has no `icon` and an empty `website`. |
+| `GET …/oauth/apps?type=published` | The Published tab. | The organization's manual apps. |
+| `POST …/oauth/apps`, `PUT` and `DELETE …/oauth/apps/{id}` | Publish, edit and delete an app. | `201 {id, client_id, client_secret, client_secret_expires_at: 0, redirect_uris}` (the plaintext secret appears here only); `200`; `200`, which also revokes the app's grants. |
+| `POST …/oauth/apps/{id}/revoke` | The Revoke button. | `201 {id, name, website, icon?, authorized_at?}`; revokes the app's live grants in this organization for every user. |
+| `GET`, `POST` `…/oauth/apps/{app_id}/client-secrets`, `DELETE …/client-secrets/{secret_id}` | A manual app's secrets. | Secret ids are UUIDs, the list shows `sba_xxxx********` aliases only, and the plaintext appears once, on create. A dynamic app's id answers `404`. |
+
+The Owner and Administrator rule of the existing `oauth_apps` permission covers the organization routes, so no permission list changes.
+
+**The Connect > MCP panel.** It reads `NEXT_PUBLIC_MCP_URL` (patch 0004 adds the placeholder; `studio/placeholders.json`), which the fleet sets to `<api url>/mcp`, and shows `<url>?project_ref=<ref>` with the Claude Code, Cursor, VS Code and Codex snippets. The panel's own text, "OAuth 2.1 with dynamic client registration", describes what the node does.
+
 ## Where the spec and Studio disagree
 
 - `GET /platform/projects/{ref}/status`: the spec documents a 200 without a body; Studio reads `{status}`.
@@ -222,6 +242,7 @@ Not a Studio call: `GET /supavise/v1/failover/readiness` (Owners and Administrat
 | Route | What it does | Needs outside access? |
 |---|---|---|
 | `/api/get-utc-time`, `/api/get-ip-address`, `/api/get-deployment-commit` | clock, caller IP, build commit | no |
+| `/api/mcp` | Studio's MCP server (`POST` only, stateless Streamable HTTP) | in platform mode patch 0004 serves it, built on the bearer token it receives and calling the Management API on loopback (`SUPAVISE_MANAGEMENT_API_URL`). The proxy answers `404` for it on `studio.<domain>` and forwards to it only from `api.<domain>/mcp`, after the gate has authenticated the caller. `search_docs` reaches `supabase.com` |
 | `/api/incident-banner` | incident.io banner list, requested on every page | yes: incident.io. Answers 500 without a key and delays sign-in; the Supavise proxy answers it with a static `{"incidents": []}` on the Studio host (see "Findings from running Studio") |
 | `/api/incident-status`, `/api/status-page`, `/api/status-override` | status banner and incident pages | yes: statuspage.io, incident.io; failure behavior unverified |
 | `/api/ai/*` | AI assistant | yes: needs `OPENAI_API_KEY` (server env); an absent key disables the assistant (from reading the code, unverified) |
@@ -243,7 +264,7 @@ These are not Management API calls. They need the project hosts (`<ref>.api.<dom
 
 `studio/spike.sh` runs this Studio build against the mock Management API with a real Postgres, GoTrue and postgres-meta, and drives it with headless Chrome. It visits sign-in, the project list, and for each of two projects the table editor, SQL editor, project home, Auth users, Storage files, Database tables and Settings. Other pages (Realtime, Edge Functions, Logs, Advisors, Integrations, Reports, organization and account pages) are readings of the code only. The findings:
 
-1. **Sign-in waits for the incident banner.** After the token call Studio waits for `GET /api/incident-banner`, which answers 500 without an incident.io key; react-query retries after 1, 4 and 16 s, and the sign-in form awaits the query cache reset, so sign-in took about 22 s. The Supavise proxy answers `GET studio.<domain>/api/incident-banner` with a static `{"incidents": []}` (`internal/proxy/studio.go`), which keeps the artifact at its three patches. Sign-in then takes about 1 s.
+1. **Sign-in waits for the incident banner.** After the token call Studio waits for `GET /api/incident-banner`, which answers 500 without an incident.io key; react-query retries after 1, 4 and 16 s, and the sign-in form awaits the query cache reset, so sign-in took about 22 s. The Supavise proxy answers `GET studio.<domain>/api/incident-banner` with a static `{"incidents": []}` (`internal/proxy/studio.go`), which needs no patch to Studio. Sign-in then takes about 1 s.
 2. **`null` in an array field crashes a page.** `GET /v1/projects/{ref}/upgrade/eligibility` with `validation_errors: null` threw in Settings, General. Stubs return `[]` for array fields. The analytics endpoints (`usage.api-counts`) need `{"result": []}`: a bare `{}` shows "Failed to load project usage" on the project home.
 3. **Studio calls Usercentrics on every page load** (`https://api.usercentrics.eu/settings//latest/languages.json`, with an empty settings id) even though `NEXT_PUBLIC_USERCENTRICS_RULESET_ID` is unset. Studio's CSP allows the host by default, so the proxy removes every `usercentrics.eu` source from the `Content-Security-Policy` it forwards and the browser refuses the request. A patch that skips initialization when the ruleset id is unset would remove the cause; none exists.
 4. **Health status values.** `/v1/projects/{ref}/health` entries use `status: "ACTIVE_HEALTHY"` (enum `COMING_UP | ACTIVE_HEALTHY | UNHEALTHY`). Any other value shows an alert icon and the raw text per service and re-polls every 5 s.

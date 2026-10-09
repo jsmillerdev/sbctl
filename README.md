@@ -31,7 +31,7 @@
 Self-hosted Supabase runs one project per Docker stack, with a single-project dashboard. Supavise gives you the multi-project platform instead.
 
 - **Many projects, one server.** Run about 20 projects with room for traffic on an 8 GB server.
-- **The tools you already use.** Supabase Studio and `supabase-js` work against your server, and apps only change the URL. The Supabase CLI connects with a profile file.
+- **The tools you already use.** Supabase Studio and `supabase-js` work against your server, and apps only change the URL. The Supabase CLI connects with a profile file, and AI tools such as Claude Code, Cursor and VS Code [sign in to the server's MCP endpoint with OAuth](docs/guide.md#connect-an-ai-tool-to-a-project).
 - **A database for every agent.** Give each preview or AI agent its own branch or project in seconds.
 - **A second server when you need one.** Join it to the first for read replicas, a planned switchover or a failover.
 

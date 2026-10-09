@@ -6,6 +6,7 @@ This guide picks up after the install in the [README](../README.md#get-started).
 - [Create a project and connect an app](#create-a-project-and-connect-an-app)
 - [Use the Supabase CLI](#use-the-supabase-cli)
 - [Give an agent or a preview its own branch](#give-an-agent-or-a-preview-its-own-branch)
+- [Connect an AI tool to a project](#connect-an-ai-tool-to-a-project)
 - [Back up and restore](#back-up-and-restore)
 - [Monitor the node](#monitor-the-node)
 - [Read replicas and failover](#read-replicas-and-failover)
@@ -67,6 +68,34 @@ supabase --profile ./supavise-profile.yaml branches get agent-task-42 --project-
 `branches get` prints the branch's connection details. A branch with data needs the Owner or Administrator role; Developers create schema-only branches (leave out `--with-data`). A branch deletes itself after 7 days unless you mark it persistent.
 
 The same branch is one call to `POST /v1/projects/<ref>/branches` with `{"branch_name": "agent-task-42", "with_data": true}`. The Supabase MCP server's branch tools work when you start it with `--api-url https://api.<domain>` and without `--project-ref`.
+
+## Connect an AI tool to a project
+
+An MCP client such as Claude Code, Cursor, VS Code, Codex or the Claude desktop connector signs in to your node with OAuth, so you don't create a personal access token. In Studio, open **Connect**, then **MCP**. The panel shows the URL of your node's MCP server:
+
+```
+https://api.<domain>/mcp?project_ref=<ref>
+```
+
+Add it to your client with the snippet the panel shows. For Claude Code:
+
+```bash
+claude mcp add --scope project --transport http supabase "https://api.<domain>/mcp?project_ref=<ref>"
+```
+
+Then start `claude`, run `/mcp` and choose **Authenticate**. The client opens Studio's "Authorize API access" page. Sign in to Studio if it asks, pick the organization and approve. The client keeps working with that organization's projects until you revoke it.
+
+- **Who can approve.** Owners and Administrators of the organization. A Developer or Read-only member who opens the link cannot approve.
+- **What the client can do.** It acts as the person who approved, in the one organization they picked, with that person's current role: if the role is reduced, the client loses the same rights at once. Each client also asks for scopes (for example `database:read` or `projects:write`), and the page lists them before you approve. A client cannot create organizations, read your profile or call the dashboard's own endpoints.
+- **Read-only and narrower sessions.** Add `&read_only=true` to the URL and the client gets no tools that write, and its SQL runs read-only. `&features=docs,database` limits the tools to those feature groups. Leave out `project_ref` and the client works across the organization's projects, with account tools such as `list_projects`.
+- **Revoke.** In Studio, open the organization's **OAuth Apps** page, then **Authorized**, and choose **Revoke** next to the client. The client's next call gets a 401, which MCP clients read as the signal to refresh or sign in again. On the server, `sudo -u supavise supavise oauth grants list` shows the grants, and `supavise oauth grants revoke --user <email>` (or `<id>`, `--org`, `--app` or `--all`; `--yes` skips the confirmation) ends them. Removing a user with `supavise users remove` ends theirs.
+- **Tokens.** An access token lasts 1 hour. A refresh token lasts 90 days and each use renews it, so a client that you use at least every 90 days doesn't ask you to sign in again. The client refreshes on its own.
+- **Your own clients.** Owners and Administrators can publish an app with fixed scopes and a client secret on the **OAuth Apps** page, **Published** tab. Clients that register themselves (all the tools above) are listed under **Authorized** once someone approves them.
+- **Personal access tokens still work.** A client that can set a header can send `Authorization: Bearer sbp_…` to the same URL.
+
+Two things to know about the server. Its documentation search, `search_docs`, calls `supabase.com` from your node, as on hosted Supabase. And the `skip_elicitations` option is accepted and ignored, because the endpoint cannot ask the client to confirm a cost.
+
+To turn OAuth sign-in off, set `disable_oauth = true` in the `[api]` section of `/etc/supavise/config.toml` and restart `supavise.service`: the MCP URL, the sign-in endpoints and the OAuth Apps page then stop working, and Studio is no longer given the URL. Personal access tokens and the dashboard keep working. [Design, section 13](design.md#13-oauth-sign-in-and-the-remote-mcp-endpoint) describes how it works.
 
 ## Back up and restore
 
@@ -146,6 +175,7 @@ By default every move is yours to start. `[failover] mode = "project"` or `"serv
 | Organizations | One | Many, each with its own members and projects | Many |
 | Dashboard | Studio for a single project | Supabase Studio in its hosted, multi-project mode | Supabase Studio |
 | Management API and `supabase link` | Not available | Yes: the parts that Studio, the Supabase CLI and the MCP server call | Yes |
+| Remote MCP server with OAuth sign-in | Not available | Yes, at `api.<domain>/mcp`, one organization per sign-in | Yes |
 | Branching | Not available | Yes, schema-only or with data | Yes |
 | Point-in-time restore | Not included; you set up backups yourself | Yes, in the dashboard (in place) or with `supavise backups restore` on the server | Yes |
 | Edge Functions | Yes | Yes, on by default | Yes |

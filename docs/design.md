@@ -1,10 +1,10 @@
 # Multi-tenant self-hosted Supabase: final design
 
-Status: v1.0, with the cluster work of [section 12](#12-clusters-replicas-and-failover).
+Status: v1.0, with the cluster work of [section 12](#12-clusters-replicas-and-failover) and the MCP sign-in of [section 13](#13-oauth-sign-in-and-the-remote-mcp-endpoint).
 
 ## 1. In one paragraph
 
-One static Go binary, `supavise`, turns a Linux machine into a multi-project Supabase for a team. It runs Supabase's own native service artifacts as systemd units: three per project (Postgres, GoTrue, PostgREST) and a handful shared (Supavisor, Realtime, Storage, postgres-meta, Studio). The binary itself is the edge proxy with automatic TLS, the Management API that Studio, the Supabase CLI and the Supabase MCP server talk to, the project lifecycle engine, and the WAL archiver. No Docker, no Envoy, no third-party gateway, no fork of any Supabase service. A team installs it with one command or one CloudFormation click and gets a dashboard that behaves like supabase.com, for up to about a hundred projects. A second server can join the first for per-project read replicas, a planned switchover and failover (section 12).
+One static Go binary, `supavise`, turns a Linux machine into a multi-project Supabase for a team. It runs Supabase's own native service artifacts as systemd units: three per project (Postgres, GoTrue, PostgREST) and a handful shared (Supavisor, Realtime, Storage, postgres-meta, Studio). The binary itself is the edge proxy with automatic TLS, the Management API that Studio, the Supabase CLI and the Supabase MCP server talk to (and the OAuth server that signs remote MCP clients in, section 13), the project lifecycle engine, and the WAL archiver. No Docker, no Envoy, no third-party gateway, no fork of any Supabase service. A team installs it with one command or one CloudFormation click and gets a dashboard that behaves like supabase.com, for up to about a hundred projects. A second server can join the first for per-project read replicas, a planned switchover and failover (section 12).
 
 ## 2. Why this shape is the native one
 
@@ -25,7 +25,7 @@ Supabase never open-sourced the management API, the per-machine agent or the edg
 | `supavise-realtime` | 1 | tenants by first host label |
 | `supavise-storage` | 1 | `MULTI_TENANT=true`, tenants by `x-forwarded-host`, file backend or S3 |
 | `supavise-pgmeta` | 1 | stateless; per-request encrypted connection string from `supavise` |
-| `supavise-studio` | 1 | our build of the upstream tag; platform mode, three small patches |
+| `supavise-studio` | 1 | our build of the upstream tag; platform mode, four small patches; it also serves the remote MCP route behind `api.<domain>/mcp` (section 13) |
 | `supavise-postgres@<ref>` | per project | the project's cluster, full extension set, own Vault key |
 | `supavise-gotrue@<ref>` | per project | about 12 MB |
 | `supavise-postgrest@<ref>` | per project | about 9 MB |
@@ -59,9 +59,10 @@ Creation takes well under a minute. Delete is the reverse, with a final base bac
 
 | Tool | How it connects | Patch needed |
 |---|---|---|
-| Studio | our platform-mode build; `NEXT_PUBLIC_API_URL` = `supavise`; sign-in via `supavise-gotrue@system` | three upstreamable patches: hCaptcha only with a site key, env-overridable `dashboard_auth:*` flags, extra project hosts in CSP |
+| Studio | our platform-mode build; `NEXT_PUBLIC_API_URL` = `supavise`; sign-in via `supavise-gotrue@system` | three upstreamable patches: hCaptcha only with a site key, env-overridable `dashboard_auth:*` flags, extra project hosts in CSP; and a fourth that only Supavise needs, which serves Studio's MCP route in platform mode (section 13.5) |
 | Supabase CLI | `--profile` file written by `supavise` with `api_url`, `dashboard_url`, `project_host`, `pooler_host`; PATs in `sbp_` format | none |
-| Supabase MCP server | `--api-url`; project-URL and logs-dialect overrides | none |
+| Supabase MCP server (stdio) | `--api-url`; project-URL and logs-dialect overrides | none |
+| Remote MCP clients: Claude Code, Cursor, VS Code, Codex, Claude desktop | `https://api.<domain>/mcp?project_ref=<ref>`; OAuth 2.1 sign-in (section 13) | none on the client |
 | supabase-js and all client SDKs | project URL and keys | none |
 | Agent skills | overlay that swaps the hosted MCP and dashboard URLs | none |
 
@@ -83,7 +84,7 @@ Laptops are not a target: `supabase start --runtime native` covers local develop
 
 ## 8. Staying in sync
 
-`internal/versions/versions.yaml` pins every artifact release and the Studio tag; a nightly job opens a bump pull request per newer upstream release, and the conformance suite (two projects, the upstream client test suites, Studio smoke tests) gates it. The three Studio patches are rebased on each tag by the Studio build and proposed upstream. A nightly job diffs the `v1`, `v2` and `platform` OpenAPI specs against the server. Projects upgrade one at a time with per-project version pinning (`internal/lifecycle/README.md`, "Service versions and project upgrades"). The jobs are listed in [development.md](development.md).
+`internal/versions/versions.yaml` pins every artifact release and the Studio tag; a nightly job opens a bump pull request per newer upstream release, and the conformance suite (two projects, the upstream client test suites, Studio smoke tests) gates it. The four Studio patches are rebased on each tag by the Studio build; the first three are proposed upstream, and the fourth is specific to Supavise (section 13.5). A nightly job diffs the `v1`, `v2` and `platform` OpenAPI specs against the server. Projects upgrade one at a time with per-project version pinning (`internal/lifecycle/README.md`, "Service versions and project upgrades"). The jobs are listed in [development.md](development.md).
 
 ## 9. In v1 and reserved
 
@@ -125,6 +126,8 @@ Hosted Supabase gives every branch its own Postgres instance, which is what AI a
 | An IAM authorizer for join | a token, a pinned CA and a keyed proof | One mechanism; on AWS the token travels through Secrets Manager |
 | Resources for a second server inside the first stack | a second stack from the same template | The template's network is one /24 with one subnet, and a changed network interface replaces the instance |
 | A stored IAM key for Storage on AWS | a role the daemon assumes, with short-lived credentials | No secret to store or rotate (spike S5) |
+| Hosted's separate MCP service, or a Go reimplementation of its tools | Studio's bundled MCP route, served in platform mode by patch 0004 behind an authenticating gate in the Go edge | Supavise has no process for a separate MCP service, and about 30 tools written again in Go would drift from the package. Studio already bundles the package with every tool. The patch is Supavise-specific and cannot go upstream (section 13.5) |
+| OAuth tokens in `access_tokens` | five `oauth_*` tables | A release without OAuth would read an `sbp_oauth_` token in `access_tokens` as an all-permissions personal access token. With separate tables it finds no row and answers 401 |
 
 ## 11. Open questions
 
@@ -300,5 +303,86 @@ These were proven before the dependent work was built. The spike code was not me
 - A major upgrade of a project with replicas is refused, and `--drop-replicas` does not exist.
 - The alert kinds `replica_needs_rebuild` and `storage_not_s3` are defined and nothing raises them. A replica that falls behind WAL that left the archive stays `ACTIVE_UNHEALTHY`.
 - The AWS stack, the rehearsal script and the fencing onto a replica server have not run against AWS (section 12.6). The two-server end-to-end run has no recorded RPO or RTO.
+
+## 13. OAuth sign-in and the remote MCP endpoint
+
+An MCP client connects to `https://api.<domain>/mcp?project_ref=<ref>`, finds the authorization server, registers itself, and opens Studio's "Authorize API access" page. A signed-in Owner or Administrator picks an organization and approves. The client receives tokens and calls `/mcp` with them. Studio's Connect > MCP panel shows the URL, and the organization's OAuth Apps page lists the client with a Revoke button. No personal access token is needed. `[api] disable_oauth = true` turns all of it off: every route below answers 404 and Studio gets no MCP URL. Personal access tokens and dashboard sessions are not affected.
+
+### 13.1 The authorization server
+
+The Management API is the authorization server. The issuer is `cfg.APIURL()` (which honors `[api] public_url`) and the MCP resource is `<issuer>/mcp`. The feature needs no extra host name, process or required configuration key. The code is in `internal/oauth` (rules and stores) and `internal/api/oauth_*.go` (HTTP).
+
+| Route | What it does |
+|---|---|
+| `GET /.well-known/oauth-protected-resource/mcp`, `GET /.well-known/oauth-authorization-server` | Discovery. Built from configuration, never from the `Host` header. S256 is the only PKCE method, and `scopes_supported` lists 13 scopes. Open CORS. |
+| `POST /platform/oauth/apps/register` | Open dynamic client registration (RFC 7591), as on hosted. A redirect URI is `https`, or `http` on `localhost`, `127.0.0.1` or `[::1]`; no custom schemes. Limited per client address and by a cap on stored apps; unused apps are pruned. |
+| `GET /v1/oauth/authorize` | Validates the request, stores it as pending for 10 minutes and redirects to Studio's `/authorize?auth_id=…`. Refuses an unknown client or an unregistered redirect URI with an HTML page and no redirect. Every other error returns to the client with `error`, `state` and `iss`. |
+| `GET /platform/oauth/authorizations/{id}`, `POST` and `DELETE /platform/organizations/{slug}/oauth/authorizations/{id}` | The calls Studio's consent page already makes: describe, approve, decline. Only an Owner or Administrator of the chosen organization approves. When the approver belongs to an organization that enforces MFA, the approval needs an MFA-verified session (aal2), as creating a personal access token does. |
+| `POST /v1/oauth/token`, `POST /v1/oauth/revoke` | Code exchange, refresh rotation and revocation. |
+| Organization apps and client secrets (8 operations under `/platform/organizations/{slug}/oauth/apps`) | The OAuth Apps page: the authorized list, revoke, manual apps and their client secrets. Studio's page needs no change. |
+
+PKCE is required for dynamic apps. A code lives for 60 seconds, works once, and is bound to the client, the exact redirect URI, the resource, the challenge, the approving user and the organization; a redemption that fails any of these burns the code. Redeeming a code a second time revokes the grant the first redemption created and raises an `oauth_token_reuse` alert. Redirect matching is exact, except that a registered loopback `http` URI may differ in port (RFC 8252). Hosted Supabase differs in a few places on purpose (section 13.7).
+
+### 13.2 Tokens and grants
+
+| Item | Format | Lifetime |
+|---|---|---|
+| Access token | `sbp_oauth_` + 40 hex (matches the CLI's token pattern) | 1 hour |
+| Refresh token | `sbr_` + 64 hex, rotated on every use | 90 days, renewed by each rotation |
+| Authorization code | `sbc_` + 64 hex | 60 seconds, single use |
+| Client secret | `sba_` + 64 hex, shown once, listed as `sba_xxxx********` | none |
+
+A grant is (app, user, organization, scopes, resource) and is the unit of revocation. Secrets, codes and tokens are stored as SHA-256 hashes and appear in no log line, audit event, alert or error message. A second use of a refresh token within 10 seconds of the first issues a fresh pair, so two processes that refresh at once do not force a sign-in; a later reuse revokes the grant. Tokens live in the `oauth_*` tables (migration `1350_oauth.sql`) and not in `access_tokens`.
+
+### 13.3 What an OAuth token may do
+
+`authenticate()` sends `sbp_oauth_` tokens to their own lookup. The result is a principal bound to one organization: `members.Access.Restrict(orgID)` leaves that organization's membership and nothing else, so every later check sees one organization. Rights are recomputed on each request from the approver's live role. A role downgrade applies at once, and a token never exceeds its approver's current rights.
+
+Scopes come from the `x-oauth-scope` annotations of the pinned specs (134 of 169 operations in `v1`, 21 of 50 in `v2`), plus an override for the two storage-config operations. An operation without an annotation answers `403 This operation is not available to OAuth tokens`; a scope the token lacks answers `403` with an `insufficient_scope` challenge. Matching is exact, so a write scope does not imply its read scope. OAuth tokens never reach `/platform/**`, which means they cannot approve a grant, and they cannot call `/v1/profile` or create organizations. A token ends at once when its user is removed or no longer admitted by single sign-on, leaves the organization, or when the app or the grant is revoked (`supavise oauth grants revoke`, Studio's Revoke button, `POST /v1/oauth/revoke`).
+
+### 13.4 The `/mcp` endpoint
+
+`api.<domain>/mcp` is a protected resource. The gate sits at the edge, in the proxy's `serveAPI`, and not in the API mux, so `/mcp` is not served on the loopback admin listener.
+
+1. With no bearer, the gate answers `401` with `WWW-Authenticate: Bearer resource_metadata="<issuer>/.well-known/oauth-protected-resource/mcp"`.
+2. It accepts an OAuth access token or a personal access token (hosted accepts both). A dashboard session, an unknown, expired or revoked token, or a grant bound to another resource answers `401 invalid_token`, which clients read as the signal to refresh. The check has to happen here: `initialize` and `tools/list` make no Management API call, so without it a revoked token would never see a 401.
+3. It limits each grant or token to 600 requests per minute and 8 in flight, rebuilds the query from `project_ref`, `read_only`, `features` and `skip_elicitations`, caps the body at 8 MiB, strips cookies, and forwards through the proxy's `forward()` to Studio's loopback `/api/mcp`. `studio.<domain>/api/mcp` answers 404.
+
+Studio's MCP route runs the MCP server package that Studio bundles. It calls the Management API on loopback with the same bearer, so every tool call is authenticated and scoped again by the API. The route is stateless: it uses the Streamable HTTP transport without sessions, so `skip_elicitations` is accepted and ignored, and a tool that would ask the client to confirm a cost (`create_project`, `create_branch`) cannot ask. The `mcp-e2e` job records what `create_project` does on this route. `search_docs` calls `supabase.com` from the node, as on hosted. The route uses the stateless transport of the 1.x SDK, so a client that speaks only a newer protocol revision may not connect. The `mcp-e2e` job tries two revisions, and the manual client check records which revision each client speaks.
+
+### 13.5 Studio patch 0004
+
+Hosted runs MCP as a separate service. Supavise has no such process, and Studio already bundles the server package with every tool, so a fourth patch makes Studio's existing `/api/mcp` route work in platform mode: `lib/hosted-api-allowlist.ts` gains `/mcp`, a new `lib/api/platform-mcp.ts` builds the platform with `createSupabaseApiPlatform({accessToken, apiUrl})` and fills `get_project_url` from `SUPAVISE_PROJECT_URL_TEMPLATE`, and `pages/api/mcp/index.ts` calls it first when `IS_PLATFORM` is set and raises the body limit to 8 MB. The query is validated and fails closed (`read_only` other than `true` or `false` is a 400, never read-write). The patch is the only way to ship the hosted tool set without a fifth shared process or a Go copy of about 30 tools. It is specific to Supavise, so unlike patches 0001 to 0003 it is not proposed upstream, and each Studio bump may need it rebased (`pages/api/mcp/index.ts` is the likely conflict). `studio/PATCHSET` counts it in the artifact name.
+
+One placeholder, `NEXT_PUBLIC_MCP_URL`, carries the URL into Connect > MCP (`required: false`, so an old unit with a new artifact shows the old localhost URL and does not fail to start). The fleet sets it with `SUPAVISE_MANAGEMENT_API_URL` and `SUPAVISE_PROJECT_URL_TEMPLATE`, and omits all three under `disable_oauth`.
+
+### 13.6 Operations
+
+- **Audit and alerts.** Each state change writes an `oauth.*` event; payloads carry ids, the organization slug, the user id, a sanitized client name, the redirect host and scopes, and no token, code, secret, `state` or challenge. A code or refresh-token replay raises one `oauth_token_reuse` alert per grant.
+- **Limits** (in memory, per node): 100 registrations per 10 minutes and 5,000 stored dynamic apps; 60 authorize requests per minute, 25 pending per app and 10,000 pending in all; 30 token or revoke failures per minute; 600 `/mcp` requests per minute and 8 in flight per principal. Every 429 carries `Retry-After`.
+- **Pruning.** The register and token handlers prune old authorizations, tokens, revoked grants and unused dynamic apps, at most once per 10 minutes per node.
+- **Rollback.** Migration 1350 adds five tables and changes none. Because the registry holds a migration an older release does not know, `supavise rollback` refuses until the system cluster is restored from its pre-upgrade backup (`deploy/README.md`). An older binary does not read OAuth tokens as personal access tokens, since they are not in `access_tokens`.
+
+### 13.7 Differences from hosted
+
+| Area | Hosted | Supavise | Reason |
+|---|---|---|---|
+| PKCE | S256 and `plain` | S256 only | `plain` does not meet the MCP authorization rules |
+| Grant types | adds `jwt-bearer` | not supported | beta, and tied to higher plans |
+| Discovery hosts | an MCP host and an API host | one host | no extra DNS name |
+| `revocation_endpoint` | not advertised | advertised | clients can revoke on sign-out |
+| Dynamic app logo | probably shown | never returned | a self-asserted logo spoofs the consent page |
+| Public clients | a secret is issued even to a `none` client | a dynamic app may omit its secret when its PKCE verifier is right, and one registered `none` may refresh with its refresh token alone | tolerates clients that registered `none` |
+| CORS | echoes the origin, with credentials | `*`, no credentials | cannot leak cookies |
+| `scope` at authorize | deprecated | honored, narrowing only | least privilege |
+| `skip_elicitations` | works | accepted and ignored | stateless transport |
+| `get_project_url` | correct | correct on the remote route; the stdio server still derives `supabase.red` | the package derives the host for unknown API hosts |
+| Redirect schemes | not verified | `https` and loopback `http` only | no custom schemes |
+
+Whether hosted lets a Developer open the consent page, the `expires_in` of a hosted token, and what an OAuth token gets on `GET /v1/projects/{ref}/config/storage` are unverified; the defaults here come from the specs and from the shape of hosted's discovery documents.
+
+### 13.8 Proving tests
+
+`internal/oauth` (rules, PKCE vectors from RFC 7636, redirect matcher and its fuzz target, fake-clock tests for expiry and rotation, a dump of every `oauth_*` table that finds no plaintext), `internal/api` (the endpoints, the scope golden file, the revocation matrix, the role matrix) and `internal/proxy` (the `/mcp` forward, the frame headers) cover the rules. The `oauth-smoke` job of `linux.yml` runs the whole flow against a real node, and the `mcp-e2e` job of `studio.yml` adds the MCP route on the Studio build. `upgrade-e2e` checks migration 1350 and that a token made before the upgrade still works. The checks that only a person can make (the Claude Code, Cursor, VS Code, Codex and Claude desktop flows, and the consent page as a Developer) are listed in the pull request that ships the feature.
 
 Supavise is not affiliated with or endorsed by Supabase Inc.
