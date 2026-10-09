@@ -119,12 +119,7 @@ if [[ $(unit_state supavise-studio.service) == active ]]; then
 fi
 
 log "daemon: supavise.service (supavise serve) next to the CLI"
-systemctl start supavise.service
-for ((i = 0; i < 30; i++)); do
-  [[ $(http_code http://127.0.0.1:7000/v1/projects) == 401 ]] && break
-  sleep 1
-done
-[[ $(http_code http://127.0.0.1:7000/v1/projects) == 401 ]] || { journalctl --no-pager -u supavise.service | tail -30 >&2; fail "the management API does not answer on the admin listener"; }
+start_daemon 30 "the management API does not answer on the admin listener"
 [[ $(http_code -H "Host: api.$SUPAVISE_DOMAIN" http://127.0.0.1/v1/projects) == 401 ]] || fail "the management API is not served at api.<domain> through the proxy"
 [[ $(http_code -H "Host: api.$SUPAVISE_DOMAIN" http://127.0.0.1/auth/v1/settings) == 200 ]] || fail "the dashboard GoTrue is not reachable at api.<domain>/auth/v1"
 PUB_A=$(project_field "$A" 'd["keys"]["publishable_key"]' --show-keys)

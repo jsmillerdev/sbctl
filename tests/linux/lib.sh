@@ -140,11 +140,80 @@ wait_active() { # UNIT SECONDS
   fail "$u is $(unit_state "$u") after ${n}s"
 }
 
+# require_free_ports: stops the stock services a runner image may ship on a port a node uses, then fails if anything
+# else listens on one of them.
+require_free_ports() {
+  local p
+  systemctl stop apache2 nginx postgresql mysql 2>/dev/null || true
+  for p in 80 443 5432 6543 5433 9999 7000 3000 8080 4000 5000; do
+    if ss -ltnH "sport = :$p" | grep -q .; then ss -ltnp "sport = :$p" >&2; fail "port $p is already in use on this VM"; fi
+  done
+}
+
+# system_up: system_init, then waits for the system project's PostgreSQL.
+system_up() { system_init; wait_active supavise-postgres@system.service 30; }
+
 http_code() { curl -s -o /dev/null -w '%{http_code}' --max-time 5 "$@" || true; }
 
+# wait_for SECONDS INTERVAL WHAT CMD...: runs CMD every INTERVAL seconds (a fraction is fine) for at least SECONDS
+# seconds, until it succeeds; CMD's output is dropped. CMD runs in a subshell, so a function that calls `fail` ends
+# only that attempt. After the last attempt: FAIL: timed out after SECONDSs waiting for WHAT. A caller that must
+# print more first wraps the call in a subshell: ( wait_for ... ) || { diagnostics; fail ...; }.
+wait_for() {
+  local secs=$1 every=$2 what=$3 tries i
+  shift 3
+  tries=$(awk -v s="$secs" -v e="$every" 'BEGIN { t = s / e; n = int(t); if (n < t) n++; print n }')
+  for ((i = 0; i < tries; i++)); do
+    ( "$@" ) >/dev/null 2>&1 && return 0
+    sleep "$every"
+  done
+  fail "timed out after ${secs}s waiting for $what"
+}
+
+# daemon_version: what the running daemon's own binary reports (the file on disk may be another release by now).
+daemon_version() { "/proc/$(systemctl show -p MainPID --value supavise.service)/exe" --version; }
+
 # ---- the daemon's Management API ------------------------------------------------------
-# The proxy listens on 127.0.0.1:80 (config tls.mode off); every name is reached with a Host header.
+# The admin listener answers without the proxy's Host dispatch; the proxy listens on 127.0.0.1:80 (config
+# tls.mode off) and every name is reached with a Host header.
+ADMIN=http://127.0.0.1:7000
 API_HOST="api.$SUPAVISE_DOMAIN"
+
+# wait_admin [SECONDS [FAILURE_TEXT]]: waits until the Management API on the admin listener answers 401 (no token).
+# When it does not (60 s by default), the daemon's journal is printed and the test fails with FAILURE_TEXT.
+wait_admin() {
+  local n=${1:-60} what=${2:-the Management API does not answer on the admin listener} i
+  for ((i = 0; i < n; i++)); do
+    [[ $(http_code "$ADMIN/v1/projects") == 401 ]] && break
+    sleep 1
+  done
+  [[ $(http_code "$ADMIN/v1/projects") == 401 ]] || { journalctl --no-pager -u supavise.service | tail -40 >&2; fail "$what"; }
+}
+# start_daemon [SECONDS [FAILURE_TEXT]]: starts supavise.service, then wait_admin.
+start_daemon() { systemctl start supavise.service; wait_admin "$@"; }
+
+# wait_fleet [FAILURE_TEXT]: waits until `supavise fleet status` succeeds, which it does when the daemon has brought the
+# shared services up (180 tries, 2 s apart). When it does not, the daemon's journal is printed and the test fails.
+wait_fleet() {
+  local what=${1:-the daemon did not bring the shared services up} i
+  for ((i = 0; i < 180; i++)); do
+    supavise fleet status >/dev/null 2>&1 && break
+    sleep 2
+  done
+  supavise fleet status || { journalctl --no-pager -u supavise.service | tail -40 >&2; fail "$what"; }
+}
+
+# wait_proxy_api [SECONDS]: waits (60 s by default) until the Management API answers 401 (no token) at api.<domain>
+# through the proxy on :80.
+wait_proxy_api() {
+  local n=${1:-60} i
+  for ((i = 0; i < n; i++)); do
+    [[ $(http_code -H "Host: $API_HOST" http://127.0.0.1/v1/projects) == 401 ]] && break
+    sleep 1
+  done
+  [[ $(http_code -H "Host: $API_HOST" http://127.0.0.1/v1/projects) == 401 ]] || fail "the Management API does not answer through the proxy"
+}
+
 api() { # METHOD PATH [curl args...]: the Management API through the proxy
   local m=$1 p=$2; shift 2
   curl -sS -m 120 -X "$m" -H "Host: $API_HOST" "$@" "http://127.0.0.1$p"
@@ -166,6 +235,20 @@ claim_and_token() {
   ORG=$(papi GET /v1/organizations | json_get 'd[0]["slug"]') || fail "listing organizations with the token"
 }
 papi() { local m=$1 p=$2; shift 2; api "$m" "$p" -H "Authorization: Bearer $PAT" "$@"; }
+# japi METHOD PATH [curl args]: the same with the dashboard session in JWT, for the /platform routes (a personal
+# access token does not open them).
+japi() { local m=$1 p=$2; shift 2; api "$m" "$p" -H "Authorization: Bearer $JWT" "$@"; }
+# code METHOD PATH [BODY]: the HTTP status of a papi call; BODY is sent as JSON.
+code() {
+  local m=$1 p=$2 b=${3:-}
+  papi "$m" "$p" -o /dev/null -w '%{http_code}' ${b:+-H 'Content-Type: application/json' -d "$b"} || true
+}
+# must STATUS METHOD PATH [BODY]: fails unless the papi call answers STATUS, after logging the start of the response.
+must() {
+  local want=$1 got
+  got=$(code "$2" "$3" "${4:-}")
+  [[ $got == "$want" ]] || { log "response: $(papi "$2" "$3" ${4:+-H 'Content-Type: application/json' -d "$4"} | head -c 600)"; fail "$2 $3 answered $got, want $want"; }
+}
 
 # gen_dbpass: sets DBPASS (the database password a project is created with). It cannot be set
 # inside api_create_project, which runs in a command substitution.
@@ -185,6 +268,21 @@ api_create_project() {
   done
   [[ $status == ACTIVE_HEALTHY ]] || { journalctl --no-pager -u supavise.service -n 60 >&2; fail "project $ref is $status"; }
   echo "$ref"
+}
+
+# wait_status REF STATUS [SECONDS [STOP_STATUS...]]: waits (600 s by default) until the Management API reports STATUS for
+# project REF. A STOP_STATUS is a state that does not turn into STATUS: the wait ends at once when the project is in
+# one. When it ends without STATUS, the daemon's journal is printed and the test fails.
+wait_status() {
+  local ref=$1 want=$2 n=${3:-600} i s="" stop
+  for ((i = 0; i < n; i++)); do
+    s=$({ papi GET "/v1/projects/$ref" | json_get 'd["status"]'; } 2>/dev/null || true)
+    [[ $s == "$want" ]] && return 0
+    for stop in "${@:4}"; do [[ $s == "$stop" ]] && break 2; done
+    sleep 1
+  done
+  journalctl --no-pager -u supavise.service | tail -60 >&2
+  fail "$ref is $s after ${n}s, want $want"
 }
 
 # project_keys REF: sets PUB (publishable key) and SEC (secret key) of an API project.
@@ -274,6 +372,35 @@ body = b64(json.dumps({"aud": "authenticated", "sub": "00000000-0000-4000-8000-0
                        "exp": int(time.time()) + 1800}).encode())
 sig = b64(hmac.new(sys.argv[1].encode(), head + b"." + body, hashlib.sha256).digest())
 print((head + b"." + body + b"." + sig).decode())
+PY
+}
+
+# ---- a local release server -------------------------------------------------------------
+# The scripts that test the installer and `supavise upgrade` serve signed releases of the repository o/r from
+# $WORK/srv: the assets under download/TAG and a GitHub-style API under repos/o/r/releases. Each script builds a release
+# with release_stage, adds what it needs, signs it with deploy/release-assets.sh and writes the API files with release_api.
+
+# release_stage DIR BINARY ARCH: makes DIR (emptied first) hold BINARY as the supavise-linux-ARCH asset and a
+# placeholder for the other architecture, as the installer and the upgrade look for both.
+release_stage() {
+  local d=$1 bin=$2 arch=$3
+  rm -rf "$d"; mkdir -p "$d"
+  cp "$bin" "$d/supavise-linux-$arch"
+  if [[ $arch == amd64 ]]; then echo other-arch >"$d/supavise-linux-arm64"; else echo other-arch >"$d/supavise-linux-amd64"; fi
+}
+
+# release_api TAG DIR HOST:PORT latest|nolatest: writes tags/TAG, and for `latest` also latest, under
+# $WORK/srv/repos/o/r/releases. The assets are the files in DIR, downloaded from http://HOST:PORT/download/TAG/.
+release_api() {
+  local tag=$1 d=$2 addr=$3 latest=$4
+  mkdir -p "$WORK/srv/repos/o/r/releases/tags"
+  python3 - "$tag" "$d" "$addr" "$WORK/srv/repos/o/r/releases" "$latest" <<'PY'
+import json, os, sys
+tag, d, addr, out, latest = sys.argv[1:]
+rel = {"tag_name": tag, "assets": [{"name": n, "browser_download_url": f"http://{addr}/download/{tag}/{n}"} for n in sorted(os.listdir(d))]}
+for name in (("latest",) if latest == "latest" else ()) + (f"tags/{tag}",):
+    with open(os.path.join(out, name), "w") as f:
+        json.dump(rel, f)
 PY
 }
 

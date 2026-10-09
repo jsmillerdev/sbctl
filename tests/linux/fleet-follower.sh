@@ -126,8 +126,7 @@ CONF
 systemctl daemon-reload
 
 log "system init (downloads artifacts), fleet start"
-system_init
-wait_active supavise-postgres@system.service 30
+system_up
 supavise fleet start || fail "fleet start"
 
 ENV_FILE=$SUPAVISE_STATE/projects/system/storage.env
@@ -142,16 +141,8 @@ grep -q "^AWS_CONTAINER_AUTHORIZATION_TOKEN=\"$TOKEN\"" "$ENV_FILE" || fail "sto
 
 log "the daemon brings the services up and serves the credentials"
 systemctl start supavise.service
-for ((i = 0; i < 180; i++)); do
-  supavise fleet status >/dev/null 2>&1 && break
-  sleep 2
-done
-supavise fleet status || { journalctl --no-pager -u supavise.service | tail -40 >&2; fail "the daemon did not bring the shared services up"; }
-for ((i = 0; i < 30; i++)); do
-  [[ $(http_code -H "Host: $API_HOST" http://127.0.0.1/v1/projects) == 401 ]] && break
-  sleep 1
-done
-[[ $(http_code -H "Host: $API_HOST" http://127.0.0.1/v1/projects) == 401 ]] || fail "the Management API does not answer through the proxy"
+wait_fleet
+wait_proxy_api 30
 has "$(journalctl --no-pager -u supavise.service)" 'storage credentials: serving the role' || fail "the daemon did not say it serves the role"
 
 CRED_URL=http://127.0.0.1:$P_CREDS/credentials

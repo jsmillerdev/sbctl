@@ -54,8 +54,7 @@ chown "$SUPAVISE_USER:$SUPAVISE_USER" "$SUPAVISE_CONF"
 chmod 0600 "$SUPAVISE_CONF" # it holds the S3 secret key
 
 log "system init and one project"
-system_init
-wait_active supavise-postgres@system.service 30
+system_up
 REF=$(create_project ident micro)
 [[ $REF =~ ^[a-z]{20}$ ]] || fail "bad ref '$REF'"
 PGU="supavise-postgres@$REF.service"
@@ -63,12 +62,7 @@ wait_active "$PGU" 30
 entered() { systemctl show -p ActiveEnterTimestampMonotonic --value "$1"; }
 
 log "daemon: supavise.service"
-systemctl start supavise.service
-for ((i = 0; i < 60; i++)); do
-  [[ $(http_code http://127.0.0.1:7000/v1/projects) == 401 ]] && break
-  sleep 1
-done
-[[ $(http_code http://127.0.0.1:7000/v1/projects) == 401 ]] || { journalctl --no-pager -u supavise.service | tail -30 >&2; fail "the Management API does not answer"; }
+start_daemon 60 "the Management API does not answer"
 
 log "a single server: no cluster identity, no peer port, no cluster block"
 [[ ! -e $CLUSTER_DIR/node.crt ]] || fail "$CLUSTER_DIR/node.crt exists before any token"

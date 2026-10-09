@@ -35,7 +35,6 @@ trap 'rc=$?; [[ -n $SMTP_PID ]] && kill "$SMTP_PID" 2>/dev/null; collect_logs; [
 # Ports away from anything the runner may listen on, as in settings-smoke.sh.
 P_SESSION=15432 P_TRANSACTION=16543 P_REALTIME=14000 P_STORAGE=15000 P_STORAGE_ADMIN=15001 P_PGMETA=18080 P_API=14001 P_STUDIO=13000
 P_SMTP=12526
-ADMIN=http://127.0.0.1:7000
 PASSWORD=roles-correct-horse-battery
 ORG=default   # the claim keeps the organization the first project created
 
@@ -104,8 +103,7 @@ python3 "$WORK/smtp.py" "$P_SMTP" "$WORK/mails.txt" &
 SMTP_PID=$!
 
 log "system init, fleet, one project"
-system_init
-wait_active supavise-postgres@system.service 30
+system_up
 supavise fleet start || fail "fleet start"
 REF=$(create_project roles micro)
 [[ $REF =~ ^[a-z]{20}$ ]] || fail "bad ref '$REF'"
@@ -116,12 +114,7 @@ PSQL=$(ls -d "$SUPAVISE_STATE"/artifacts/postgres/*/bin/psql | head -1)
 sql() { sudo -u "$SUPAVISE_USER" "$PSQL" "host=$SUPAVISE_STATE/projects/$REF/postgres/sock port=$PGPORT user=supabase_admin dbname=postgres" -Atc "$1" </dev/null; }
 
 log "daemon: supavise.service"
-systemctl start supavise.service
-for ((i = 0; i < 60; i++)); do
-  [[ $(http_code "$ADMIN/v1/projects") == 401 ]] && break
-  sleep 1
-done
-[[ $(http_code "$ADMIN/v1/projects") == 401 ]] || { journalctl --no-pager -u supavise.service | tail -30 >&2; fail "the Management API does not answer on the admin listener"; }
+start_daemon
 
 dash() { curl -sS -m 60 -X "$1" -H "Host: api.$SUPAVISE_DOMAIN" "${@:3}" "http://127.0.0.1$2"; }
 sign_in() { dash POST '/auth/v1/token?grant_type=password' -H 'Content-Type: application/json' -d "{\"email\":\"$1\",\"password\":\"$PASSWORD\"}" | json_get 'd["access_token"]'; }

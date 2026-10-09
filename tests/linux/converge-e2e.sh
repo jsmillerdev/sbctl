@@ -70,7 +70,6 @@ preflight
 cd "$REPO_ROOT" || exit 1
 SV=/usr/local/bin/supavise
 STATE=$SUPAVISE_STATE
-ADMIN=http://127.0.0.1:7000
 
 # ---- 1. static checks -----------------------------------------------------------------------
 log "static checks"
@@ -122,10 +121,7 @@ REV=$(/opt/supavise-e2e/new release-info --json | json_get 'd["converge_revision
 [[ $(/opt/supavise-e2e/new release-info --json | json_get 'len(d["host_changes"])') -ge 1 ]] || fail "release-info lists no host changes"
 
 # ---- 2. the previous release, with a project -----------------------------------------------
-systemctl stop apache2 nginx postgresql mysql 2>/dev/null || true
-for p in 80 443 5432 6543 5433 9999 7000 3000 8080 4000 5000; do
-  if ss -ltnH "sport = :$p" | grep -q .; then ss -ltnp "sport = :$p" >&2; fail "port $p is already in use on this VM"; fi
-done
+require_free_ports
 log "install.sh --binary: the previous release"
 deploy/install.sh --binary /opt/supavise-e2e/prev --public-ip 127.0.0.1 --tls off --email ci@example.com --firewall none --no-studio \
   --claim-token-file "$WORK/claim-token" 2>&1 | tee "$WORK/install.log"
@@ -138,12 +134,7 @@ for u in supavise.service supavise-postgres@system.service supavise-gotrue@syste
 pending_ids() { local out; out=$("$SV" system converge --check --json) || return 1; printf ',%s,' "$(json_get '",".join(s["id"] for s in d if s["pending"])' <<<"$out")"; }
 is_pending() { [[ $(pending_ids) == *",$1,"* ]]; }
 
-wait_daemon() {
-  local i
-  for ((i = 0; i < 120; i++)); do [[ $(http_code "$ADMIN/v1/projects") == 401 ]] && return 0; sleep 1; done
-  journalctl --no-pager -u supavise.service | tail -40 >&2
-  fail "the Management API does not answer"
-}
+wait_daemon() { wait_admin 120 "the Management API does not answer"; }
 wait_daemon
 claim_and_token
 gen_dbpass
@@ -288,19 +279,10 @@ openssl pkey -in "$KEYS/sign.pem" -pubout -out "$KEYS/pub.pem"
 ARCH=$(dpkg --print-architecture)
 SRV_PORT=38804
 REL=$WORK/srv/download/v0.2.1
-mkdir -p "$REL" "$WORK/srv/repos/o/r/releases/tags"
-cp "$NEXT" "$REL/supavise-linux-$ARCH"
-if [[ $ARCH == amd64 ]]; then echo other-arch >"$REL/supavise-linux-arm64"; else echo other-arch >"$REL/supavise-linux-amd64"; fi
+release_stage "$REL" "$NEXT" "$ARCH"
 echo "not a real studio build" >"$REL/supavise-studio-test-p1-linux-$ARCH.tar.zst"
 env SUPAVISE_RELEASE_TAG=v0.2.1 SUPAVISE_RELEASETOOL="${SUPAVISE_RELEASETOOL:-}" deploy/release-assets.sh "$REL" "$KEYS/sign.pem" "$KEYS/pub.pem" >/dev/null
-python3 - v0.2.1 "$REL" "$SRV_PORT" "$WORK/srv/repos/o/r/releases" <<'PY'
-import json, os, sys
-tag, d, port, out = sys.argv[1:]
-rel = {"tag_name": tag, "assets": [{"name": n, "browser_download_url": f"http://127.0.0.1:{port}/download/{tag}/{n}"} for n in sorted(os.listdir(d))]}
-for name in ("latest", f"tags/{tag}"):
-    with open(os.path.join(out, name), "w") as f:
-        json.dump(rel, f)
-PY
+release_api v0.2.1 "$REL" "127.0.0.1:$SRV_PORT" latest
 (cd "$WORK/srv" && exec python3 -m http.server "$SRV_PORT" --bind 127.0.0.1 >"$WORK/http.log" 2>&1) &
 SRV_PID=$!
 for ((i = 0; i < 20; i++)); do [[ $(http_code "http://127.0.0.1:$SRV_PORT/download/v0.2.1/SHA256SUMS") == 200 ]] && break; sleep 0.5; done

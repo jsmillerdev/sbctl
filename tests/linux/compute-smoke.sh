@@ -36,7 +36,6 @@ trap 'rc=$?; collect_logs; [[ $TEARDOWN -eq 1 ]] && teardown; cleanup_volume; ex
 
 # Ports away from anything the runner may listen on, as in settings-smoke.sh.
 P_SESSION=15432 P_TRANSACTION=16543 P_REALTIME=14000 P_STORAGE=15000 P_STORAGE_ADMIN=15001 P_PGMETA=18080 P_API=14001 P_STUDIO=13000
-ADMIN=http://127.0.0.1:7000
 
 preflight
 
@@ -77,19 +76,12 @@ CONF
 systemctl daemon-reload
 
 log "system init, fleet, daemon"
-system_init
-wait_active supavise-postgres@system.service 30
+system_up
 supavise fleet start || fail "fleet start"
-systemctl start supavise.service
-for ((i = 0; i < 60; i++)); do
-  [[ $(http_code "$ADMIN/v1/projects") == 401 ]] && break
-  sleep 1
-done
-[[ $(http_code "$ADMIN/v1/projects") == 401 ]] || { journalctl --no-pager -u supavise.service | tail -30 >&2; fail "the Management API does not answer on the admin listener"; }
+start_daemon
 claim_and_token
 JWT=$(api POST '/auth/v1/token?grant_type=password' -H 'Content-Type: application/json' \
   -d '{"email":"smoke@example.com","password":"smoke-correct-horse-battery"}' | json_get 'd["access_token"]') || fail "dashboard sign-in"
-japi() { local m=$1 p=$2; shift 2; api "$m" "$p" -H "Authorization: Bearer $JWT" "$@"; }
 
 log "two projects through the Management API (Micro, the default)"
 gen_dbpass
@@ -106,22 +98,7 @@ pool_row() { sysql _supavisor "select t.default_pool_size || ',' || t.default_ma
 unit_prop() { systemctl show -p "$2" --value "supavise-postgres@$1.service"; }
 status() { papi GET "/v1/projects/$REF" | json_get 'd["status"]'; }
 size_of() { japi GET "/platform/projects/$REF" | json_get 'd["infra_compute_size"]'; }
-code() { local m=$1 p=$2 b=${3:-}; papi "$m" "$p" -o /dev/null -w '%{http_code}' ${b:+-H 'Content-Type: application/json' -d "$b"} || true; }
-must() { # STATUS METHOD PATH [BODY]
-  local want=$1 got
-  got=$(code "$2" "$3" "${4:-}")
-  [[ $got == "$want" ]] || { log "response: $(papi "$2" "$3" ${4:+-H 'Content-Type: application/json' -d "$4"} | head -c 600)"; fail "$2 $3 answered $got, want $want"; }
-}
-wait_healthy() { # SECONDS
-  local n=${1:-300} s=""
-  for ((i = 0; i < n; i++)); do
-    s=$(status 2>/dev/null || true)
-    [[ $s == ACTIVE_HEALTHY ]] && return 0
-    sleep 1
-  done
-  journalctl --no-pager -u supavise.service | tail -40 >&2
-  fail "$REF is $s after ${n}s, want ACTIVE_HEALTHY"
-}
+wait_healthy() { wait_status "$REF" ACTIVE_HEALTHY "${1:-300}"; } # SECONDS
 change() { # VARIANT: ask for a size and expect the answer 200
   must 200 PATCH "/v1/projects/$REF/billing/addons" "{\"addon_type\":\"compute_instance\",\"addon_variant\":\"$1\"}"
 }

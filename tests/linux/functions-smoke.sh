@@ -90,8 +90,7 @@ install_supabase_cli() {
 install_supabase_cli
 
 log "system init (downloads artifacts)"
-system_init
-wait_active supavise-postgres@system.service 30
+system_up
 
 log "two projects"
 REF_A=$(create_project fn-a micro)

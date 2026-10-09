@@ -32,7 +32,6 @@ WORK=$(mktemp -d)
 IDP_NAME=supavise-saml-idp
 P_IDP=8080
 P_STUDIO=13000
-ADMIN=http://127.0.0.1:7000
 ORG=default   # the claim keeps the organization the first project created
 trap 'rc=$?; docker logs "$IDP_NAME" >"$LOG_DIR/idp.log" 2>&1; docker rm -f "$IDP_NAME" >/dev/null 2>&1; collect_logs; [[ $TEARDOWN -eq 1 ]] && teardown; rm -rf "$WORK"; exit $rc' EXIT
 
@@ -57,8 +56,7 @@ CONF
 systemctl daemon-reload
 
 log "system init, one project"
-system_init
-wait_active supavise-postgres@system.service 30
+system_up
 wait_active supavise-gotrue@system.service 30
 REF=$(create_project shop micro)
 [[ $REF =~ ^[a-z]{20}$ ]] || fail "bad ref '$REF'"
@@ -92,12 +90,7 @@ sudo test -f "$STUDIO_ENV" || fail "no Studio environment at $STUDIO_ENV"
 ! sudo grep -q '^NEXT_PUBLIC_DISABLED_FEATURES=' "$STUDIO_ENV" || fail "Studio is configured before any provider exists"
 
 log "daemon: supavise.service"
-systemctl start supavise.service
-for ((i = 0; i < 60; i++)); do
-  [[ $(http_code "$ADMIN/v1/projects") == 401 ]] && break
-  sleep 1
-done
-[[ $(http_code "$ADMIN/v1/projects") == 401 ]] || { journalctl --no-pager -u supavise.service | tail -30 >&2; fail "the Management API does not answer on the admin listener"; }
+start_daemon
 
 claim_and_token   # sets PAT and ORG (the first project's organization)
 [[ $ORG == default ]] || fail "the claim made organization '$ORG', want 'default'"

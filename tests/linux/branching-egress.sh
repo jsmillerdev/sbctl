@@ -63,8 +63,7 @@ xfs_info "$SUPAVISE_STATE" | grep -o 'reflink=[01]' | grep -q 'reflink=1' || fai
 install_binary
 setup_node
 log "system init (downloads artifacts)"
-system_init
-wait_active supavise-postgres@system.service 30
+system_up
 
 # ---- the "external host": the runner's own address, which is not loopback -------------------
 HOSTIP=$(hostname -I | awk '{print $1}')
