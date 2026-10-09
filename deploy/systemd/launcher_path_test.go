@@ -42,3 +42,40 @@ func TestPostgresUnitConditionNamesTheLauncherTheFenceRemoves(t *testing.T) {
 		}
 	}
 }
+
+// The daemon runs under ProtectSystem=strict. In a cluster it renews its node certificate in the cluster
+// directory, and a retirement (a removed node, a rejoin) deletes the identity there and the cluster settings
+// in config.d. Without those two directories among its ReadWritePaths the daemon of a joined server cannot
+// renew its certificate and cannot retire, and nothing says so until the certificate expires. The leading "-"
+// leaves out a directory that does not exist yet, which a single server never has.
+func TestDaemonUnitCanWriteWhatAClusterNodeKeeps(t *testing.T) {
+	b, err := systemd.Read("supavise.service")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var strict bool
+	writable := map[string]bool{}
+	for _, l := range strings.Split(string(b), "\n") {
+		if l == "ProtectSystem=strict" {
+			strict = true
+		}
+		if v, ok := strings.CutPrefix(l, "ReadWritePaths="); ok {
+			for _, p := range strings.Fields(v) {
+				writable[strings.TrimPrefix(p, "-")] = true
+			}
+		}
+	}
+	if !strict {
+		t.Fatal("the daemon unit no longer sets ProtectSystem=strict: this test's premise changed")
+	}
+	cfg := config.Default()
+	for what, dir := range map[string]string{
+		"the state directory":    cfg.StateDir,
+		"the node's certificate": config.ClusterDir(config.DefaultPath),
+		"the cluster settings":   config.ConfigDDir(config.DefaultPath),
+	} {
+		if !writable[dir] {
+			t.Errorf("%s (%s) is not among the daemon's ReadWritePaths %v", what, dir, writable)
+		}
+	}
+}
