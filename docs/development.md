@@ -44,8 +44,8 @@ The unpacked artifacts default to `~/.cache/sbctl/unpacked`, a path the test cod
 | `footprint` | manual; see [reference/footprint.md](reference/footprint.md) |
 | `bump-proposals` | nightly; opens one pull request per upstream release newer than its pin |
 | `release` | on a `v*` tag |
-| `replication-spike` | the two-node Incus harness of `tests/linux/multi` on both architectures |
-| `replication` | `two-servers`: the two-server release test (`tests/linux/multi/replication.sh`) on both architectures: install, join, a read replica, planned and unplanned failover, rejoin, and the upgrade of both servers. Pushes to `integrate/**` and a manual run use both runners; a push to a `ws/**` branch listed in the workflow uses amd64 only |
+| `replication-spike` | the two-node Incus harness of `tests/linux/multi` on both architectures, when the harness changes on `main` or `integrate/**`, or by hand |
+| `replication` | `two-servers`: the two-server release test (`tests/linux/multi/replication.sh`) on both architectures: install, join, a read replica, planned and unplanned failover, rejoin, and the upgrade of both servers. It runs on pushes to `integrate/**` and by hand, on both runners |
 | `screenshots` | README screenshots |
 
 The `studio` workflow starts on changes under `studio/`, in `internal/versions/versions.yaml` and in its own file. A change that touches only `tests/linux/oauth/`, the `/mcp` gate or the proxy does not start `mcp-e2e`, so start the workflow by hand after one and before a release. `release-gate.sh` requires `linux.yml` and not `studio.yml`, so the release gate does not wait for `mcp-e2e`.

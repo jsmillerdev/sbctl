@@ -9,15 +9,15 @@ name: replication
 # writer's files.
 #
 # Virtual machines where /dev/kvm works (amd64), privileged system containers where it does not (arm64): unit
-# hardening and the instance metadata block need either (tests/linux/multi/README.md). A push to a ws/** branch
-# runs amd64 only, as linux.yml does; integrate/** and a dispatch run both architectures.
+# hardening and the instance metadata block need either (tests/linux/multi/README.md). A push to integrate/** and a
+# dispatch both run both architectures.
 #
 # deploy/release-gate.sh requires it (the jobs named two-servers). The gate accepts a workflow_dispatch run on the
 # tagged commit: `gh workflow run replication.yml --ref <branch>`, then tag. A run took 9 to 15 minutes per job in the three
 # runs measured (the architectures run in parallel) and is cut off at 150 when a wait times out; the gate waits for three hours (GATE_TIMEOUT_SECONDS).
 on:
   push:
-    branches: ["ws/rep-x2", "ws/rep-fx", "integrate/**"]
+    branches: ["integrate/**"]
   workflow_dispatch:
 
 permissions:
@@ -35,28 +35,14 @@ defaults:
     shell: bash
 
 jobs:
-  # The architectures of the job below, worked out once: amd64 only for a push to a ws/** branch, both otherwise
-  # (a dispatch on a ws/** branch included, as the header says).
-  plan:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 5
-    outputs:
-      matrix: ${{ steps.plan.outputs.matrix }}
-    steps:
-      - id: plan
-        env:
-          MATRIX: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/heads/ws/') && '[{"runner":"ubuntu-24.04","arch":"amd64"}]' || '[{"runner":"ubuntu-24.04","arch":"amd64"},{"runner":"ubuntu-24.04-arm","arch":"arm64"}]' }}
-        run: |
-          echo "matrix=$MATRIX" >>"$GITHUB_OUTPUT"
-          echo "$MATRIX"
-
   two-servers:
     name: two-servers (${{ matrix.arch }})
-    needs: plan
     strategy:
       fail-fast: false
       matrix:
-        include: ${{ fromJSON(needs.plan.outputs.matrix) }}
+        include:
+          - { runner: ubuntu-24.04, arch: amd64 }
+          - { runner: ubuntu-24.04-arm, arch: arm64 }
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 150
     steps:

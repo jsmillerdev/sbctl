@@ -18,7 +18,7 @@ name: replication-spike
 # It runs when the harness changes; replication.yml is the test that uses the harness.
 on:
   push:
-    branches: ["ws/rep-x1", "ws/rep-x2", "integrate/**"]
+    branches: [main, "integrate/**"]
     paths:
       - ".github/workflows/replication-spike.yml"
       - "tests/linux/multi/lib-multi.sh"
