@@ -43,7 +43,8 @@ func (s *Server) currentUser(r *http.Request) (*User, error) {
 	}
 	u, err := s.store.GetUser(r.Context(), p.UserID)
 	if err == ErrNotFound {
-		return s.store.UpsertUser(r.Context(), User{UserID: p.UserID, Email: p.Email, Username: strings.SplitN(p.Email, "@", 2)[0]})
+		email := p.UserEmail()
+		return s.store.UpsertUser(r.Context(), User{UserID: p.UserID, Email: email, Username: strings.SplitN(email, "@", 2)[0]})
 	}
 	return u, err
 }

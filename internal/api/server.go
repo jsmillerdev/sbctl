@@ -438,11 +438,12 @@ func (s *Server) oauthAdmit(ctx context.Context, userID string, orgID int64) err
 			return err
 		}
 	}
-	a, err := s.members.Access(ctx, userID)
+	// Membership is all the gate needs: one query for a member, where Access reads the user's roles too.
+	member, err := s.members.IsMember(ctx, userID, orgID)
 	if err != nil {
 		return err
 	}
-	if !a.IsMember(orgID) {
+	if !member {
 		return oauth.ErrNotMember
 	}
 	return nil

@@ -132,6 +132,22 @@ func (s *Service) Access(ctx context.Context, userID string) (*Access, error) {
 	return a, nil
 }
 
+// IsMember reports whether user belongs to org, which is all a gate that admits members needs to
+// know. A member costs one query. A user who has no row in org gets what Access gives, the legacy
+// rule included, so the answer is always Access(user).IsMember(org).
+func (s *Service) IsMember(ctx context.Context, user string, org int64) (bool, error) {
+	if _, err := s.Store.GetMember(ctx, org, user); err == nil {
+		return true, nil
+	} else if !errors.Is(err, ErrNotFound) {
+		return false, err
+	}
+	a, err := s.Access(ctx, user)
+	if err != nil {
+		return false, err
+	}
+	return a.IsMember(org), nil
+}
+
 // legacyOwner applies the legacy-account rule to a user without memberships.
 func (s *Service) legacyOwner(ctx context.Context, userID string) error {
 	if s.AccountCreatedAt == nil {

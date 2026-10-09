@@ -16,7 +16,9 @@ const (
 // Principal is the authenticated caller.
 type Principal struct {
 	UserID string // GoTrue user uuid
-	Email  string
+	// Email is the user's address as authenticate found it for a session and a personal access token.
+	// An OAuth principal leaves it empty: read the address with UserEmail, which loads it.
+	Email string
 	// Via is "jwt" (dashboard session), "pat" (personal access token) or "oauth" (OAuth access
 	// token). A token ("pat", "oauth") is not an interactive session: it carries no AAL and is not held
 	// to an organization's MFA requirement.
@@ -32,6 +34,18 @@ type Principal struct {
 	// access is what the user may do, loaded on first use during the request. For an OAuth
 	// principal authenticate has loaded it already, restricted to the grant's organization.
 	access *members.Access
+	// loadEmail fetches the address of an OAuth principal on the first UserEmail. Almost no request
+	// that an OAuth token can make reads it, and the lookup is a query of the store.
+	loadEmail func() string
+}
+
+// UserEmail is the address of the user. For an OAuth principal it is read from the store on the
+// first call and kept; for the others it is Email.
+func (p *Principal) UserEmail() string {
+	if p.loadEmail != nil {
+		p.Email, p.loadEmail = p.loadEmail(), nil
+	}
+	return p.Email
 }
 
 // OAuthInfo is the grant behind an OAuth access token (authOAuth, oauth_authn.go).

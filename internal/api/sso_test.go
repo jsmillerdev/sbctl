@@ -1747,3 +1747,51 @@ func TestSSORemovingAProviderThatGoTrueRefusedCanBeRetried(t *testing.T) {
 		t.Fatal("the record is still there")
 	}
 }
+
+// countingSSOStore counts the lookups of an SSO user's record.
+type countingSSOStore struct {
+	SSOStore
+	gets atomic.Int32
+}
+
+func (c *countingSSOStore) GetSSOUser(ctx context.Context, userID string) (*SSOUser, error) {
+	c.gets.Add(1)
+	return c.SSOStore.GetSSOUser(ctx, userID)
+}
+
+// A user with no SSO record (every password account that holds a token) is looked up once per
+// ssoCacheTTL, the way an admitted SSO user is, and the answer goes the moment the user is recorded.
+func TestAdmitUserRemembersThatAUserIsNotAnSSOUser(t *testing.T) {
+	f := newSSOFixture(t)
+	ctx := context.Background()
+	id := f.addProvider(acmeIdP, "developer", "acme.test")
+	counter := &countingSSOStore{SSOStore: f.srv.sso.Store}
+	f.srv.sso.Store = counter
+	clock := time.Now()
+	f.srv.sso.Now = func() time.Time { return clock }
+
+	for i := 0; i < 5; i++ {
+		if err := f.srv.sso.AdmitUser(ctx, f.userID); err != nil {
+			t.Fatalf("a password account: %v", err)
+		}
+	}
+	if n := counter.gets.Load(); n != 1 {
+		t.Fatalf("%d lookups for five requests of one user, want 1", n)
+	}
+	clock = clock.Add(ssoCacheTTL)
+	if err := f.srv.sso.AdmitUser(ctx, f.userID); err != nil || counter.gets.Load() != 2 {
+		t.Fatalf("after the TTL: %v, %d lookups, want a second lookup", err, counter.gets.Load())
+	}
+
+	// The same user id signs in through the provider and waits for approval: the next token request
+	// sees the record and refuses, not the answer remembered for the user before.
+	if err := f.srv.sso.AdmitUser(ctx, ssoUser2); err != nil {
+		t.Fatalf("before the user is recorded: %v", err)
+	}
+	if err := f.srv.sso.Admit(ctx, ssoUser2, "mallory@contractor.test", id); err == nil {
+		t.Fatal("a user of an unmapped domain was admitted")
+	}
+	if err := f.srv.sso.AdmitUser(ctx, ssoUser2); err == nil {
+		t.Fatal("a token of a user who waits for approval passed on the answer remembered before the user was recorded")
+	}
+}

@@ -72,7 +72,11 @@ type DashboardSSO struct {
 	mu       sync.Mutex
 	provs    map[string]cachedProvider
 	admitted map[string]time.Time
-	firstMu  sync.Mutex
+	// notSSO is when AdmitUser last found that a user has no SSO record, which is the answer for every
+	// user who signs in with a password and holds a personal access token or an OAuth grant. It lives
+	// ssoCacheTTL, as admitted does, and goes with it (forgetUser, forgetAdmitted).
+	notSSO  map[string]time.Time
+	firstMu sync.Mutex
 }
 
 type cachedProvider struct {
@@ -84,6 +88,21 @@ type cachedProvider struct {
 // removed provider or member loses the session within this time even when the change was made
 // by another process (the CLI).
 const ssoCacheTTL = 10 * time.Second
+
+// forgetUser drops what is remembered about the admission of one user (after a change made here).
+func (d *DashboardSSO) forgetUser(userID string) {
+	d.mu.Lock()
+	delete(d.admitted, userID)
+	delete(d.notSSO, userID)
+	d.mu.Unlock()
+}
+
+// forgetAdmitted drops what is remembered about the admission of every user.
+func (d *DashboardSSO) forgetAdmitted() {
+	d.mu.Lock()
+	d.admitted, d.notSSO = nil, nil
+	d.mu.Unlock()
+}
 
 // NewDashboardSSO builds the service from the account service that shares its credentials,
 // members and registry: the CLI's `supavise sso` uses it, the server builds its own the same way.
@@ -844,9 +863,7 @@ func (d *DashboardSSO) Approve(ctx context.Context, actor *members.Access, org m
 	if err != nil {
 		return err
 	}
-	d.mu.Lock()
-	delete(d.admitted, userID)
-	d.mu.Unlock()
+	d.forgetUser(userID)
 	payload := map[string]any{"user": userID, "org": org.Slug, "role": members.RoleName(roleID)}
 	if cleared {
 		payload["denial_cleared"] = true
@@ -876,9 +893,7 @@ func (d *DashboardSSO) Deny(ctx context.Context, actor *members.Access, org memb
 		if err := d.Store.SetSSOUserState(ctx, userID, SSOActive, d.now()); err != nil {
 			return err
 		}
-		d.mu.Lock()
-		delete(d.admitted, userID)
-		d.mu.Unlock()
+		d.forgetUser(userID)
 		return errf(http.StatusConflict, "This user is a member of an organization now and is not waiting for approval; remove the member instead")
 	}
 	// Recorded first, and durably: a step below that fails leaves the denial standing, and Deny can
@@ -905,9 +920,7 @@ func (d *DashboardSSO) Deny(ctx context.Context, actor *members.Access, org memb
 	if err := d.revokeGrants(ctx, actor, u.UserID); err != nil {
 		d.log().Warn("OAuth grants of a denied SSO user could not be revoked", "user", u.UserID, "error", err)
 	}
-	d.mu.Lock()
-	delete(d.admitted, userID)
-	d.mu.Unlock()
+	d.forgetUser(userID)
 	d.event(ctx, "sso.user.denied", map[string]any{"user": userID, "org": org.Slug})
 	return d.Store.DeleteSSOUser(ctx, userID)
 }
@@ -938,9 +951,7 @@ func (d *DashboardSSO) Allow(ctx context.Context, providerID, email string) erro
 			}
 		}
 	}
-	d.mu.Lock()
-	d.admitted = nil
-	d.mu.Unlock()
+	d.forgetAdmitted()
 	d.event(ctx, "sso.user.allowed", map[string]any{"provider": providerID, "email_domain": members.DomainOf(email)})
 	d.log().Info("a single sign-on refusal was cleared", "provider", providerID, "email", email)
 	return nil
@@ -996,8 +1007,8 @@ func (d *DashboardSSO) provider(ctx context.Context, id string) (*SSOProviderRow
 func (d *DashboardSSO) forget(id string) {
 	d.mu.Lock()
 	delete(d.provs, id)
-	d.admitted = nil
 	d.mu.Unlock()
+	d.forgetAdmitted()
 }
 
 func (d *DashboardSSO) isMember(ctx context.Context, userID string) (bool, error) {
@@ -1065,14 +1076,22 @@ func (d *DashboardSSO) Admit(ctx context.Context, userID, email, providerID stri
 // from the record. A user with no record is not an SSO user (the account of a denied or removed
 // one is gone, and so are its tokens), and passes.
 func (d *DashboardSSO) AdmitUser(ctx context.Context, userID string) error {
+	now := d.now()
 	d.mu.Lock()
 	at, ok := d.admitted[userID]
+	none, notSSO := d.notSSO[userID]
 	d.mu.Unlock()
-	if ok && d.now().Sub(at) < ssoCacheTTL {
+	if ok && now.Sub(at) < ssoCacheTTL || notSSO && now.Sub(none) < ssoCacheTTL {
 		return nil
 	}
 	u, err := d.Store.GetSSOUser(ctx, userID)
 	if errors.Is(err, ErrNotFound) {
+		d.mu.Lock()
+		if d.notSSO == nil || len(d.notSSO) >= maxAdmitted {
+			d.notSSO = map[string]time.Time{} // entries are ten seconds old at most; a reset only costs a lookup
+		}
+		d.notSSO[userID] = now
+		d.mu.Unlock()
 		return nil
 	}
 	if err != nil {
@@ -1124,6 +1143,9 @@ func (d *DashboardSSO) firstSight(ctx context.Context, row *SSOProviderRow, user
 	if _, err := d.Store.InsertSSOUser(ctx, u); err != nil {
 		return nil, err
 	}
+	d.mu.Lock()
+	delete(d.notSSO, userID)
+	d.mu.Unlock()
 	payload := map[string]any{"user": userID, "provider": row.ID, "state": u.State}
 	if denied && !member {
 		payload["default_role_withheld"] = "this address was denied or removed by an administrator"
