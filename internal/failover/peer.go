@@ -2,7 +2,6 @@ package failover
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -211,32 +210,20 @@ func (o *Orchestrator) PeerHandlers() map[string]mesh.HandlerFunc {
 	}
 }
 
-func writePeerJSON(w http.ResponseWriter, status int, v any) {
+// peerBodyMax caps the body of a peer request: they are small JSON documents.
+const peerBodyMax = 64 << 10
+
+// writePeerStatus answers with status and no body (mesh.RespondJSON answers 204 for that).
+func writePeerStatus(w http.ResponseWriter, status int) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	if v != nil {
-		_ = json.NewEncoder(w).Encode(v)
-	}
-}
-
-func writePeerError(w http.ResponseWriter, status int, code, msg string) {
-	writePeerJSON(w, status, peerapi.Error{Message: msg, Code: code})
-}
-
-func decodePeer(w http.ResponseWriter, r *http.Request, v any) bool {
-	r.Body = http.MaxBytesReader(w, r.Body, 64<<10)
-	if err := json.NewDecoder(r.Body).Decode(v); err != nil {
-		writePeerError(w, http.StatusBadRequest, "bad_request", "the request body is not valid: "+err.Error())
-		return false
-	}
-	return true
 }
 
 // caller returns the authenticated peer, or answers 401.
 func caller(w http.ResponseWriter, r *http.Request) (mesh.Peer, bool) {
 	p, ok := mesh.PeerFrom(r.Context())
 	if !ok || p.Node == "" {
-		writePeerError(w, http.StatusUnauthorized, "unauthenticated", "the request carries no node certificate")
+		mesh.RespondError(w, http.StatusUnauthorized, "unauthenticated", "the request carries no node certificate")
 		return mesh.Peer{}, false
 	}
 	return p, true
@@ -245,7 +232,7 @@ func caller(w http.ResponseWriter, r *http.Request) (mesh.Peer, bool) {
 // callerLeads answers 403 unless the peer is the node this one believes is the leader.
 func (o *Orchestrator) callerLeads(w http.ResponseWriter, p mesh.Peer) bool {
 	if l, ok := o.d.Members.Leader(); !ok || l.ID != p.Node {
-		writePeerError(w, http.StatusForbidden, "not_leader", "only the leader may ask for this")
+		mesh.RespondError(w, http.StatusForbidden, "not_leader", "only the leader may ask for this")
 		return false
 	}
 	return true
@@ -257,7 +244,7 @@ func (o *Orchestrator) callerLeads(w http.ResponseWriter, p mesh.Peer) bool {
 // the unit's ConditionPathExists turns into a hard stop that survives a reboot, and stops them.
 func (o *Orchestrator) handleFence(w http.ResponseWriter, r *http.Request) {
 	var req FenceCall
-	if !decodePeer(w, r, &req) {
+	if !mesh.DecodeBodyMax(w, r, peerBodyMax, &req) {
 		return
 	}
 	peer, ok := caller(w, r)
@@ -265,11 +252,11 @@ func (o *Orchestrator) handleFence(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if req.Leader == "" || req.Leader != peer.Node {
-		writePeerError(w, http.StatusForbidden, "forbidden", "a node asks for a fence only in its own name")
+		mesh.RespondError(w, http.StatusForbidden, "forbidden", "a node asks for a fence only in its own name")
 		return
 	}
 	if o.d.LocalPrimaries == nil {
-		writePeerError(w, http.StatusNotImplemented, "unsupported", "this node cannot stop a primary")
+		mesh.RespondError(w, http.StatusNotImplemented, "unsupported", "this node cannot stop a primary")
 		return
 	}
 	local := o.d.Members.Epoch()
@@ -278,12 +265,12 @@ func (o *Orchestrator) handleFence(w http.ResponseWriter, r *http.Request) {
 	ctx := context.WithoutCancel(r.Context())
 	if req.Ref != "" {
 		if !fenced.ValidRef(req.Ref) {
-			writePeerError(w, http.StatusBadRequest, "bad_request", "not a project ref: "+req.Ref)
+			mesh.RespondError(w, http.StatusBadRequest, "bad_request", "not a project ref: "+req.Ref)
 			return
 		}
 		// A project fence runs in the current epoch, and only the leader asks for it.
 		if req.Epoch < local {
-			writePeerJSON(w, http.StatusOK, peerapi.FenceResponse{Epoch: local})
+			mesh.RespondJSON(w, http.StatusOK, peerapi.FenceResponse{Epoch: local})
 			return
 		}
 		if !o.callerLeads(w, peer) {
@@ -291,10 +278,10 @@ func (o *Orchestrator) handleFence(w http.ResponseWriter, r *http.Request) {
 		}
 		resp, err := o.fenceProjectHere(ctx, req)
 		if err != nil {
-			writePeerError(w, http.StatusInternalServerError, "fence_failed", err.Error())
+			mesh.RespondError(w, http.StatusInternalServerError, "fence_failed", err.Error())
 			return
 		}
-		writePeerJSON(w, http.StatusOK, resp)
+		mesh.RespondJSON(w, http.StatusOK, resp)
 		return
 	}
 	if req.Epoch <= local {
@@ -302,7 +289,7 @@ func (o *Orchestrator) handleFence(w http.ResponseWriter, r *http.Request) {
 		if rec, err := fenced.Node(paths); err == nil && rec != nil && rec.Epoch >= req.Epoch {
 			already = true
 		}
-		writePeerJSON(w, http.StatusOK, peerapi.FenceResponse{Epoch: local, Fenced: already})
+		mesh.RespondJSON(w, http.StatusOK, peerapi.FenceResponse{Epoch: local, Fenced: already})
 		return
 	}
 	// A node fence names the epoch after this node's, and comes from an active node that holds a
@@ -310,11 +297,11 @@ func (o *Orchestrator) handleFence(w http.ResponseWriter, r *http.Request) {
 	// lags is refused (its epoch is not the next one); it does not ask again, and goes on to the
 	// provider's fence, which is the one that counts.
 	if req.Epoch != local+1 {
-		writePeerJSON(w, http.StatusOK, peerapi.FenceResponse{Epoch: local})
+		mesh.RespondJSON(w, http.StatusOK, peerapi.FenceResponse{Epoch: local})
 		return
 	}
 	if !o.mayTakeOver(ctx, peer.Node) {
-		writePeerError(w, http.StatusForbidden, "forbidden", "only an active node that holds a standby of the system cluster may fence this node")
+		mesh.RespondError(w, http.StatusForbidden, "forbidden", "only an active node that holds a standby of the system cluster may fence this node")
 		return
 	}
 	refs := o.primaryRefs(ctx)
@@ -322,7 +309,7 @@ func (o *Orchestrator) handleFence(w http.ResponseWriter, r *http.Request) {
 		return fenced.WriteNode(paths, o.nodeRecord(req.Epoch, req.Leader, reasonOf(req)))
 	}, true)
 	if err != nil {
-		writePeerError(w, http.StatusInternalServerError, "fence_failed", err.Error())
+		mesh.RespondError(w, http.StatusInternalServerError, "fence_failed", err.Error())
 		return
 	}
 	o.alert(ctx, alerts.Event{
@@ -330,7 +317,7 @@ func (o *Orchestrator) handleFence(w http.ResponseWriter, r *http.Request) {
 		Detail: fmt.Sprintf("Node %s leads at epoch %d and asked this node to stop acting as a primary. No cluster starts as a primary here until `supavise node rejoin` rebuilds it as a follower.", req.Leader, req.Epoch),
 		Key:    "fenced",
 	})
-	writePeerJSON(w, http.StatusOK, peerapi.FenceResponse{Epoch: req.Epoch, Fenced: true, Stopped: stopped})
+	mesh.RespondJSON(w, http.StatusOK, peerapi.FenceResponse{Epoch: req.Epoch, Fenced: true, Stopped: stopped})
 }
 
 // fenceProjectHere records the fence of one project's primary on this node, then removes its
@@ -489,7 +476,7 @@ func (o *Orchestrator) primaryRefs(ctx context.Context) []string {
 // handleQuiesce stops the leader for a planned switchover (design 2.10.4 step 2).
 func (o *Orchestrator) handleQuiesce(w http.ResponseWriter, r *http.Request) {
 	var req QuiesceRequest
-	if !decodePeer(w, r, &req) {
+	if !mesh.DecodeBodyMax(w, r, peerBodyMax, &req) {
 		return
 	}
 	peer, ok := caller(w, r)
@@ -497,19 +484,19 @@ func (o *Orchestrator) handleQuiesce(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !o.d.Members.IsLeader() {
-		writePeerError(w, http.StatusConflict, "not_leader", "this node is not the leader")
+		mesh.RespondError(w, http.StatusConflict, "not_leader", "this node is not the leader")
 		return
 	}
 	if peer.Node != req.To {
-		writePeerError(w, http.StatusForbidden, "forbidden", "only the node that takes over may ask for this")
+		mesh.RespondError(w, http.StatusForbidden, "forbidden", "only the node that takes over may ask for this")
 		return
 	}
 	if want := o.d.Members.Epoch() + 1; req.Epoch != want {
-		writePeerError(w, http.StatusConflict, "stale_epoch", fmt.Sprintf("a switchover from epoch %d runs at epoch %d, not %d", want-1, want, req.Epoch))
+		mesh.RespondError(w, http.StatusConflict, "stale_epoch", fmt.Sprintf("a switchover from epoch %d runs at epoch %d, not %d", want-1, want, req.Epoch))
 		return
 	}
 	if o.d.LocalPrimaries == nil {
-		writePeerError(w, http.StatusNotImplemented, "unsupported", "this node cannot stop a primary")
+		mesh.RespondError(w, http.StatusNotImplemented, "unsupported", "this node cannot stop a primary")
 		return
 	}
 	// One quiesce at a time, and not beside a move of this node's own: a second request waits for
@@ -522,7 +509,7 @@ func (o *Orchestrator) handleQuiesce(w http.ResponseWriter, r *http.Request) {
 	defer o.quiesceMu.Unlock()
 	release, err := o.acquireForDelegate(peer.Node)
 	if err != nil {
-		writePeerError(w, http.StatusConflict, "busy", "a move is running on the leader")
+		mesh.RespondError(w, http.StatusConflict, "busy", "a move is running on the leader")
 		return
 	}
 	defer release()
@@ -530,18 +517,18 @@ func (o *Orchestrator) handleQuiesce(w http.ResponseWriter, r *http.Request) {
 	rec, err := o.currentQuiesce()
 	switch {
 	case err != nil:
-		writePeerError(w, http.StatusInternalServerError, "quiesce_failed", err.Error())
+		mesh.RespondError(w, http.StatusInternalServerError, "quiesce_failed", err.Error())
 		return
 	case rec != nil && !rec.matches(req):
-		writePeerError(w, http.StatusConflict, "quiesce_pending", fmt.Sprintf("a switchover to %s at epoch %d is waiting; its survivor continues or undoes it", rec.To, rec.Epoch))
+		mesh.RespondError(w, http.StatusConflict, "quiesce_pending", fmt.Sprintf("a switchover to %s at epoch %d is waiting; its survivor continues or undoes it", rec.To, rec.Epoch))
 		return
 	}
 	res, err := o.quiesceLocal(context.WithoutCancel(r.Context()), req, rec)
 	if err != nil {
-		writePeerError(w, http.StatusInternalServerError, "quiesce_failed", err.Error())
+		mesh.RespondError(w, http.StatusInternalServerError, "quiesce_failed", err.Error())
 		return
 	}
-	writePeerJSON(w, http.StatusOK, res)
+	mesh.RespondJSON(w, http.StatusOK, res)
 }
 
 // quiesceLocal enters maintenance, then stops the project clusters (in parallel, Realtime and the
@@ -646,7 +633,7 @@ func (o *Orchestrator) handleResume(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if o.d.LocalPrimaries == nil {
-		writePeerError(w, http.StatusNotImplemented, "unsupported", "this node cannot start a primary")
+		mesh.RespondError(w, http.StatusNotImplemented, "unsupported", "this node cannot start a primary")
 		return
 	}
 	// A quiesce that is still stopping clusters finishes first; its record is what this undo reads.
@@ -656,26 +643,26 @@ func (o *Orchestrator) handleResume(w http.ResponseWriter, r *http.Request) {
 	// system cluster this very quiesce stopped.
 	rec, err := o.currentQuiesce()
 	if err != nil {
-		writePeerError(w, http.StatusInternalServerError, "resume_failed", err.Error())
+		mesh.RespondError(w, http.StatusInternalServerError, "resume_failed", err.Error())
 		return
 	}
 	if rec == nil || rec.To != peer.Node {
-		writePeerError(w, http.StatusConflict, "no_quiesce", "no switchover to that node is waiting")
+		mesh.RespondError(w, http.StatusConflict, "no_quiesce", "no switchover to that node is waiting")
 		return
 	}
 	// The projects the quiesce held start again: the hold is released before the plane is asked.
 	for _, ref := range rec.Refs {
 		if err := fenced.ReleaseProject(o.d.Cfg.Paths(), ref); err != nil {
-			writePeerError(w, http.StatusInternalServerError, "resume_failed", err.Error())
+			mesh.RespondError(w, http.StatusInternalServerError, "resume_failed", err.Error())
 			return
 		}
 	}
 	if err := o.resumeLocal(context.WithoutCancel(r.Context())); err != nil {
-		writePeerError(w, http.StatusInternalServerError, "resume_failed", err.Error())
+		mesh.RespondError(w, http.StatusInternalServerError, "resume_failed", err.Error())
 		return
 	}
 	o.clearQuiesce()
-	writePeerJSON(w, http.StatusOK, nil)
+	writePeerStatus(w, http.StatusOK)
 }
 
 // resumeLocal starts the system cluster, then the shared services, then the projects that run, in
@@ -729,7 +716,7 @@ func (o *Orchestrator) resumeLocal(ctx context.Context) error {
 func (o *Orchestrator) handlePrimary(w http.ResponseWriter, r *http.Request) {
 	ref, op := r.PathValue("ref"), r.PathValue("op")
 	var req PrimaryCall
-	if !decodePeer(w, r, &req) {
+	if !mesh.DecodeBodyMax(w, r, peerBodyMax, &req) {
 		return
 	}
 	peer, ok := caller(w, r)
@@ -740,15 +727,15 @@ func (o *Orchestrator) handlePrimary(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !fenced.ValidRef(ref) {
-		writePeerError(w, http.StatusBadRequest, "bad_request", "not a project ref: "+ref)
+		mesh.RespondError(w, http.StatusBadRequest, "bad_request", "not a project ref: "+ref)
 		return
 	}
 	if local := o.d.Members.Epoch(); req.Epoch < local {
-		writePeerError(w, http.StatusConflict, "stale_epoch", fmt.Sprintf("the node is at epoch %d, the request at %d", local, req.Epoch))
+		mesh.RespondError(w, http.StatusConflict, "stale_epoch", fmt.Sprintf("the node is at epoch %d, the request at %d", local, req.Epoch))
 		return
 	}
 	if o.d.LocalPrimaries == nil {
-		writePeerError(w, http.StatusNotImplemented, "unsupported", "this node cannot run a primary")
+		mesh.RespondError(w, http.StatusNotImplemented, "unsupported", "this node cannot run a primary")
 		return
 	}
 	ctx := r.Context()
@@ -769,10 +756,10 @@ func (o *Orchestrator) handlePrimary(w http.ResponseWriter, r *http.Request) {
 		p, gerr := o.store().GetProject(ctx, ref)
 		switch {
 		case gerr == nil && p.NodeID == o.self().ID:
-			writePeerError(w, http.StatusConflict, CodeHomedHere, "the registry homes "+ref+" on this node: its data is not set aside")
+			mesh.RespondError(w, http.StatusConflict, CodeHomedHere, "the registry homes "+ref+" on this node: its data is not set aside")
 			return
 		case gerr != nil && !errors.Is(gerr, registry.ErrNotFound):
-			writePeerError(w, http.StatusServiceUnavailable, "registry_unavailable", "this node's registry cannot say where "+ref+" is homed, so its data is not set aside: "+gerr.Error())
+			mesh.RespondError(w, http.StatusServiceUnavailable, "registry_unavailable", "this node's registry cannot say where "+ref+" is homed, so its data is not set aside: "+gerr.Error())
 			return
 		}
 		err = o.d.LocalPrimaries.SetAside(ctx, ref, req.Epoch)
@@ -781,12 +768,12 @@ func (o *Orchestrator) handlePrimary(w http.ResponseWriter, r *http.Request) {
 	case OpRelease:
 		err = fenced.ReleaseProject(o.d.Cfg.Paths(), ref)
 	default:
-		writePeerError(w, http.StatusNotFound, "unknown_op", "no such operation: "+op)
+		mesh.RespondError(w, http.StatusNotFound, "unknown_op", "no such operation: "+op)
 		return
 	}
 	if err != nil {
-		writePeerError(w, http.StatusInternalServerError, "primary_failed", err.Error())
+		mesh.RespondError(w, http.StatusInternalServerError, "primary_failed", err.Error())
 		return
 	}
-	writePeerJSON(w, http.StatusOK, res)
+	mesh.RespondJSON(w, http.StatusOK, res)
 }
