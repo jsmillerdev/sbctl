@@ -273,6 +273,8 @@ multi_push_tests() {
   node_push "$n" "$here/multi/node-lib.sh" /root/node-lib.sh
   node_push "$n" "$here/multi/writer.py" /root/writer.py 0755
   node_push "$n" "$here/multi/fence.sh" /usr/local/lib/supavise-ci/fence.sh 0755
+  # incus creates the directory for root alone, and the daemon, which runs the fence command, is the supavise user.
+  on "$n" chmod 0755 /usr/local/lib/supavise-ci
   printf 'export SUPAVISE_DOMAIN=%s\nexport BRIDGE_IP=%s\nexport S3_BUCKET=%s\nexport S3_OBJECTS_BUCKET=%s\n' \
     "${MULTI_DOMAIN:-$(node_ip n1).sslip.io}" "$BRIDGE_IP" "$S3_BUCKET" "$S3_OBJECTS_BUCKET" | on "$n" tee /root/multi-env.sh >/dev/null
 }

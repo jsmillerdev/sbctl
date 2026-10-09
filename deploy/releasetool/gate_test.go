@@ -97,6 +97,10 @@ func allGreen(t *testing.T, dir string) {
 	set(t, dir, p, b)
 	p, b = jobs(3, job("suites (ubuntu-24.04, amd64)", "success"), job("suites (ubuntu-24.04-arm, arm64)", "success"), job("specdiff", "skipped"))
 	set(t, dir, p, b)
+	p, b = runs("replication.yml", runOn(4, "workflow_dispatch", "completed", "success", "2026-10-07T01:00:00Z"))
+	set(t, dir, p, b)
+	p, b = jobs(4, job("two-servers (amd64)", "success"), job("two-servers (arm64)", "success"))
+	set(t, dir, p, b)
 }
 
 func TestGatePassesWhenEveryRequiredRunSucceeded(t *testing.T) {
@@ -106,7 +110,8 @@ func TestGatePassesWhenEveryRequiredRunSucceeded(t *testing.T) {
 	if err != nil || !strings.Contains(out, "release gate passed") {
 		t.Fatalf("%v\n%s", err, out)
 	}
-	if !strings.Contains(out, "2 job(s) of conformance.yml named suites*") || !strings.Contains(out, "2 job(s) of linux.yml named upgrade*") {
+	if !strings.Contains(out, "2 job(s) of conformance.yml named suites*") || !strings.Contains(out, "2 job(s) of linux.yml named upgrade*") ||
+		!strings.Contains(out, "2 job(s) of replication.yml named two-servers*") {
 		t.Errorf("the gate should say which jobs it saw:\n%s", out)
 	}
 }
@@ -132,6 +137,14 @@ func TestGateRefuses(t *testing.T) {
 			p, b := jobs(2, job("upgrade-e2e (ubuntu-24.04, amd64)", "skipped"))
 			set(t, dir, p, b)
 		}, "(skipped)"},
+		"the two-server test failed on arm64": {func(t *testing.T, dir string) {
+			p, b := jobs(4, job("two-servers (amd64)", "success"), job("two-servers (arm64)", "failure"))
+			set(t, dir, p, b)
+		}, "two-servers (arm64) (failure)"},
+		"the two-server test never ran on the commit": {func(t *testing.T, dir string) {
+			p, b := runs("replication.yml")
+			set(t, dir, p, b)
+		}, "replication.yml has no run on " + sha},
 		"ci failed": {func(t *testing.T, dir string) {
 			p, b := runs("ci.yml", run(1, "completed", "failure", "2026-10-07T01:00:00Z"))
 			set(t, dir, p, b)

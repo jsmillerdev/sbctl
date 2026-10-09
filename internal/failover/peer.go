@@ -33,7 +33,7 @@ import (
 //	POST /peer/v1/fence                          any node to a node: the cooperative fence (peerapi.PathFence)
 //	POST /peer/v1/failover/quiesce               the survivor to the leader: stop everything for a planned switchover
 //	POST /peer/v1/failover/resume                the survivor to the leader: undo a quiesce
-//	POST /peer/v1/failover/primary/{ref}/{op}    the leader to a project's home: stop, start, health or aside
+//	POST /peer/v1/failover/primary/{ref}/{op}    the leader to a project's home: stop, start, health, aside, hold or release
 //	POST|GET /peer/v1/failover/server            the leader to the node that takes over: run a switchover, and tell how it goes
 const (
 	PathQuiesce = "/peer/v1/failover/quiesce"
@@ -47,10 +47,12 @@ const CodeHomedHere = "homed_here"
 
 // Operations of PathPrimary.
 const (
-	OpStop   = "stop"
-	OpStart  = "start"
-	OpHealth = "health"
-	OpAside  = "aside"
+	OpStop    = "stop"
+	OpStart   = "start"
+	OpHealth  = "health"
+	OpAside   = "aside"
+	OpHold    = "hold"
+	OpRelease = "release"
 )
 
 // PrimaryPath fills in PathPrimary.
@@ -80,9 +82,10 @@ type QuiesceResult struct {
 	LSNs map[string]string `json:"lsns"`
 }
 
-// PrimaryCall is the body of PathPrimary.
+// PrimaryCall is the body of PathPrimary. Reason is the sentence a hold records for the operator.
 type PrimaryCall struct {
-	Epoch int64 `json:"epoch"`
+	Epoch  int64  `json:"epoch"`
+	Reason string `json:"reason,omitempty"`
 }
 
 // PrimaryResult is the answer of PathPrimary.
@@ -120,6 +123,19 @@ func (m MeshPeers) Fence(ctx context.Context, node string, req FenceCall) (peera
 	var r peerapi.FenceResponse
 	err := m.RPC.Call(ctx, node, http.MethodPost, peerapi.PathFence, req, &r)
 	return r, err
+}
+
+func (m MeshPeers) Hold(ctx context.Context, node, ref string, epoch int64, reason string) error {
+	return m.RPC.Call(ctx, node, http.MethodPost, PrimaryPath(ref, OpHold), PrimaryCall{Epoch: epoch, Reason: reason}, nil)
+}
+
+func (m MeshPeers) Release(ctx context.Context, node, ref string, epoch int64) error {
+	err := m.RPC.Call(ctx, node, http.MethodPost, PrimaryPath(ref, OpRelease), PrimaryCall{Epoch: epoch}, nil)
+	var re *mesh.RemoteError
+	if errors.As(err, &re) && re.Code == "unknown_op" {
+		return nil // a node that predates the hold has none of this move's to remove
+	}
+	return err
 }
 
 func (m MeshPeers) Quiesce(ctx context.Context, node string, req QuiesceRequest) (QuiesceResult, error) {
@@ -333,6 +349,15 @@ func (o *Orchestrator) fenceProjectHere(ctx context.Context, req FenceCall) (pee
 	return peerapi.FenceResponse{Epoch: o.d.Members.Epoch(), Fenced: true, Stopped: stopped}, nil
 }
 
+// holdHere writes the hold of a planned stop on this node: the project's fence record, marked as the
+// move's own, so that the plane does not start the primary until the move releases it.
+func (o *Orchestrator) holdHere(ref, leader string, epoch int64, reason string) error {
+	if reason == "" {
+		reason = fmt.Sprintf("node %s stopped the primary of %s for a planned move at epoch %d", leader, ref, epoch)
+	}
+	return fenced.WriteProject(o.d.Cfg.Paths(), fenced.Record{Epoch: epoch, Leader: leader, Ref: ref, Reason: reason, At: o.d.Now().UTC(), Planned: true})
+}
+
 func reasonOf(req FenceCall) string {
 	if req.Reason != "" {
 		return req.Reason
@@ -423,9 +448,11 @@ func (o *Orchestrator) fencePrimaries(ctx context.Context, refs []string, record
 // removeLauncher deletes <ref>/postgres.run, which supavise-postgres@<ref> needs to exist
 // (ConditionPathExists): without it systemd will not start the cluster, not even at boot.
 func removeLauncher(cfg *config.Config, ref string) error {
-	run := units.FilesFor(cfg, units.Spec{Service: config.SvcPostgres, Ref: ref}).Run
-	if err := os.Remove(run); err != nil && !errors.Is(err, fs.ErrNotExist) {
-		return fmt.Errorf("removing %s: %w", run, err)
+	files := units.FilesFor(cfg, units.Spec{Service: config.SvcPostgres, Ref: ref})
+	for _, f := range []string{files.Run, files.Held()} {
+		if err := os.Remove(f); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return fmt.Errorf("removing %s: %w", f, err)
+		}
 	}
 	return nil
 }
@@ -546,6 +573,12 @@ func (o *Orchestrator) quiesceLocal(ctx context.Context, req QuiesceRequest, rec
 	g.SetLimit(quiesceParallel)
 	for _, ref := range rec.Refs {
 		g.Go(func() error {
+			// The hold first: until the new leader has the projects, the registry of this node still homes them
+			// here, and a restart of the daemon would start them again (design 2.10.3, the window of a planned stop).
+			reason := fmt.Sprintf("the primary of %s was stopped for the planned switchover of the server to %s at epoch %d; finish it with supavise failover --resume", ref, req.To, req.Epoch)
+			if err := o.holdHere(ref, req.To, req.Epoch, reason); err != nil {
+				return fmt.Errorf("keeping %s from starting again: %w", ref, err)
+			}
 			o.quiesceTenant(ctx, ref)
 			lsn, err := o.d.LocalPrimaries.Stop(ctx, ref)
 			if err != nil {
@@ -564,6 +597,14 @@ func (o *Orchestrator) quiesceLocal(ctx context.Context, req QuiesceRequest, rec
 		if err := o.d.LocalServices.Stop(ctx); err != nil {
 			return QuiesceResult{}, fmt.Errorf("stopping the shared services: %w", err)
 		}
+	}
+	// The system cluster is held the way the projects are, but by its launcher: systemd starts it by
+	// itself (supavise.service wants it when the daemon restarts, and it starts at boot), which a
+	// record that only the plane reads would not stop. Without the launcher the unit's condition
+	// fails and the old leader's system cluster stays down until the move ends or is undone
+	// (StartSystemDatabase puts the launcher back).
+	if err := units.FilesFor(o.d.Cfg, units.Spec{Service: config.SvcPostgres, Ref: config.SystemRef}).Hold(); err != nil {
+		return QuiesceResult{}, fmt.Errorf("keeping the system cluster from starting again: %w", err)
 	}
 	lsn, err := o.d.LocalPrimaries.Stop(ctx, config.SystemRef)
 	if err != nil {
@@ -621,6 +662,13 @@ func (o *Orchestrator) handleResume(w http.ResponseWriter, r *http.Request) {
 	if rec == nil || rec.To != peer.Node {
 		writePeerError(w, http.StatusConflict, "no_quiesce", "no switchover to that node is waiting")
 		return
+	}
+	// The projects the quiesce held start again: the hold is released before the plane is asked.
+	for _, ref := range rec.Refs {
+		if err := fenced.ReleaseProject(o.d.Cfg.Paths(), ref); err != nil {
+			writePeerError(w, http.StatusInternalServerError, "resume_failed", err.Error())
+			return
+		}
 	}
 	if err := o.resumeLocal(context.WithoutCancel(r.Context())); err != nil {
 		writePeerError(w, http.StatusInternalServerError, "resume_failed", err.Error())
@@ -728,6 +776,10 @@ func (o *Orchestrator) handlePrimary(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		err = o.d.LocalPrimaries.SetAside(ctx, ref, req.Epoch)
+	case OpHold:
+		err = o.holdHere(ref, peer.Node, req.Epoch, req.Reason)
+	case OpRelease:
+		err = fenced.ReleaseProject(o.d.Cfg.Paths(), ref)
 	default:
 		writePeerError(w, http.StatusNotFound, "unknown_op", "no such operation: "+op)
 		return

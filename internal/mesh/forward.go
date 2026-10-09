@@ -191,10 +191,18 @@ func (f *Forwarders) desired(ctx context.Context) (map[int]target, error) {
 		}
 		want[port] = target{kind: k, ref: ref, node: node}
 	}
+	leader, haveLeader := f.Topology.Leader()
 	for _, p := range projects {
-		if p.NodeID != self {
+		// The system cluster is the leader's (I1). A copy of the registry that has not replayed a planned
+		// switchover still homes it on the old leader, whose standby has to stream from the new one before it
+		// can replay anything: the membership's leader decides, not the row.
+		home := p.NodeID
+		if p.Ref == config.SystemRef && haveLeader {
+			home = leader.ID
+		}
+		if home != self {
 			for _, k := range []Kind{KindPostgres, KindGoTrue, KindPostgREST} {
-				add(k, p.Ref, p.Seq, p.NodeID)
+				add(k, p.Ref, p.Seq, home)
 			}
 		}
 		// The replica ports are the replica itself on the node that holds it and a forwarder to

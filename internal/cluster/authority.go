@@ -70,6 +70,10 @@ type Authority struct {
 	// view of the cluster, which peers admit certificates by, holds the change when the peer comes
 	// back a moment later.
 	Changed func(ctx context.Context)
+	// Rebuild, when set, sets up a replica of project ref on node: the leader calls it for the projects a rejoined
+	// node set aside (peerapi.JoinConfirm.Rebuild), after the node is active. It runs on the caller's goroutine, so
+	// an implementation that may take long starts its own.
+	Rebuild func(ctx context.Context, ref, node string) error
 	Now     func() time.Time
 
 	mu      sync.Mutex
@@ -507,7 +511,41 @@ func (a *Authority) Confirm(ctx context.Context, caller string, c peerapi.JoinCo
 	}
 	a.changed(ctx)
 	a.log().Info("node joined", "node", caller, "replay_lsn", c.ReplayLSN)
+	a.rebuildReplicas(ctx, caller, c.Rebuild)
 	return nil
+}
+
+// rebuildReplicas sets up, on a node that rejoined, a replica of each project it says it had set aside, so that
+// the node serves its projects' reads again without an operator running `supavise replicas add` for each. The
+// node's word is only a hint: a project that is gone, homed on the node itself (it keeps its primary), the
+// system project, or one the node already has a replica of is skipped, and a failure is logged and left to the
+// operator, because the rejoin itself has succeeded.
+func (a *Authority) rebuildReplicas(ctx context.Context, node string, refs []string) {
+	if a.Rebuild == nil || len(refs) == 0 {
+		return
+	}
+	have := map[string]bool{}
+	if rs, err := a.Reg.ListReplicasOn(ctx, node); err == nil {
+		for _, r := range rs {
+			have[r.Ref] = true
+		}
+	}
+	seen := map[string]bool{}
+	for _, ref := range refs {
+		if ref == config.SystemRef || seen[ref] || have[ref] {
+			continue
+		}
+		seen[ref] = true
+		p, err := a.Reg.GetProject(ctx, ref)
+		if err != nil || p.Status == registry.StatusRemoved || p.NodeID == node || p.Branch != nil {
+			continue
+		}
+		if err := a.Rebuild(ctx, ref, node); err != nil {
+			a.log().Warn("a replica could not be set up again on the node that rejoined; run `supavise replicas add`", "project", ref, "node", node, "error", err)
+			continue
+		}
+		a.log().Info("a replica is being set up again on the node that rejoined", "project", ref, "node", node)
+	}
 }
 
 // Renew signs a new certificate for the calling node and records its serial. The node keeps using

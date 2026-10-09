@@ -53,7 +53,28 @@ func (m *Manager) Call(ctx context.Context, node, method, path string, in, out a
 	if err != nil {
 		return err
 	}
-	return call(ctx, st, node, method, path, in, out)
+	err = call(ctx, st, node, method, path, in, out)
+	if errors.Is(err, ErrNoSession) {
+		m.logLostCall(node, method, path, err)
+	}
+	return err
+}
+
+// logLostCall says, at warning, what the session to node looked like when a call on it ended without an answer: the
+// far end closed the stream, and nothing on either side says why unless the session does. Who dialed it, how old it
+// is, whether it is the one being retired and how many streams it carries tell a restart of the far end from a
+// session that lost the tie-break.
+func (m *Manager) logLostCall(node, method, path string, err error) {
+	m.mu.Lock()
+	pc := m.sessions[node]
+	m.mu.Unlock()
+	if pc == nil {
+		m.o.Log.Warn("mesh: a call ended without an answer and there is no session to the node now", "node", node, "method", method, "path", path, "error", err)
+		return
+	}
+	m.o.Log.Warn("mesh: a call ended without an answer", "node", node, "method", method, "path", path, "error", err,
+		"dialed_by_us", pc.dialed, "session_age", m.o.Now().Sub(pc.since).Round(time.Millisecond).String(), "retiring", pc.retiring.Load(),
+		"closed", pc.sess.IsClosed(), "streams", pc.sess.NumStreams())
 }
 
 // callOn is Call over the session pc, not whichever session the node has now.

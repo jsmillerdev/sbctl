@@ -94,7 +94,7 @@ The replica's PostgREST reloads its schema cache when the primary notifies it an
 - Every answer carries `X-Supavise-Route: <identifier>` (the ref for the primary), and the access log gets `load_balancer_redirect_identifier`.
 - A read whose chosen replica refuses the connection or breaks before it answers is repeated once on the primary. A request with a body is not repeated and answers `502`.
 - Custom and vanity hostnames always go to the primary.
-- Lag readings live on the leader. On a follower, a nonzero `lb_max_lag_seconds` leaves every replica out and reads go to the primary.
+- Lag readings live on the leader, and nothing carries them to a follower. On a follower, a nonzero `lb_max_lag_seconds` leaves every replica out and reads go to the primary, so the limit takes effect only on the leader. With the limit at zero every node spreads reads as described above.
 
 **Pooler.** `postgres.<identifier>` on the replica's node logs in to the standby. The Supavisor tenant is a row of the replicated pooler database, so each node's Supavisor serves it.
 
@@ -120,6 +120,10 @@ A project move needs a replica of that project. A server move needs one for ever
 
 The server move writes the new leader and epoch to `_node/leader.json` in the backup store, takes the service address (an Elastic IP on AWS, the operator's command elsewhere), promotes the system cluster, and then promotes each project's replica, four at a time. Nothing is promoted until the old leader cannot write. The daemon restarts once when the system cluster is promoted, and the daemon that starts continues the move. The CLI waits for it and goes on printing steps. A move that stopped is continued with `--resume`. A failed server move that has gone no further than stopping the leader is discarded with `--abort`.
 
+**The window of a planned stop.** Between the moment the old primary stops and the moment the registry names the new home, a restart of the old home's daemon or a reboot of its machine would start the primary again, and a second writable primary would exist once the replica is promoted. A planned move therefore writes a hold on the old home before it stops anything. For a project the hold is its fence record (`fenced.json` with `planned` set), which the daemon's plane obeys. For the system cluster of a server move the hold is its launcher, `projects/system/postgres.run`, which the quiesce renames to `postgres.run.held` before it stops the cluster; systemd refuses to start the unit without the launcher, so neither a restart of the daemon (which wants the system cluster) nor a boot starts it. A daemon of the old leader that restarts in that window cannot open its registry and serves nothing until the move is finished or undone by hand: move `postgres.run.held` back to `projects/system/postgres.run` and start `supavise-postgres@system`, then run `supavise failover --abort` (before the promotion) or `supavise node rejoin` (after it). The end of the move, `supavise failover --resume` or `--abort`, puts the launcher back when it starts the cluster. A fenced node loses the held launcher with the rest.
+
+**WAL kept for the standbys.** Standbys use no replication slots. A clean shutdown switches to a new WAL segment, writes the shutdown checkpoint at its start and recycles the segment it closed, so a standby that had not read the end of that segment lost the checkpoint, and the move refused it as behind the old primary (`requested WAL segment ... has already been removed` in the standby's log; seen in one arm64 run of the release test, run 37886326567). Just before a planned stop the primary sets `wal_keep_size = 64MB` (`ALTER SYSTEM` and a reload), which keeps four segments. The setting stays in the cluster's `postgresql.auto.conf` and goes with it to its standbys; it costs at most 64 MB of disk per project and you can reset it with `ALTER SYSTEM RESET wal_keep_size`.
+
 **Fencing.** `[failover] fencing` chooses how the old primary is kept from writing:
 
 - `aws`: the survivor stops the peer's EC2 instance, waits for `stopped`, and associates the service address's Elastic IP with itself. A peer that EC2 does not list is not taken for stopped. A survivor whose only private address carries an Elastic IP of its own is not touched: the move prints the DNS change instead.
@@ -130,7 +134,7 @@ The server move writes the new leader and epoch to `_node/leader.json` in the ba
 
 **Failback.** A switchover moves the work back. After a planned move the old primary already follows as a replica, so run `supavise failover` (or `supavise projects failover <ref>`) on the node that should lead again. After an unplanned failover, run `supavise node rejoin` on the returned node first. It sets the old data aside for `keep_diverged_days` (3), rebuilds from the new leader's archive and keeps its identity.
 
-**A node that returns.** At boot a node that led asks its peers for the epoch and reads `_node/leader.json`. A higher epoch, or another leader at the same epoch, fences it: no primary starts, the proxy answers `503`, `supavise status` shows FENCED and the critical alert `fenced` fires. A node that cannot reach either source starts only when its own record shows no demotion. A node that led and restarts before its copy of the registry has replayed a planned switchover reads itself as the replaced leader and is fenced; `supavise node rejoin` brings it back.
+**A node that returns.** At boot a node that led asks its peers for the epoch and reads `_node/leader.json`. A higher epoch, or another leader at the same epoch, fences it: no primary starts, the proxy answers `503`, `supavise status` shows FENCED and the critical alert `fenced` fires. A node that cannot reach either source starts only when its own record shows no demotion. A node that led and restarts before its copy of the registry has replayed a planned switchover reads itself as the replaced leader and is fenced; `supavise node rejoin` brings it back. The rejoin sets the node's old data aside, rebuilds its system standby, and tells the leader which projects' data it set aside; once the node is active the leader sets up a replica of each of those projects there (a project that moved to the node, was removed, or already has a replica there is left out), so the node serves reads again without `supavise replicas add`. A rejoin that finds the old system cluster still shutting down waits for it, and for its port, before it forwards that port to the leader; run again, it does the same, and so does `supavise node join --resume`: the projects the first run set aside are kept in `join.json` (`rebuild`) and reach the leader whichever command finishes the join.
 
 ## Failure matrix
 
@@ -159,14 +163,22 @@ The server move writes the new leader and epoch to `_node/leader.json` in the ba
 
 | Case | Data lost (RPO) | Label |
 |---|---|---|
-| Planned switchover | none: the old primary stops cleanly and the replica replays to its final checkpoint before it is promoted | Designed, covered by tests that run real clusters for the replica steps; no recorded run of a full move |
-| Unplanned, replica streaming | the replication lag at the failure. The lag alert opens at 60 seconds, and a move refuses a replica over `max_lag_seconds` without `--force`. | Designed; lag p99 was 0.10 to 0.41 s at 20 MB/s of WAL over 2 to 70 ms of round trip (**Measured** in spike S6) |
+| Planned switchover | none: the old primary stops cleanly and the replica replays to its final checkpoint before it is promoted | **Measured** by the two-server release test (`replication` workflow): a continuous writer lost no acknowledged row in any project or server move of the runs below |
+| Unplanned, replica streaming | the replication lag at the failure. The lag alert opens at 60 seconds, and a move refuses a replica over `max_lag_seconds` without `--force`. | **Measured**: the test stopped the leader at once under a writer of 20 rows a second (the replay lag before the stop was 1 to 5 ms) and no acknowledged row was lost (0.000 s of writes) in five runs. Lag p99 was 0.10 to 0.41 s at 20 MB/s of WAL over 2 to 70 ms of round trip (spike S6) |
 | Unplanned, stream broken | up to `archive_timeout` (**Setting**, `[backup] archive_timeout_seconds`, 300 s) plus the upload time | Designed |
 | Project with no replica, `--restore-missing` | the same bound | Designed |
 | Storage objects | none on S3. The file backend refuses a server move. | As built |
 | Realtime events in flight | lost | Designed |
 
-RTO is the time to promote and re-register. The design expects tens of seconds for the control plane and one to three minutes for tens of projects (**Designed**). No run records it. A move reports each step, so a run on your servers gives your own figure.
+RTO is the time to promote and re-register. The release test measures it as the time from the stop of the old leader to the first write that a client sees acknowledged on the new primary, with two small projects and a client that sends 20 inserts a second through the proxy:
+
+| Case | amd64 (virtual machines) | arm64 (system containers) |
+|---|---|---|
+| `supavise failover --force` after the leader stopped at once (the whole server, two projects) | 74 to 85 s | 49 to 56 s |
+| Planned switchover of the server (`supavise failover --to`): the longest gap the writer saw | 34 to 58 s | 34 to 47 s |
+| Planned switchover of one project (`supavise projects failover`): the longest gap the writer saw | 1.4 to 3.7 s | 1.2 to 6.7 s |
+
+These are **Measured** on two-core machines with 5 GiB each, over a bridge with 0.2 to 0.4 ms of round trip, and are what a cluster of that size does, not a promise: the figure grows with the number of projects (each promoted replica starts its own services) and with the time the old leader's last WAL needs to reach the store. A move reports each step, so a run on your servers gives your own figure.
 
 ## Configuration
 
@@ -183,7 +195,7 @@ Cluster-scoped keys are the same on every node. The leader's values win: `supavi
 | `[replicas] concurrency` | 2 | setups at once |
 | `[replicas] bootstrap_max_backup_age` | `24h` | a base backup older than this is replaced before seeding |
 | `[replicas] unhealthy_lag_seconds` | 300 | lag above this is `ACTIVE_UNHEALTHY` |
-| `[replicas] lb_max_lag_seconds` | 0 | the balancer skips a replica over this lag; 0 ignores lag |
+| `[replicas] lb_max_lag_seconds` | 0 | the balancer skips a replica over this lag; 0 ignores lag. Only the leader knows the lag, so a balancer on a follower sends every read to the primary while this is set |
 | `[replicas] schema_reload_seconds` | 10 | the replica's PostgREST schema reload interval |
 | `[failover] mode` | `manual` | `manual`, `project` or `server` |
 | `[failover] fencing` | empty | `aws`, `command` or empty |

@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/supavise/supavise/internal/config"
 	"github.com/supavise/supavise/internal/mesh/peerapi"
 	"github.com/supavise/supavise/internal/registry"
 )
@@ -1210,4 +1211,45 @@ func TestAShortSessionThatStaysOpenIsClosed(t *testing.T) {
 		t.Fatalf("the server holds %d short sessions of n1, want 1", held())
 	}
 	eventually(t, "the server to close a short session that stayed open", func() bool { return held() == 0 })
+}
+
+// A copy of the registry that has not replayed a planned switchover still homes the system cluster on the
+// old leader. The old leader's standby has to stream from the new one before it can replay anything, so the
+// canonical port of the system cluster forwards to the node the membership names the leader, not to the
+// node the stale row names (which is this node).
+func TestTheSystemPortForwardsToTheLeaderTheMembershipNames(t *testing.T) {
+	h := newHarness(t, "n1", "n2")
+	h.project(config.SystemRef, 0, "n1") // the old copy: homed on n1, which is the node asking
+	n1 := h.nodes["n1"]
+	n1.fwd.Topology = leaderOf{Topology: n1.fwd.Topology, leader: "n2"}
+	want, err := n1.fwd.desired(h.ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	port, err := LocalPort(n1.cfg, KindPostgres, config.SystemRef, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, ok := want[port]; !ok || got.node != "n2" || got.ref != config.SystemRef {
+		t.Fatalf("the system port %d forwards to %+v (wanted n2)", port, got)
+	}
+	// With the leader unknown the row decides, as it did.
+	n1.fwd.Topology = leaderOf{Topology: n1.fwd.Topology}
+	want, _ = n1.fwd.desired(h.ctx)
+	if _, ok := want[port]; ok {
+		t.Fatal("the system port is forwarded on the node the row homes it on")
+	}
+}
+
+// leaderOf overrides the leader a topology reports.
+type leaderOf struct {
+	Topology
+	leader string
+}
+
+func (l leaderOf) Leader() (registry.Node, bool) {
+	if l.leader == "" {
+		return registry.Node{}, false
+	}
+	return registry.Node{ID: l.leader, State: registry.NodeActive}, true
 }

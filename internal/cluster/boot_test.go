@@ -1097,3 +1097,159 @@ func TestLiveShowsThePromotedEpoch(t *testing.T) {
 		t.Fatalf("epoch %d", m.Epoch())
 	}
 }
+
+// The registry handle of a follower is a connection to its standby's socket. The promotion ends with a
+// restart on the system port that takes the socket away, so the cluster row cannot be read when the node
+// has to see that it leads: the recovery probe decides alone, and the daemon restarts in the new role.
+func TestLiveFollowsTheProbeWhenTheRegistryCannotBeRead(t *testing.T) {
+	p := &probe{rec: true}
+	l, reg, _ := newLive(t, BootDecision{Role: RoleFollower, SelfID: "n2"}, p)
+	l.o.Reg = unreadable{reg}
+	ctx := context.Background()
+	l.Refresh(ctx) // a standby, as it booted: nothing changes
+	select {
+	case <-l.Changed():
+		t.Fatal("a standby that is still one changed the role")
+	default:
+	}
+	p.set(false, errors.New("the socket is gone"))
+	l.Refresh(ctx) // the probe finds nothing to say
+	p.set(false, nil)
+	l.Refresh(ctx) // one poll of a primary is not yet a change
+	select {
+	case <-l.Changed():
+		t.Fatal("one poll was taken for a change")
+	default:
+	}
+	l.Refresh(ctx)
+	select {
+	case <-l.Changed():
+		if !strings.Contains(l.Why(), "started as follower and is now leader") {
+			t.Fatalf("why: %q", l.Why())
+		}
+	default:
+		t.Fatal("a primary on the system port did not restart a follower whose registry cannot be read")
+	}
+	if l.Role() != RoleFollower {
+		t.Fatalf("the snapshot is the registry's to publish, not the probe's: role %s", l.Role())
+	}
+}
+
+// unreadable is a registry whose cluster row cannot be read.
+type unreadable struct{ registry.Registry }
+
+func (unreadable) GetCluster(context.Context) (*registry.Cluster, error) {
+	return nil, errors.New("the socket of the standby is gone")
+}
+
+// The old leader of a planned switchover has stopped its database, so it cannot read the registry that
+// names the new leader. It follows the word of the node its record says it stopped for, and only that one:
+// its requests are then the leader's (the demotion of the node's own clusters), and the node is not fenced.
+func TestLiveFollowsTheSuccessorItStoppedFor(t *testing.T) {
+	p := &probe{}
+	l, _, _ := newLive(t, BootDecision{Role: RoleLeader, SelfID: "n1"}, p)
+	l.o.Successor = func(node string, epoch int64) bool { return node == "n2" && epoch >= 2 }
+	ctx := context.Background()
+	l.Refresh(ctx)
+	if lead, ok := l.Leader(); !ok || lead.ID != "n1" {
+		t.Fatalf("leader %+v", lead)
+	}
+	// The quiesce stopped the database: the probe fails, and the node is not a primary.
+	p.set(false, errors.New("the cluster is stopped"))
+	l.Refresh(ctx)
+	l.ObserveEpoch("n3", 2, "n3") // a node nobody stopped for
+	if lead, _ := l.Leader(); lead.ID != "n1" || l.Fenced() != nil {
+		t.Fatalf("a stranger took the leadership: %+v", lead)
+	}
+	l.ObserveEpoch("n2", 2, "n2")
+	if lead, ok := l.Leader(); !ok || lead.ID != "n2" {
+		t.Fatalf("the successor does not lead: %+v %v", lead, ok)
+	}
+	if l.Epoch() != 1 || l.Role() != RoleLeader || l.Fenced() != nil {
+		t.Fatalf("epoch %d, role %s, fenced %v: the snapshot takes the leader and keeps the epoch and the role", l.Epoch(), l.Role(), l.Fenced())
+	}
+	// A refresh with an unreadable registry (the database is still stopped) leaves it so.
+	l.o.Reg = unreadable{l.o.Reg}
+	l.Refresh(ctx)
+	if lead, _ := l.Leader(); lead.ID != "n2" {
+		t.Fatalf("a refresh took the successor back: %+v", lead)
+	}
+}
+
+// The epoch only rises: the old leader of a planned switchover restarts as a follower with a copy of the
+// registry that has not replayed the move, and the boot decision (which asked the peers) knows better.
+func TestARegistryCopyBehindTheBootDecisionDoesNotTakeTheLeaderBack(t *testing.T) {
+	cfg := config.Default()
+	cfg.StateDir = t.TempDir()
+	reg := registry.NewMemory()
+	ctx := context.Background()
+	if err := reg.CreateNode(ctx, &registry.Node{Name: "second", State: registry.NodeActive}); err != nil {
+		t.Fatal(err)
+	}
+	p := &probe{rec: true} // a standby
+	boot := BootDecision{Role: RoleFollower, SelfID: "n1", Joined: true, Epoch: 2, Leader: "n2"}
+	l := NewLive(LiveOptions{Cfg: cfg, Reg: reg, SelfID: "n1", Boot: boot, InRecovery: p.InRecovery, Poll: 10 * time.Millisecond})
+	l.Refresh(ctx) // the copy says: epoch 1, led by n1
+	if lead, ok := l.Leader(); !ok || lead.ID != "n2" || l.Epoch() != 2 {
+		t.Fatalf("leader %+v (%v) at epoch %d, want n2 at 2", lead, ok, l.Epoch())
+	}
+	// Once the copy has caught up, it is the registry's word again.
+	if err := reg.SetLeader(ctx, "n2", 2); err != nil {
+		t.Fatal(err)
+	}
+	l.Refresh(ctx)
+	if lead, _ := l.Leader(); lead.ID != "n2" || l.Epoch() != 2 {
+		t.Fatalf("leader %+v at epoch %d after the copy caught up", lead, l.Epoch())
+	}
+}
+
+// The old leader of a planned switchover restarts as a follower with a copy of the registry that has not
+// replayed the move. It hears who leads from its peers and believes only the node its record says it
+// stopped for: the forwarders its standby streams through are bound from the leader the membership names.
+func TestAFollowerWithAStaleCopyFollowsTheSuccessorItStoppedFor(t *testing.T) {
+	cfg := config.Default()
+	cfg.StateDir = t.TempDir()
+	reg := registry.NewMemory()
+	ctx := context.Background()
+	if err := reg.CreateNode(ctx, &registry.Node{Name: "second", State: registry.NodeActive}); err != nil {
+		t.Fatal(err)
+	}
+	p := &probe{rec: true}
+	boot := BootDecision{Role: RoleFollower, SelfID: "n1", Joined: true}
+	l := NewLive(LiveOptions{Cfg: cfg, Reg: reg, SelfID: "n1", Boot: boot, InRecovery: p.InRecovery, Poll: 10 * time.Millisecond,
+		Successor: func(node string, epoch int64) bool { return node == "n2" && epoch >= 2 }})
+	l.Refresh(ctx) // the copy says: epoch 1, led by n1
+	if lead, _ := l.Leader(); lead.ID != "n1" || l.Epoch() != 1 {
+		t.Fatalf("the stale copy: leader %s at epoch %d", lead.ID, l.Epoch())
+	}
+	l.ObserveEpoch("n2", 1, "n2") // not a higher epoch
+	l.ObserveEpoch("n3", 2, "n3") // not the node this one stopped for
+	if lead, _ := l.Leader(); lead.ID != "n1" || l.Epoch() != 1 {
+		t.Fatalf("a claim nobody vouches for took the leadership: %s at %d", lead.ID, l.Epoch())
+	}
+	l.ObserveEpoch("n2", 2, "n2")
+	if lead, ok := l.Leader(); !ok || lead.ID != "n2" || l.Epoch() != 2 || l.Role() != RoleFollower {
+		t.Fatalf("leader %+v (%v) at epoch %d, role %s", lead, ok, l.Epoch(), l.Role())
+	}
+	l.Refresh(ctx) // the copy is still behind: it does not take the leader back
+	if lead, _ := l.Leader(); lead.ID != "n2" || l.Epoch() != 2 {
+		t.Fatalf("a refresh took the leadership back: %s at %d", lead.ID, l.Epoch())
+	}
+}
+
+// A ping names the leader and the epoch of one snapshot: read separately they can come from two, and "node
+// X leads at epoch E" with a pair that never was makes the node that leads at E fence itself.
+func TestLeaderAndEpochComeFromOneSnapshot(t *testing.T) {
+	s := NewStatic(Snapshot{Nodes: []registry.Node{{ID: "n1"}, {ID: "n2"}}, Leader: "n1", Epoch: 1, Role: RoleFollower})
+	if lead, ok, epoch := s.LeaderAndEpoch(); !ok || lead.ID != "n1" || epoch != 1 {
+		t.Fatalf("%v %v %d", lead.ID, ok, epoch)
+	}
+	s.Set(Snapshot{Nodes: []registry.Node{{ID: "n1"}, {ID: "n2"}}, Leader: "n2", Epoch: 2, Role: RoleFollower})
+	if lead, ok, epoch := s.LeaderAndEpoch(); !ok || lead.ID != "n2" || epoch != 2 {
+		t.Fatalf("%v %v %d", lead.ID, ok, epoch)
+	}
+	s.Set(Snapshot{Leader: "n9", Epoch: 3})
+	if _, ok, epoch := s.LeaderAndEpoch(); ok || epoch != 3 {
+		t.Fatalf("a leader that is not among the nodes: %v, epoch %d", ok, epoch)
+	}
+}

@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -130,7 +131,12 @@ func Rejoin(ctx context.Context, o RejoinOptions) (*RejoinResult, error) {
 	if err := markFollower(dir, creds.NodeID, addr, firstNonEmpty(resp.System.Leader, want), now()); err != nil {
 		return nil, fmt.Errorf("cluster: writing %s: %w", FollowerFile, err)
 	}
-	st := &JoinState{NodeID: creds.NodeID, Leader: addr, System: resp.System, At: now().UTC()}
+	st := &JoinState{NodeID: creds.NodeID, Leader: addr, System: resp.System, At: now().UTC(), Rebuild: refsOfDiverged(o.Cfg, moved)}
+	// A rejoin that runs again finds no project data to set aside (the first run moved it): the projects
+	// it named are in the state it left.
+	if prev, perr := ReadJoinState(dir); perr == nil && prev.NodeID == st.NodeID {
+		st.Rebuild = unionRefs(prev.Rebuild, st.Rebuild)
+	}
 	if err := writeJSON(filepath.Join(dir, JoinStateFile), st); err != nil {
 		return nil, err
 	}
@@ -143,6 +149,34 @@ func Rejoin(ctx context.Context, o RejoinOptions) (*RejoinResult, error) {
 		return nil, err
 	}
 	return &RejoinResult{NodeID: creds.NodeID, System: resp.System, Diverged: moved}, nil
+}
+
+// refsOfDiverged names the projects (not the system project) that the directories MoveDiverged returned belonged
+// to: <state>/projects/<ref>/postgres/data.diverged-<epoch>.
+func refsOfDiverged(cfg *config.Config, moved []string) []string {
+	var refs []string
+	for _, d := range moved {
+		ref := filepath.Base(filepath.Dir(filepath.Dir(d)))
+		if ref == config.SystemRef || !strings.HasPrefix(d, cfg.Paths().PostgresData(ref)+divergedMark) {
+			continue
+		}
+		refs = append(refs, ref)
+	}
+	return refs
+}
+
+// unionRefs is the sorted union of two lists of refs.
+func unionRefs(a, b []string) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, r := range append(append([]string{}, a...), b...) {
+		if !seen[r] {
+			seen[r] = true
+			out = append(out, r)
+		}
+	}
+	sort.Strings(out)
+	return out
 }
 
 // divergedMark is the infix of the directories MoveDiverged creates.

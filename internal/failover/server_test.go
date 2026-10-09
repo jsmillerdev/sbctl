@@ -1201,3 +1201,98 @@ func TestAbortOfASwitchoverWhoseLogHoldsOnlyThePlanStartsTheLeaderAgain(t *testi
 		}
 	})
 }
+
+// The old leader's system cluster is demoted with no registry to read (it is the database the leader
+// stopped for the move): the request carries the replication password, and only that request does.
+func TestTheDemotionOfTheSystemClusterCarriesTheReplicationPassword(t *testing.T) {
+	w := serverWorld(t)
+	o := w.orch(func(d *Deps) {
+		d.SystemReplicationPassword = func(context.Context) (string, error) { return "s3cret", nil }
+	})
+	mv, err := o.FailoverServer(w.ctx, ServerOptions{})
+	if err != nil || mv.State != registry.MoveDone {
+		t.Fatalf("move: %+v, %v", mv, err)
+	}
+	sys, other := 0, 0
+	for id, pw := range w.demotePasswords {
+		if strings.HasPrefix(id, config.SystemRef+"-rr-") {
+			sys++
+			if pw != "s3cret" {
+				t.Errorf("the demotion of %s carried %q", id, pw)
+			}
+		} else {
+			other++
+			if pw != "" {
+				t.Errorf("the demotion of %s carried a password", id)
+			}
+		}
+	}
+	if sys != 1 || other == 0 {
+		t.Fatalf("demotions: %d of the system cluster, %d of projects: %v", sys, other, w.demotePasswords)
+	}
+	// Without a source the request carries none: the old leader reads its registry, as it did.
+	w2 := serverWorld(t)
+	if _, err := w2.orch().FailoverServer(w2.ctx, ServerOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	for id, pw := range w2.demotePasswords {
+		if pw != "" {
+			t.Errorf("without a source, the demotion of %s carried a password", id)
+		}
+	}
+}
+
+// The old leader's projects were held when its quiesce stopped them; the hold goes once the old leader
+// follows the new primary of each, and the system cluster, which was not held, has none to release.
+func TestAServerMoveReleasesTheHoldsOfTheOldLeadersProjects(t *testing.T) {
+	w := serverWorld(t)
+	mv, err := w.orch().FailoverServer(w.ctx, ServerOptions{})
+	if err != nil || mv.State != registry.MoveDone {
+		t.Fatalf("move: %+v, %v", mv, err)
+	}
+	for _, ref := range []string{refA, refB} {
+		i, j := w.index("demote n1/"+ref+"-rr-"), w.index("release n1/"+ref+" epoch=2")
+		if i < 0 || j < 0 || i > j {
+			t.Errorf("%s: demote at %d, release at %d:\n%v", ref, i, j, w.snapshot())
+		}
+	}
+	w.assertNever("release n1/system")
+}
+
+// A leader that stopped for a switchover accepts as its successor the node the record names, at the epoch
+// the switchover runs at or a later one, and no other; the record ends with the cluster's epoch.
+func TestAuthorizesSuccessorFollowsTheRecordOfTheQuiesce(t *testing.T) {
+	w := newWorld(t)
+	o := w.orch()
+	if o.AuthorizesSuccessor("n2", 2) {
+		t.Fatal("a leader that stopped for nobody has a successor")
+	}
+	must(t, o.saveQuiesce(&quiesceRecord{To: "n2", Epoch: 2, At: w.now()}))
+	for _, tc := range []struct {
+		node  string
+		epoch int64
+		want  bool
+	}{{"n2", 2, true}, {"n2", 3, true}, {"n2", 1, false}, {"n3", 2, false}, {"", 2, false}} {
+		if got := o.AuthorizesSuccessor(tc.node, tc.epoch); got != tc.want {
+			t.Errorf("AuthorizesSuccessor(%q, %d) = %v, want %v", tc.node, tc.epoch, got, tc.want)
+		}
+	}
+}
+
+// The old leader of a switchover has just restarted as a follower: it keeps no log of the move, and it
+// has not heard from the node it stopped for. Its record of the quiesce says the move is running there,
+// so a client that follows it waits instead of being told that nothing runs.
+func TestFollowWaitsWhileTheRecordOfTheQuiesceSaysTheMoveRunsElsewhere(t *testing.T) {
+	w := newWorld(t)
+	o := w.orch()
+	if st := o.Follow(w.ctx, 0, 2); st.State != "idle" {
+		t.Fatalf("with no record and no move: %+v", st)
+	}
+	must(t, o.saveQuiesce(&quiesceRecord{To: "n2", Epoch: 2, At: w.now()}))
+	if st := o.Follow(w.ctx, 0, 2); st.State != "running" {
+		t.Fatalf("with the record of the quiesce: %+v", st)
+	}
+	if st := o.Follow(w.ctx, 0, 3); st.State != "idle" {
+		t.Fatalf("the record of another epoch: %+v", st)
+	}
+}

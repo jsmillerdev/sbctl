@@ -53,8 +53,10 @@
 #   fenced             n1 returns: it records that it is fenced, runs no primary and answers 503
 #   rejoin             `supavise node rejoin`: n1 follows n2 and its replicas come back
 # 7. Upgrade
+#   upgrade-refused    a follower that has a project of its own running is refused by `supavise upgrade` (exit status 2),
+#                      and nothing on it changes; the project goes back to the leader
 #   upgrade-leader     `supavise upgrade` to v0.0.2 on the leader: no PostgreSQL cluster restarts
-#   upgrade-follower   and on the follower
+#   upgrade-follower   and on the follower, which has no project of its own: no rollout
 #   status-final       `supavise status` exits 0 on the leader
 #   follower-status-final
 #                      `supavise status` exits 0 on the follower, a check of its own
@@ -75,7 +77,7 @@ RESULTS_TITLE="Two-server release test"
 MULTI_FAKE_AWS=0                 # lib-checks.sh does not start the fake AWS service (the spike's fakeaws checks use it)
 export MULTI_FAKE_AWS
 FACT_PREFIX=replication
-CHECK_ORDER="incus services launch boot prep net install claim projects storage token join cluster follower-status replica-setup replica-shapes replica-read replica-ddl pooler lb project-switchover project-failback server-switchover server-failback hard-failover fenced rejoin upgrade-leader upgrade-follower status-final follower-status-final"
+CHECK_ORDER="incus services launch boot prep net install claim projects storage token join cluster follower-status replica-setup replica-shapes replica-read replica-ddl pooler lb project-switchover project-failback server-switchover server-failback hard-failover fenced rejoin upgrade-refused upgrade-leader upgrade-follower status-final follower-status-final"
 CHECK_ON_FAIL=on_fail
 
 # One prefix and one domain for the cluster: a joining server takes the leader's settings, and a domain left to the
@@ -101,6 +103,21 @@ lead() { sget leader; }
 follower() { if [[ $(sget leader) == n1 ]]; then echo n2; else echo n1; fi; }
 next_run() { local r; r=$(($(cat "$WORK/state/kv/run" 2>/dev/null || echo 0) + 1)); sset run "$r"; echo "$r"; }
 refs() { echo "$(sget ref1) $(sget ref2)"; }
+
+# wait_dry_run NODE SECONDS CMD...: CMD --dry-run on NODE, again every five seconds until it passes or SECONDS have gone.
+# A move refuses a replica whose lag is above max_lag_seconds (30), and the lag of an idle project is the age of its
+# last replayed commit whenever the reading falls between receiving a record and replaying it: a standby that has
+# just reconnected can show a minute for an instant. The move asks the same question when it runs and is not
+# repeated; only the wait for the question to be answered yes is.
+wait_dry_run() {
+  local node=$1 n=$2 i
+  shift 2
+  for ((i = 0; i < n; i += 5)); do
+    onl "$node" "$@" --dry-run >/dev/null 2>&1 && return 0
+    sleep 5
+  done
+  onl "$node" "$@" --dry-run || log "the dry run was refused for ${n}s (the move would be refused)"
+}
 
 # copy_secrets FROM TO: the keys, the passwords and the token of the API, between the nodes through this pipe.
 copy_secrets() { on "$1" tar -C / -cf - root/keys root/pat root/pat.hdr root/org | on "$2" tar -C / -xf -; }
@@ -274,8 +291,13 @@ c_replica_setup() {
 
 c_replica_shapes() {
   needs replica-setup
-  local ref key
-  for ref in $(refs); do onl n1 check_database_shapes "$ref" 1; done
+  local ref key i
+  # A replica's status can leave ACTIVE_HEALTHY for a moment while its PostgREST reloads its schema right after the
+  # setup; the shapes are looked at again, up to a minute, and the last look decides.
+  for ref in $(refs); do
+    for i in 1 2 3 4 5 6; do onl n1 check_database_shapes "$ref" 1 2>/dev/null && continue 2; sleep 10; done
+    onl n1 check_database_shapes "$ref" 1
+  done
   # `replicas ls` is a command of the leader (its help says so): it opens the registry for writing, which a follower's
   # standby refuses. It lists each replica on the other node.
   onl "$(lead)" supavise replicas ls
@@ -332,9 +354,9 @@ project_move() {
   ref=$(sget ref1) sha1=$(sget sha1) lead=$(lead)
   onl "$lead" wait_replicas "$ref" 1 600
   run=$(next_run)
-  onl n2 writer_start "$ref" "$run"
+  onl n2 writer_start "$ref" "$run" "$WRITER_RATE"
   sleep 10
-  onl "$lead" supavise projects failover "$ref" --to "$to" --dry-run || log "the dry run was refused (the move would be refused)"
+  wait_dry_run "$lead" 120 supavise projects failover "$ref" --to "$to"
   t0=$SECONDS
   onl "$lead" supavise projects failover "$ref" --to "$to" --yes
   note "project.$from-$to.seconds" "$((SECONDS - t0))"
@@ -367,9 +389,9 @@ server_move() {
   epoch0=$(onl "$old" node_epoch)
   for ref in $ref1 $ref2; do onl "$old" wait_replicas "$ref" 1 600; done
   run=$(next_run)
-  onl n2 writer_start "$ref1" "$run"
+  onl n2 writer_start "$ref1" "$run" "$WRITER_RATE"
   sleep 10
-  onl "$runner" supavise failover --to "$new" --dry-run || log "the dry run was refused (the move would be refused)"
+  wait_dry_run "$runner" 120 supavise failover --to "$new"
   t0=$SECONDS
   onl "$runner" supavise failover --to "$new" --yes || rc=$?
   note "server.$old-$new.seconds" "$((SECONDS - t0))"
@@ -379,6 +401,7 @@ server_move() {
   onl "$new" wait_nodes "$new" 600
   sset leader "$new"
   reached "server-moved-$new"
+  onl "$new" wait_move_ended 900
   [[ $(onl "$new" node_epoch) == $((epoch0 + 1)) ]] || fail "the epoch is $(onl "$new" node_epoch), want $((epoch0 + 1))"
   [[ $(onl "$new" last_move | cut -d'|' -f2,3,5,6,8) == "server|switchover|$old|$new|done" ]] || fail "the last move is $(onl "$new" last_move)"
   onl "$new" wait_api 300
@@ -411,7 +434,7 @@ c_hard_failover() {
   epoch0=$(onl n1 node_epoch)
   for ref in $ref1 $ref2; do onl n1 wait_replicas "$ref" 1 600; done
   run=$(next_run)
-  onl n2 writer_start "$ref1" "$run"
+  onl n2 writer_start "$ref1" "$run" "$WRITER_RATE"
   sleep 5
   lag=$(onl n1 replay_lag_max "$ref1" 10)
   note hard.replay_lag_before_seconds "$lag"
@@ -497,7 +520,7 @@ c_rejoin() {
 # ---- 7. upgrade ------------------------------------------------------------------------------------------------------
 # upgrade_one NODE: supavise upgrade to v0.0.2 on NODE, which restarts no PostgreSQL cluster, and the cluster after it.
 upgrade_one() {
-  local n=$1 lead other ref ident id secs
+  local n=$1 lead other ref ident id secs out rc=0
   lead=$(lead)
   node_push "$n" "$WORK/keys/pub.pem" /root/release-pub.pem
   onl "$n" unit_stamp >"$WORK/stamp-$n.before"
@@ -506,9 +529,20 @@ upgrade_one() {
   [[ $(wc -l <"$WORK/stamp-$n.before") -ge 3 ]] && ! grep -q ' none$' "$WORK/stamp-$n.before" \
     || fail "$n: the stamp of the PostgreSQL clusters is not complete: $(cat "$WORK/stamp-$n.before")"
   log "$n: $(on "$n" /usr/local/bin/supavise --version | head -n1) -> v0.0.2; PostgreSQL clusters here: $(wc -l <"$WORK/stamp-$n.before")"
+  out=$WORK/upgrade-$n.out
   on "$n" timeout 3000 /usr/local/bin/supavise upgrade --repo o/r --api-base "http://$BRIDGE_IP:$RELEASE_PORT" \
-    --public-key-file /root/release-pub.pem --yes --version v0.0.2 \
-    || fail "$n: supavise upgrade exited $?"
+    --public-key-file /root/release-pub.pem --yes --version v0.0.2 >"$out" 2>&1 || rc=$?
+  cat "$out"
+  [[ $rc -eq 0 ]] || fail "$n: supavise upgrade exited $rc"
+  # The leader announces maintenance before it stops anything, so that no automatic failover fires while its daemon
+  # restarts (design 2.10.7), and clears it when the run ends. A follower announces nothing.
+  if [[ $n == "$lead" ]]; then
+    grep -q 'announced maintenance on' "$out" || fail "$n: the leader's upgrade did not announce maintenance"
+    [[ $(onl "$n" reg "select maintenance::text from supavise.cluster") == '{}' ]] \
+      || fail "$n: the maintenance announcement is still there after the upgrade: $(onl "$n" reg "select maintenance::text from supavise.cluster")"
+  else
+    ! grep -q 'announced maintenance on' "$out" || fail "$n: a follower announced maintenance"
+  fi
   [[ $(on "$n" /usr/local/bin/supavise --version) == *v0.0.2* ]] || fail "$n: the installed binary is $(on "$n" /usr/local/bin/supavise --version)"
   [[ $(onl "$n" daemon_version) == *v0.0.2* ]] || fail "$n: the daemon runs $(onl "$n" daemon_version)"
   [[ $n != "$lead" ]] || onl "$n" wait_healthy 300
@@ -530,13 +564,64 @@ upgrade_one() {
   echo "# a row written on the primary reached the replica in $secs s"
 }
 
+# release_next: the release server signs v0.0.2, the release the upgrades move to; once, by the first check that needs it.
+release_next() {
+  [[ ! -e $WORK/state/kv/release-next ]] || return 0
+  [[ -x ${SUPAVISE_BIN_NEXT:-} ]] || fail "SUPAVISE_BIN_NEXT: a Linux build of this checkout, built with -X main.version=v0.0.2"
+  [[ $("$SUPAVISE_BIN_NEXT" --version) == *v0.0.2* ]] || fail "SUPAVISE_BIN_NEXT must report v0.0.2: $("$SUPAVISE_BIN_NEXT" --version)"
+  (cd "$REPO_ROOT" && make_release v0.0.2 "$SUPAVISE_BIN_NEXT")
+  sset release-next 1
+}
+
+# A follower writes no registry, and the backup, the rollout and the restart of a project need one: with a project of its
+# own running it is refused before anything changes (exit status 2). The check homes the second project on the follower
+# with a planned move, asks the follower to upgrade and looks at what the refusal left, then moves the project back. The
+# upgrades come after it, so that both servers still run the same release for the two moves.
+refused_cleanup() { # LEADER REF: the project is on the leader again, whatever the check did
+  onl "$1" supavise projects failover "$2" --to "$1" --yes >/dev/null 2>&1 || true
+}
+c_upgrade_refused() {
+  needs cluster-two-nodes
+  local f out rc=0
+  lead=$(lead) f=$(follower) ref=$(sget ref2) moved=""   # the trap reads these as they are when the check ends
+  release_next
+  node_push "$f" "$WORK/keys/pub.pem" /root/release-pub.pem
+  onl "$lead" wait_replicas "$ref" 1 600
+  trap '[[ -z $moved ]] || refused_cleanup "$lead" "$ref"' EXIT
+  moved=1
+  # The rejoined follower's daemon has just restarted into its role: the move's preflight asks it over the mesh, and the
+  # question is asked again until the session is up and the replica is within its lag (as the other project moves do).
+  wait_dry_run "$lead" 120 supavise projects failover "$ref" --to "$f"
+  onl "$lead" supavise projects failover "$ref" --to "$f" --yes
+  onl "$lead" wait_project "$ref" ACTIVE_HEALTHY 300
+  [[ $(onl "$lead" home_of "$ref") == "$f" ]] || fail "$ref is homed on $(onl "$lead" home_of "$ref"), want the follower $f"
+  onl "$f" wait_items_rest "$ref" 100 120
+  onl "$f" unit_stamp >"$WORK/refused-$f.before"
+  out=$(on "$f" timeout 900 /usr/local/bin/supavise upgrade --repo o/r --api-base "http://$BRIDGE_IP:$RELEASE_PORT" \
+    --public-key-file /root/release-pub.pem --yes --version v0.0.2 2>&1) || rc=$?
+  log "$f: supavise upgrade with a project of its own running exited $rc: $(head -c 600 <<<"$out" | tr '\n' ' ')"
+  [[ $rc -eq 2 ]] || fail "$f: supavise upgrade exited $rc, want 2 (refused before it changed anything)"
+  grep -q 'project(s) run here' <<<"$out" || fail "$f: the refusal does not say that a project runs there: $(head -c 400 <<<"$out")"
+  grep -q "$ref" <<<"$out" || fail "$f: the refusal does not name the project $ref"
+  [[ $(on "$f" /usr/local/bin/supavise --version) == *v0.0.1* ]] || fail "$f: the binary is $(on "$f" /usr/local/bin/supavise --version) after a refusal"
+  [[ $(onl "$f" daemon_version) == *v0.0.1* ]] || fail "$f: the daemon runs $(onl "$f" daemon_version) after a refusal"
+  onl "$f" unit_stamp >"$WORK/refused-$f.after"
+  diff -u "$WORK/refused-$f.before" "$WORK/refused-$f.after" || fail "$f: a PostgreSQL cluster was restarted by a refused upgrade"
+  wait_dry_run "$lead" 120 supavise projects failover "$ref" --to "$lead"
+  onl "$lead" supavise projects failover "$ref" --to "$lead" --yes
+  moved=""
+  onl "$lead" wait_project "$ref" ACTIVE_HEALTHY 300
+  [[ $(onl "$lead" home_of "$ref") == "$lead" ]] || fail "$ref is homed on $(onl "$lead" home_of "$ref"), want the leader $lead"
+  onl "$lead" wait_replicas "$ref" 1 600
+  onl "$lead" wait_items_rest "$ref" 100 120
+  echo "# $f, with $ref running on it, was refused (exit status 2) and kept its release and its clusters; $ref is on $lead again"
+}
+
 c_upgrade_leader() {
   needs cluster-two-nodes
   local lead
   lead=$(lead)
-  [[ -x ${SUPAVISE_BIN_NEXT:-} ]] || fail "SUPAVISE_BIN_NEXT: a Linux build of this checkout, built with -X main.version=v0.0.2"
-  [[ $("$SUPAVISE_BIN_NEXT" --version) == *v0.0.2* ]] || fail "SUPAVISE_BIN_NEXT must report v0.0.2: $("$SUPAVISE_BIN_NEXT" --version)"
-  (cd "$REPO_ROOT" && make_release v0.0.2 "$SUPAVISE_BIN_NEXT")
+  release_next
   upgrade_one "$lead"
   echo "# $lead (the leader) runs v0.0.2; no PostgreSQL cluster restarted"
 }
@@ -615,6 +700,7 @@ check_snap server-failback "failover makes n1 the leader again" c_server_failbac
 check_snap hard-failover "failover --force promotes n2 after n1 is stopped at once; RPO and RTO" c_hard_failover
 check fenced "n1 returns fenced and runs no primary" c_fenced
 check_snap rejoin "node rejoin brings n1 back as a follower" c_rejoin
+check upgrade-refused "supavise upgrade refuses a follower that has a project of its own running" c_upgrade_refused
 check_snap upgrade-leader "supavise upgrade of the leader restarts no PostgreSQL cluster" c_upgrade_leader
 check_snap upgrade-follower "supavise upgrade of the follower restarts no PostgreSQL cluster" c_upgrade_follower
 check status-final "supavise status is healthy on the leader" c_status_final

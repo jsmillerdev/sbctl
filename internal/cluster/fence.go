@@ -3,11 +3,14 @@ package cluster
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io/fs"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
+	"time"
 
 	"github.com/supavise/supavise/internal/config"
 	"github.com/supavise/supavise/internal/units"
@@ -47,11 +50,15 @@ func FenceLocal(ctx context.Context, cfg *config.Config, sup units.Supervisor, l
 			if err := os.Remove(run); err != nil && !errors.Is(err, fs.ErrNotExist) {
 				note(err)
 			}
+			// A launcher that a planned stop held (moved aside) goes too, or a later start would put it back.
+			if err := os.Remove(run + ".held"); err != nil && !errors.Is(err, fs.ErrNotExist) {
+				note(err)
+			}
 			st, err := sup.Status(ctx, unit)
 			if err != nil || !running(st) {
 				continue
 			}
-			if err := sup.Stop(ctx, unit); err != nil {
+			if err := stopSettled(ctx, sup, unit); err != nil {
 				log.Error("fence: a unit did not stop", "unit", unit, "error", err)
 				note(err)
 				continue
@@ -66,7 +73,7 @@ func FenceLocal(ctx context.Context, cfg *config.Config, sup units.Supervisor, l
 		if st, err := sup.Status(ctx, unit); err != nil || !running(st) {
 			continue
 		}
-		if err := sup.Stop(ctx, unit); err != nil {
+		if err := stopSettled(ctx, sup, unit); err != nil {
 			log.Error("fence: a unit did not stop", "unit", unit, "error", err)
 			note(err)
 		}
@@ -75,7 +82,54 @@ func FenceLocal(ctx context.Context, cfg *config.Config, sup units.Supervisor, l
 	return stopped, first
 }
 
-// running reports whether a unit is up or coming up, and so needs a stop.
+// running reports whether a unit is up, coming up or going down, and so needs a stop: a unit that is
+// still going down holds its ports and its data directory until it is inactive, and whoever fenced
+// the node must not go on to move that data aside or to listen on those ports before then.
 func running(st units.Status) bool {
-	return st.State == units.StateActive || st.State == units.StateActivating
+	return st.State == units.StateActive || st.State == units.StateActivating || st.State == units.StateDeactivating
+}
+
+// Timings of stopSettled; variables so that a test can shorten them.
+var (
+	stopSettleTimeout = 3 * time.Minute
+	stopSettleEvery   = 250 * time.Millisecond
+	stopRetries       = 5
+)
+
+// stopSettled stops unit and returns once it is down. Stop waits for its own job, but a job that
+// was queued before it (a start at boot that the fence overtook) can cancel it, and a stop that
+// found the unit already going down returns while the unit still holds what it holds: it asks
+// again for a canceled stop, and then polls until the unit is neither active, activating nor
+// deactivating.
+func stopSettled(ctx context.Context, sup units.Supervisor, unit string) error {
+	var err error
+	for attempt := 0; attempt < stopRetries; attempt++ {
+		if err = sup.Stop(ctx, unit); err != nil {
+			if !strings.Contains(err.Error(), `"canceled"`) || ctx.Err() != nil {
+				return err
+			}
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(stopSettleEvery):
+			}
+			continue
+		}
+		deadline := time.Now().Add(stopSettleTimeout)
+		for {
+			st, serr := sup.Status(ctx, unit)
+			if serr != nil || !running(st) {
+				return nil
+			}
+			if time.Now().After(deadline) {
+				return fmt.Errorf("cluster: %s is still %s/%s after %s", unit, st.State, st.SubState, stopSettleTimeout)
+			}
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(stopSettleEvery):
+			}
+		}
+	}
+	return err
 }

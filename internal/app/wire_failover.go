@@ -73,9 +73,16 @@ func wireFailover(ctx context.Context, w *Wire) error {
 		LocalPrimaries: local,
 		Primaries:      failover.MeshPrimaries{Self: func() string { return members.Self().ID }, Local: local, RPC: rpc, Epoch: members.Epoch},
 		Locks:          locks,
-		Extra:          extra,
-		Takeover:       handoff,
-		Notify:         handoff.notify,
+		SystemReplicationPassword: func(ctx context.Context) (string, error) {
+			k, err := w.Node.Engine.Keys(ctx, config.SystemRef)
+			if err != nil {
+				return "", err
+			}
+			return k.ReplicationPassword, nil
+		},
+		Extra:    extra,
+		Takeover: handoff,
+		Notify:   handoff.notify,
 	}
 	peers := failover.MeshPeers{RPC: rpc}
 	d.Peers, d.Leader = peers, peers

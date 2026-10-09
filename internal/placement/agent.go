@@ -57,6 +57,9 @@ type ReplicaPlane interface {
 	ObserveReplica(ctx context.Context, t lifecycle.ReplicaTarget) lifecycle.ReplicaObservation
 	PromoteReplica(ctx context.Context, t lifecycle.ReplicaTarget, o lifecycle.PromoteOptions) error
 	DemoteToReplica(ctx context.Context, t lifecycle.ReplicaTarget) error
+	// SystemStandbyTarget is the standby of the system cluster without a look at the registry
+	// (lifecycle.PostgresPlane.SystemStandbyTarget).
+	SystemStandbyTarget(identifier, replicationPassword string) (lifecycle.ReplicaTarget, error)
 }
 
 var _ ReplicaPlane = (*lifecycle.PostgresPlane)(nil)
@@ -784,6 +787,20 @@ func (a *NodeAgent) Do(ctx context.Context, identifier string, act peerapi.Actio
 			_ = os.Remove(a.filePath(ref))
 		}
 	case peerapi.ActionDemote:
+		// The old leader of a planned switchover demotes its system cluster with no registry to read: that
+		// registry is the cluster it stopped for the move, so the project row is the system project's and
+		// the replication password comes with the request. Only the leader that took over, which the
+		// node's record of the switchover names, may ask (cluster.LiveOptions.Successor).
+		if ref == config.SystemRef && req.ReplicationPassword != "" {
+			var t lifecycle.ReplicaTarget
+			if t, err = a.o.Plane.SystemStandbyTarget(identifier, req.ReplicationPassword); err != nil {
+				break
+			}
+			if err = a.o.Plane.DemoteToReplica(ctx, t); err == nil {
+				a.adopt(identifier, ref)
+			}
+			break
+		}
 		// The registry names the new home before the old one is demoted (design 2.10.3, steps 5 and 7):
 		// a demotion of the node the registry still names the home would stop its primary.
 		var home bool

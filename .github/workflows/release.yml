@@ -29,12 +29,13 @@ defaults:
 
 jobs:
   # The tagged commit must have passed ci.yml, linux.yml (which holds the upgrade test) and
-  # conformance.yml on this very commit. The gate reads those runs; it does not start them, so a
+  # conformance.yml on this very commit, and the two-server job of replication.yml (a run in progress is
+  # waited for up to GATE_TIMEOUT_SECONDS, three hours, so the job's own limit is above that). The gate reads those runs; it does not start them, so a
   # tag on a commit that never ran them fails here (deploy/release-gate.sh says what to do) and
   # nothing is built or published. It holds no secrets and uses no environment.
   gate:
     runs-on: ubuntu-24.04
-    timeout-minutes: 150
+    timeout-minutes: 200
     permissions:
       contents: read
       actions: read

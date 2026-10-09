@@ -440,3 +440,41 @@ func TestLateFencerAsksTheOrchestratorOnceItExists(t *testing.T) {
 		t.Fatalf("the orchestrator fenced with an error: %v, %v", fenced, err)
 	}
 }
+
+// The role of a follower whose system cluster was promoted changes when the cluster answers on the
+// system port, not when pg_promote returns: the promotion restarts it on the system port, and the
+// leader's shared services must not start against the cluster it is about to stop.
+func TestSystemInRecoveryWaitsForThePromotionToReachTheSystemPort(t *testing.T) {
+	const system, replica = "system-port", "replica-port"
+	answers := map[string]struct {
+		rec bool
+		err error
+	}{}
+	probe := func(_ context.Context, dsn string) (bool, error) { a := answers[dsn]; return a.rec, a.err }
+	down := errors.New("connection refused")
+	set := func(dsn string, rec bool, err error) {
+		answers[dsn] = struct {
+			rec bool
+			err error
+		}{rec, err}
+	}
+	in := systemInRecovery([]string{replica, system, replica}, system, probe)
+	for name, tc := range map[string]struct {
+		onSystem, onReplica func()
+		rec                 bool
+		err                 error
+	}{
+		"a standby on the replica port": {func() { set(system, false, down) }, func() { set(replica, true, nil) }, true, nil},
+		"a primary on the system port":  {func() { set(system, false, nil) }, func() { set(replica, false, down) }, false, nil},
+		"a promotion half done":         {func() { set(system, false, down) }, func() { set(replica, false, nil) }, false, errPromoting},
+		"nothing answers":               {func() { set(system, false, down) }, func() { set(replica, false, down) }, false, down},
+		"a demoted cluster, restarted":  {func() { set(system, false, down) }, func() { set(replica, true, nil) }, true, nil},
+	} {
+		tc.onSystem()
+		tc.onReplica()
+		rec, err := in(context.Background())
+		if rec != tc.rec || !errors.Is(err, tc.err) {
+			t.Errorf("%s: in recovery %v, error %v; want %v, %v", name, rec, err, tc.rec, tc.err)
+		}
+	}
+}

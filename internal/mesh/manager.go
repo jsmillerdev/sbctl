@@ -159,7 +159,9 @@ func New(o Options) *Manager {
 		Handler:           http.HandlerFunc(m.serveRPC),
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       30 * time.Second,
-		ErrorLog:          slog.NewLogLogger(o.Log.Handler(), slog.LevelDebug),
+		// A handler that panics or a connection the server drops is logged at warning: the caller sees only a stream
+		// that closed without an answer ("unexpected EOF"), and the reason is here or nowhere.
+		ErrorLog: slog.NewLogLogger(o.Log.Handler(), slog.LevelWarn),
 		ConnContext: func(ctx context.Context, c net.Conn) context.Context {
 			if rc, ok := c.(*rpcConn); ok {
 				return WithPeer(ctx, rc.peer)
@@ -620,7 +622,7 @@ func (m *Manager) serveOneShot(conn net.Conn, node string) {
 	// A short call is short: the session is not in the table, so the sweep that closes the sessions of a
 	// node the registry stopped admitting does not see it.
 	defer time.AfterFunc(m.o.OneShotLife, func() { _ = sess.Close() }).Stop()
-	m.serveStreams(sess, node, "")
+	m.serveStreams(sess, node, "", true)
 }
 
 // serveAnonymous serves the streams of a caller that presented no certificate until its session
@@ -647,7 +649,7 @@ func (m *Manager) serveAnonymous(conn net.Conn, remote string) {
 	}
 	sess := &streamSeen{Session: s}
 	go m.reapAnonymous(sess)
-	m.serveStreams(sess, "", remote)
+	m.serveStreams(sess, "", remote, false)
 	_ = sess.Close()
 }
 
@@ -741,7 +743,7 @@ func (m *Manager) register(pc *peerConn) {
 	} else {
 		go m.retire(pc)
 	}
-	go m.serveStreams(pc.sess, pc.node, "")
+	go m.serveStreams(pc.sess, pc.node, "", false)
 }
 
 // preferred reports whether the existing session a beats the new one b.
@@ -767,9 +769,21 @@ func (m *Manager) preferred(a, b *peerConn) bool {
 	return false // the same side dialed again: the newer one replaces a session that is probably dead
 }
 
-// retire closes a session that lost the tie-break once nothing runs on it.
+// retireGrace is how long a session that lost the tie-break is kept before it is closed for being idle. The far end
+// may not have registered the session that won yet (its handshake finishes a moment after ours does), and until it
+// has, it sends its calls on the session that lost; a session closed at once would end them without an answer.
+// A variable so that a test can shorten it.
+var retireGrace = 5 * time.Second
+
+// retire closes a session that lost the tie-break once nothing runs on it, after a grace period in which it still
+// serves what the far end sends on it.
 func (m *Manager) retire(pc *peerConn) {
 	pc.retiring.Store(true)
+	select {
+	case <-pc.sess.CloseChan():
+		return
+	case <-time.After(retireGrace):
+	}
 	deadline := time.Now().Add(time.Minute)
 	for time.Now().Before(deadline) && !pc.sess.IsClosed() && pc.sess.NumStreams() > 0 {
 		select {
@@ -792,9 +806,9 @@ func (m *Manager) watch(pc *peerConn) {
 }
 
 // serveStreams handles every stream the peer opens on sess until the session ends. remote is the
-// peer's IP address, for a caller that has no node. Such a caller has at most maxAnonStreams streams
+// peer's IP address, for a caller that has no node. short marks the one-shot session of a command-line tool. Such a caller has at most maxAnonStreams streams
 // open at a time; the others are closed unread.
-func (m *Manager) serveStreams(sess Session, node, remote string) {
+func (m *Manager) serveStreams(sess Session, node, remote string, short bool) {
 	var open atomic.Int32
 	for {
 		st, err := sess.AcceptStream()
@@ -803,6 +817,14 @@ func (m *Manager) serveStreams(sess Session, node, remote string) {
 			// else (its CloseChan fires on a local Close or the keepalive timeout), so the session is
 			// closed now: watch then drops it from the table, and a node that restarted is not shut out
 			// by its own dead session when the tie-break prefers it.
+			// A short call of a command-line tool (short) ends its session in seconds and many times an hour:
+			// only the sessions of the daemons say something worth counting at Info.
+			switch {
+			case node != "" && short:
+				m.o.Log.Debug("mesh: a short session ended", "node", node, "error", err)
+			case node != "":
+				m.o.Log.Info("mesh: a session ended", "node", node, "error", err)
+			}
 			_ = sess.Close()
 			return
 		}
@@ -835,7 +857,7 @@ func (m *Manager) handleStream(st net.Conn, node, remote string) {
 	h, err := ReadHeader(st)
 	_ = st.SetReadDeadline(time.Time{})
 	if err != nil {
-		m.o.Log.Debug("mesh: bad stream header", "node", node, "error", err)
+		m.o.Log.Warn("mesh: a stream was closed because its header could not be read", "node", node, "error", err)
 		_ = st.Close()
 		return
 	}
@@ -846,6 +868,7 @@ func (m *Manager) handleStream(st net.Conn, node, remote string) {
 		select {
 		case m.rpcCh <- &rpcConn{Conn: st, peer: peer}:
 		case <-time.After(10 * time.Second):
+			m.o.Log.Warn("mesh: an rpc stream was closed unanswered because the peer API server did not take it for 10 s", "node", node)
 			_ = st.Close()
 		}
 	case StreamForward:

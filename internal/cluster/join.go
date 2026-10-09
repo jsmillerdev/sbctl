@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/supavise/supavise/internal/config"
@@ -81,8 +82,11 @@ type JoinOptions struct {
 	// Streaming, when set, replaces the look at DSNs: it returns the standby's replay position once it
 	// streams (tests).
 	Streaming func(ctx context.Context) (lsn string, err error)
-	Log       *slog.Logger
-	Now       func() time.Time
+	// Rebuild lists the projects a rejoin set aside, which the confirmation hands to the leader to set up replicas of
+	// (peerapi.JoinConfirm.Rebuild). Rejoin sets it; a join leaves it empty.
+	Rebuild []string
+	Log     *slog.Logger
+	Now     func() time.Time
 }
 
 // JoinState is the content of join.json.
@@ -91,6 +95,10 @@ type JoinState struct {
 	Leader string                  `json:"leader"` // host:port of the leader's peer listener
 	System peerapi.SystemBootstrap `json:"system"` // how to seed the standby
 	At     time.Time               `json:"at"`
+	// Rebuild lists the projects a rejoin set aside, kept here so that `node join --resume` and a second
+	// `node rejoin` hand them to the leader too: the data is under data.diverged-* by then, and nothing
+	// else says which projects the node had.
+	Rebuild []string `json:"rebuild,omitempty"`
 }
 
 // JoinResult is what a finished join tells the caller.
@@ -418,14 +426,8 @@ func (o *JoinOptions) stream(ctx context.Context, dir string, st *JoinState) err
 	fctx, stop := context.WithCancel(ctx)
 	defer stop()
 	port := o.Cfg.PortsFor(config.SystemRef, 0).Postgres
-	fwdErr := make(chan error, 1)
-	go func() { fwdErr <- mesh.ForwardOne(fctx, c, port, leader, mesh.KindPostgres, config.SystemRef, o.log()) }()
-	select { // ForwardOne returns at once when it cannot listen
-	case err := <-fwdErr:
-		if err != nil {
-			return fmt.Errorf("cluster: cannot forward the system cluster's port %d to the leader: %w", port, err)
-		}
-	case <-time.After(200 * time.Millisecond):
+	if err := o.forwardSystem(fctx, c, port, leader); err != nil {
+		return err
 	}
 
 	if err := o.Seed(ctx, st.System); err != nil {
@@ -444,10 +446,44 @@ func (o *JoinOptions) stream(ctx context.Context, dir string, st *JoinState) err
 	if err != nil {
 		return err
 	}
-	if err := c.Call(ctx, "POST", peerapi.PathJoinConfirm, peerapi.JoinConfirm{NodeID: st.NodeID, ReplayLSN: lsn}, nil); err != nil {
+	if err := c.Call(ctx, "POST", peerapi.PathJoinConfirm, peerapi.JoinConfirm{NodeID: st.NodeID, ReplayLSN: lsn, Rebuild: unionRefs(o.Rebuild, st.Rebuild)}, nil); err != nil {
 		return fmt.Errorf("cluster: the leader did not confirm the join: %w", err)
 	}
 	return nil
+}
+
+// portWait is how long forwardSystem waits for the system cluster's port when something still holds it; a variable
+// so that a test can shorten it.
+var portWait = time.Minute
+
+// forwardSystem starts the forwarder that carries the system cluster's port to the leader, and returns once it
+// listens. The port belongs to the PostgreSQL that ran here until a moment ago (a rejoin, a join --resume that finds
+// the old cluster still going down): a listener that is still there is waited for, so that the command can be run
+// again at once after a failure and does not depend on how long the old cluster takes to stop. Any other failure to
+// listen is returned.
+func (o *JoinOptions) forwardSystem(ctx context.Context, c mesh.Dialer, port int, leader string) error {
+	deadline := time.Now().Add(portWait)
+	for {
+		fwdErr := make(chan error, 1)
+		go func() { fwdErr <- mesh.ForwardOne(ctx, c, port, leader, mesh.KindPostgres, config.SystemRef, o.log()) }()
+		select { // ForwardOne returns at once when it cannot listen
+		case err := <-fwdErr:
+			if err == nil {
+				return nil
+			}
+			if !errors.Is(err, syscall.EADDRINUSE) || !time.Now().Before(deadline) {
+				return fmt.Errorf("cluster: cannot forward the system cluster's port %d to the leader: %w", port, err)
+			}
+			o.log().Info("the system cluster's port is still held; waiting for it", "port", port, "error", err)
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(500 * time.Millisecond):
+			}
+		case <-time.After(200 * time.Millisecond):
+			return nil
+		}
+	}
 }
 
 // WaitStreaming waits until the standby at one of dsns is in recovery and its WAL receiver

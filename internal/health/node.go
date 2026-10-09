@@ -39,7 +39,11 @@ func ForNode(n *lifecycle.Node, o NodeOptions) (Deps, error) {
 	if d.Escrow == nil {
 		d.Escrow = EscrowCheck(n.Cfg, time.Hour, o.InDaemon)
 	}
+	d.Follower = systemStandby(n.Cfg)
 	d.System = func(ctx context.Context) []lifecycle.ServiceHealth {
+		if d.Follower {
+			return followerSystem(n.Cfg, n.Supervisor)(ctx)
+		}
 		p, err := n.Registry.GetProject(ctx, config.SystemRef)
 		if err != nil {
 			return []lifecycle.ServiceHealth{{Name: config.SvcPostgres, Status: "UNHEALTHY", Error: "the registry has no system project: " + err.Error()}}

@@ -219,6 +219,11 @@ type InstanceAction struct {
 	// the project's size and the node's copy of the registry may not have caught up. Empty: the
 	// size in the node's copy.
 	Class string `json:"class,omitempty"`
+	// ReplicationPassword (demote, system cluster only): the opened password of the system cluster's
+	// replication role. The old leader of a planned switchover cannot read it from its registry, which is
+	// the database it stopped for the move; the leader that took over sends it with the request, over the
+	// mesh. It is a secret: the node writes it into the 0600 postgresql.auto.conf of the standby, and no log.
+	ReplicationPassword string `json:"replication_password,omitempty"`
 }
 
 // PlaneMethod names a method of lifecycle.Plane. placement's reflection test fails when the
@@ -448,4 +453,8 @@ type JoinConfirm struct {
 	NodeID string `json:"node_id"`
 	// ReplayLSN is the standby's replay position when it confirmed.
 	ReplayLSN string `json:"replay_lsn,omitempty"`
+	// Rebuild lists the projects whose data this node set aside because another node had replaced its primary
+	// (a rejoin): the leader sets a replica of each up here again, when the project lives elsewhere and this node
+	// has none. A fresh joiner sends none.
+	Rebuild []string `json:"rebuild,omitempty"`
 }

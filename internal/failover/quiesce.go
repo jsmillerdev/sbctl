@@ -60,6 +60,15 @@ func (o *Orchestrator) currentQuiesce() (*quiesceRecord, error) {
 	return &rec, nil
 }
 
+// AuthorizesSuccessor reports whether node is the one this leader stopped for: the record of a planned
+// switchover names it, and epoch is the epoch the switchover runs at or a later one. The leader's own
+// database is stopped then, so it cannot read the registry that would tell it who leads; it follows the
+// word of the node it stopped for (cluster.LiveOptions.Successor).
+func (o *Orchestrator) AuthorizesSuccessor(node string, epoch int64) bool {
+	rec, err := o.currentQuiesce()
+	return err == nil && rec != nil && rec.To == node && epoch >= rec.Epoch
+}
+
 func (o *Orchestrator) saveQuiesce(rec *quiesceRecord) error {
 	return writeJSONFile(quiescePath(o.d.Cfg.Paths()), rec)
 }

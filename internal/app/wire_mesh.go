@@ -113,6 +113,18 @@ func (l *lateFencer) set(f interface {
 	l.mu.Unlock()
 }
 
+// successor is cluster.LiveOptions.Successor: whether the orchestrator's record of a planned switchover
+// names node as the one this leader stopped for. Without an orchestrator there is no record.
+func (l *lateFencer) successor(node string, epoch int64) bool {
+	l.mu.Lock()
+	f := l.f
+	l.mu.Unlock()
+	s, ok := f.(interface {
+		AuthorizesSuccessor(node string, epoch int64) bool
+	})
+	return ok && s.AuthorizesSuccessor(node, epoch)
+}
+
 func (l *lateFencer) fence(ctx context.Context, source string, epoch int64, leader string) (bool, error) {
 	l.mu.Lock()
 	f := l.f
@@ -319,6 +331,40 @@ func wireMesh(ctx context.Context, w *Wire) error {
 	return startCluster(ctx, w, boot, dir)
 }
 
+// errPromoting is the answer of the system cluster's recovery probe while a standby has been promoted but
+// still listens on the replica port: the promotion ends with a restart on the system port, and the node
+// is the leader only after it.
+var errPromoting = errors.New("the system cluster was promoted and is not on the system port yet")
+
+// systemInRecovery is the membership's probe of the system cluster. dsns are the sockets it may answer
+// on and system is the one on the system port. Any standby that answers says the node follows. A primary
+// on the system port says it leads. A primary on the replica port only is a promotion half done (pg_promote
+// has run, the restart on the system port has not): the role stays as it was. Taking it for the leader
+// then starts the leader's shared services against a cluster that the promotion is about to stop.
+func systemInRecovery(dsns []string, system string, probe func(ctx context.Context, dsn string) (bool, error)) func(ctx context.Context) (bool, error) {
+	return func(ctx context.Context) (bool, error) {
+		var last error
+		promoting := false
+		for _, dsn := range dsns {
+			rec, err := probe(ctx, dsn)
+			switch {
+			case err != nil:
+				last = err
+			case rec:
+				return true, nil
+			case dsn == system:
+				return false, nil
+			default:
+				promoting = true
+			}
+		}
+		if promoting {
+			return false, errPromoting
+		}
+		return false, last
+	}
+}
+
 // startCluster builds the membership, the mesh and the leader's authority for a node that belongs to
 // a cluster, and registers the workers.
 func startCluster(ctx context.Context, w *Wire, boot cluster.BootDecision, dir string) error {
@@ -348,18 +394,8 @@ func startCluster(ctx context.Context, w *Wire, boot cluster.BootDecision, dir s
 	Provide(w, fencer)
 	live := cluster.NewLive(cluster.LiveOptions{
 		Cfg: cfg, Reg: reg, SelfID: selfID, Boot: boot, Log: log,
-		Fence: fencer.fence, Marker: &lazyMarker{cfg: cfg},
-		InRecovery: func(ctx context.Context) (bool, error) {
-			var last error
-			for _, dsn := range dsns {
-				rec, err := cluster.InRecovery(ctx, dsn)
-				if err == nil {
-					return rec, nil
-				}
-				last = err
-			}
-			return false, last
-		},
+		Fence: fencer.fence, Successor: fencer.successor, Marker: &lazyMarker{cfg: cfg},
+		InRecovery: systemInRecovery(dsns, RegistryDSNs(cfg)[0], cluster.InRecovery),
 		OnFenced: func(rec cluster.FencedRecord) {
 			_ = alerts.Notify(context.Background(), alerts.Event{
 				Kind: alerts.KindFenced, Severity: alerts.SeverityCritical, Title: "This node is fenced",
@@ -403,6 +439,24 @@ func startCluster(ctx context.Context, w *Wire, boot cluster.BootDecision, dir s
 			return k.ReplicationPassword, nil
 		},
 	}
+	// The replicas of a node that rejoined: its projects' primaries are gone from it (a failover replaced them), and
+	// the leader sets a replica of each up again once the node is active. The controller is the leader's and is
+	// wired after this hook, so it is looked up when the node confirms. The setup writes the row and returns, but
+	// it can wait for a base backup, so the confirmation does not.
+	auth.Rebuild = func(ctx context.Context, ref, node string) error {
+		svc := w.API.Replicas
+		if svc == nil {
+			return errors.New("the replica controller does not run on this node")
+		}
+		go func() {
+			sctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Minute)
+			defer cancel()
+			if err := svc.SetupOn(sctx, ref, node); err != nil {
+				log.Warn("a replica could not be set up again on the node that rejoined; run `supavise replicas add`", "project", ref, "node", node, "error", err)
+			}
+		}()
+		return nil
+	}
 	if bs, ok := Get[*backup.Service](w); ok {
 		auth.Ensure = bs
 	} else {
@@ -427,7 +481,8 @@ func startCluster(ctx context.Context, w *Wire, boot cluster.BootDecision, dir s
 	})
 	ping := func() peerapi.Ping {
 		leader := ""
-		if l, ok := live.Leader(); ok {
+		l, ok, epoch := live.LeaderAndEpoch() // one snapshot: a leader and an epoch from two would name a node that leads at an epoch it never did
+		if ok {
 			leader = l.ID
 		}
 		verdict := string(health.Healthy)
@@ -440,7 +495,7 @@ func startCluster(ctx context.Context, w *Wire, boot cluster.BootDecision, dir s
 				verdict = string(r.Verdict)
 			}
 		}
-		return peerapi.Ping{Node: selfID, Epoch: live.Epoch(), Leader: leader, Version: w.Options.Version, Schema: schema.get(), Health: verdict}
+		return peerapi.Ping{Node: selfID, Epoch: epoch, Leader: leader, Version: w.Options.Version, Schema: schema.get(), Health: verdict}
 	}
 	registerPeerAPI(&cluster.PeerAPI{Authority: auth, Topology: live, Cfg: cfg, Reports: reports, Ping: ping}, mesh.Handle, peerAPIServedByOthers...)
 

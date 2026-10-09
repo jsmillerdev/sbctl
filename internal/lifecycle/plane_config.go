@@ -77,11 +77,23 @@ func (pl *PostgresPlane) RefreshSystem(ctx context.Context, p *registry.Project,
 func (pl *PostgresPlane) refreshSystem(ctx context.Context, p *registry.Project, keys *secrets.ProjectKeys, startDatabase func() error) error {
 	unit := config.UnitName(config.SvcGoTrue, config.SystemRef)
 	was := pl.unitRunning(ctx, unit)
+	// A node that has no launcher for the sign-in service never rendered it or had it taken away: a follower
+	// that was promoted has never run it, and a leader that was demoted had its launchers removed by the fence.
+	// Either way the node leads now, systemd will not start a unit whose launcher is missing, and nobody else
+	// renders it, so it is rendered and started here. A launcher that is there and a unit that was stopped on
+	// purpose are left alone, as before.
+	_, statErr := os.Stat(units.FilesFor(pl.cfg, units.Spec{Service: config.SvcGoTrue}).Run)
+	noLauncher := errors.Is(statErr, fs.ErrNotExist)
 	if err := startDatabase(); err != nil {
 		return &SystemRefreshError{Err: err}
 	}
 	authErr := pl.RefreshSystemAuth(ctx, p, keys)
-	if authErr == nil && was && !pl.unitRunning(ctx, unit) {
+	switch {
+	case authErr != nil:
+	case noLauncher && !pl.unitRunning(ctx, unit):
+		pl.log.Info("this node leads and has no launcher for the dashboard's sign-in service; rendering and starting it", "unit", unit)
+		authErr = pl.startAPI(ctx, p, keys)
+	case was && !pl.unitRunning(ctx, unit):
 		pl.log.Info("the dashboard's sign-in service was stopped by the restart of the system cluster; starting it", "unit", unit)
 		authErr = pl.startAPI(ctx, p, keys)
 	}

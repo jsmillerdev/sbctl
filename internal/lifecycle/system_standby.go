@@ -122,6 +122,13 @@ func (pl *PostgresPlane) systemTarget(plan SystemStandbyPlan) (ReplicaTarget, er
 	return ReplicaTarget{Identifier: plan.Identifier, Project: systemProject(pl.cfg, versions), Keys: keys}, nil
 }
 
+// SystemStandbyTarget is the standby of the system cluster on this node as the plane renders it, from the
+// node's pins and the leader's replication password, without a look at the registry. The old leader of a
+// planned switchover demotes its system cluster with it: the registry it would read is that cluster.
+func (pl *PostgresPlane) SystemStandbyTarget(identifier, replicationPassword string) (ReplicaTarget, error) {
+	return pl.systemTarget(SystemStandbyPlan{Identifier: identifier, ReplicationPassword: replicationPassword})
+}
+
 // SystemStandbyPreflight checks what SeedSystemStandby needs before a rejoin moves data aside: a backup
 // backend a second server can read, room on the disk, and a Postgres release to run. It does not look at
 // the data directory (the seeding refuses what it must), and it does not read the backup store, which the

@@ -90,7 +90,14 @@ func wireFleet(ctx context.Context, w *Wire) error {
 		return err
 	}
 	Provide[failover.LocalServices](w, &localServices{mgr: mgr, sup: w.Node.Supervisor})
-	w.AddServerCheck(artifactsCheck(mgr, func() string { return mem.Self().ID }))
+	// Studio is optional (a node without its artifact runs the other services and says so in its status),
+	// so a server move does not wait for it: the preflight renders the services a leader needs without it.
+	checkMgr, err := fleet.NewManager(fleet.Deps{Cfg: w.Cfg, Log: log, Registry: w.Node.Registry, Secrets: w.Node.Secrets,
+		Supervisor: w.Node.Supervisor, Artifacts: w.Node.Artifacts, Skip: []string{config.SvcStudio}})
+	if err != nil {
+		return err
+	}
+	w.AddServerCheck(artifactsCheck(checkMgr, func() string { return mem.Self().ID }))
 
 	booted := cluster.RoleLeader
 	if b, ok := Get[cluster.BootDecision](w); ok && b.Role != "" {

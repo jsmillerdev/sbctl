@@ -163,12 +163,24 @@ func TestRejoin(t *testing.T) {
 		t.Fatal(err)
 	}
 	l.live.Refresh(ctx)
-	for _, ref := range []string{"system", "aaaaaaaaaaaaaaaaaaaa"} {
+	// Three projects have data here: a (homed on the leader now, so a replica is wanted), b (homed here, the node
+	// keeps its primary) and c (the registry has none: it was removed).
+	for _, p := range []registry.Project{
+		{Ref: "aaaaaaaaaaaaaaaaaaaa", Name: "a", Status: registry.StatusActiveHealthy, NodeID: "n1"},
+		{Ref: "bbbbbbbbbbbbbbbbbbbb", Name: "b", Status: registry.StatusActiveHealthy, NodeID: "n2"},
+	} {
+		if err := l.reg.CreateProject(ctx, &p); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, ref := range []string{"system", "aaaaaaaaaaaaaaaaaaaa", "bbbbbbbbbbbbbbbbbbbb", "cccccccccccccccccccc"} {
 		d := j.cfg.Paths().PostgresData(ref)
 		if err := os.MkdirAll(d, 0o700); err != nil {
 			t.Fatal(err)
 		}
 	}
+	var rebuilt []string
+	l.auth.Rebuild = func(_ context.Context, ref, node string) error { rebuilt = append(rebuilt, ref+"@"+node); return nil }
 	rejoin := RejoinOptions{Cfg: j.cfg, ConfigPath: j.confPath, Version: "v0.2.0", Pins: testPins,
 		StopLocal: func(context.Context) error { return nil },
 		Streaming: func(context.Context) (string, error) { return "0/4000000", nil }, Log: quiet()}
@@ -194,7 +206,7 @@ func TestRejoin(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if res.NodeID != "n2" || stopped != 1 || len(boot) != 1 || len(res.Diverged) != 2 {
+	if res.NodeID != "n2" || stopped != 1 || len(boot) != 1 || len(res.Diverged) != 4 {
 		t.Fatalf("result %+v, stopped %d, seeded %v", res, stopped, boot)
 	}
 	for _, d := range res.Diverged {
@@ -218,6 +230,10 @@ func TestRejoin(t *testing.T) {
 	cl := filepath.Join(config.ConfigDDir(j.confPath), config.ClusterConfigFile)
 	if fi, err := os.Stat(cl); err != nil || fi.Mode().Perm()&0o077 != 0 {
 		t.Fatalf("%s after a rejoin: %v, %v", cl, fi, err)
+	}
+	// The leader sets a replica of the project it homes up again, and of no other.
+	if len(rebuilt) != 1 || rebuilt[0] != "aaaaaaaaaaaaaaaaaaaa@n2" {
+		t.Fatalf("replicas set up again after the rejoin: %v", rebuilt)
 	}
 	if rs, _ := l.reg.ListReplicasOn(ctx, "n2"); len(rs) != 1 || rs[0].Ref != "system" || boot[0].Identifier != rs[0].Identifier {
 		t.Fatalf("system replica rows %+v for bootstrap %+v", rs, boot)
@@ -651,6 +667,67 @@ func TestRejoinRepeatsAfterAFailureOnTheNode(t *testing.T) {
 	}
 	if rec, _ := ReadFenced(j.cfg); rec != nil {
 		t.Fatal("the fenced record is still there")
+	}
+}
+
+// A rejoin whose standby does not stream the first time still asks the leader for the replicas of the
+// projects it set aside: `node join --resume` and a second `node rejoin` find them in join.json, because
+// the data is under data.diverged-* by then and nothing else says which projects the node had.
+func TestARejoinThatFailsToStreamStillRebuildsTheReplicas(t *testing.T) {
+	for _, how := range []string{"resume", "rejoin again"} {
+		t.Run(how, func(t *testing.T) {
+			l := newLeader(t)
+			ctx := context.Background()
+			j := l.joiner(t, "n2")
+			seed, _ := okSeed(t)
+			if _, err := Join(ctx, j.joinOptions(l.token(t, TokenOptions{}), "second", seed)); err != nil {
+				t.Fatal(err)
+			}
+			if err := l.reg.SetNodeState(ctx, "n2", registry.NodeFenced); err != nil {
+				t.Fatal(err)
+			}
+			l.live.Refresh(ctx)
+			const ref = "aaaaaaaaaaaaaaaaaaaa"
+			if err := l.reg.CreateProject(ctx, &registry.Project{Ref: ref, Name: "a", Status: registry.StatusActiveHealthy, NodeID: "n1"}); err != nil {
+				t.Fatal(err)
+			}
+			for _, r := range []string{"system", ref} {
+				if err := os.MkdirAll(j.cfg.Paths().PostgresData(r), 0o700); err != nil {
+					t.Fatal(err)
+				}
+			}
+			var rebuilt []string
+			l.auth.Rebuild = func(_ context.Context, ref, node string) error { rebuilt = append(rebuilt, ref+"@"+node); return nil }
+			if err := WriteFenced(j.cfg, FencedRecord{Epoch: 2, Leader: "n1", Reason: "replaced", At: time.Now(), Peers: map[string]string{"n1": l.cfg.PeerAddr()}}); err != nil {
+				t.Fatal(err)
+			}
+			broken := errors.New("the standby does not stream")
+			o := RejoinOptions{Cfg: j.cfg, ConfigPath: j.confPath, Version: "v0.2.0", Pins: testPins, Seed: seed, Log: quiet(),
+				StopLocal: func(context.Context) error { return nil },
+				Streaming: func(context.Context) (string, error) { return "", broken }}
+			if _, err := Rejoin(ctx, o); !errors.Is(err, broken) {
+				t.Fatalf("the first rejoin: %v", err)
+			}
+			if len(rebuilt) != 0 {
+				t.Fatalf("replicas were set up before the node was active: %v", rebuilt)
+			}
+			streaming := func(context.Context) (string, error) { return "0/4000000", nil }
+			if how == "resume" {
+				jo := j.joinOptions(Token{}, "", seed)
+				jo.Resume, jo.Streaming = true, streaming
+				if _, err := Join(ctx, jo); err != nil {
+					t.Fatalf("join --resume: %v", err)
+				}
+			} else {
+				o.Streaming = streaming
+				if _, err := Rejoin(ctx, o); err != nil {
+					t.Fatalf("the rejoin run again: %v", err)
+				}
+			}
+			if len(rebuilt) != 1 || rebuilt[0] != ref+"@n2" {
+				t.Fatalf("replicas set up after the retry: %v", rebuilt)
+			}
+		})
 	}
 }
 

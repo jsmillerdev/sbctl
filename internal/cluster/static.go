@@ -67,6 +67,19 @@ func (s *Static) Leader() (registry.Node, bool) {
 	return registry.Node{}, false
 }
 
+// LeaderAndEpoch is Leader and Epoch from one snapshot. Two reads can straddle a change (the leader of the
+// old snapshot with the epoch of the new one), and a ping that says "node X leads at epoch E" with such a pair
+// makes the node that leads at E fence itself.
+func (s *Static) LeaderAndEpoch() (leader registry.Node, ok bool, epoch int64) {
+	snap := s.get()
+	for _, n := range snap.Nodes {
+		if n.ID == snap.Leader {
+			return n, true, snap.Epoch
+		}
+	}
+	return registry.Node{}, false, snap.Epoch
+}
+
 func (s *Static) Watch(ctx context.Context) <-chan Snapshot {
 	out := make(chan Snapshot, 1)
 	s.mu.Lock()

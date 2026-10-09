@@ -6,6 +6,8 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -243,6 +245,14 @@ func TestRefreshSystemStartsTheSignInServiceTheClusterRestartStopped(t *testing.
 		t.Fatalf("the sign-in service is %s after the cluster restarted: %s", d.states[gotrue], d.calls())
 	}
 
+	// A node that has the launcher of the sign-in service and stopped it leaves it stopped.
+	launcher := units.FilesFor(cfg, units.Spec{Service: config.SvcGoTrue}).Run
+	if err := os.MkdirAll(filepath.Dir(launcher), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(launcher, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
 	d = &depSup{states: map[string]units.State{gotrue: units.StateInactive, pg: units.StateActive}}
 	pl = NewPostgresPlane(cfg, d, fakeArts{}, registry.NewMemory(), PlaneOptions{})
 	if err := pl.refreshSystem(ctx, sys, keys, restart(d)); err != nil {
@@ -250,6 +260,21 @@ func TestRefreshSystemStartsTheSignInServiceTheClusterRestartStopped(t *testing.
 	}
 	if d.states[gotrue] != units.StateInactive {
 		t.Fatalf("a sign-in service that was not running was started: %s", d.calls())
+	}
+
+	// A node that has no launcher leads without ever having run the service (a follower that was promoted) or after
+	// the fence took its launchers away (a leader that was demoted and leads again): systemd would skip the unit
+	// for its missing launcher, so the daemon renders and starts it.
+	if err := os.Remove(launcher); err != nil {
+		t.Fatal(err)
+	}
+	d = &depSup{states: map[string]units.State{gotrue: units.StateInactive, pg: units.StateActive}}
+	pl = NewPostgresPlane(cfg, d, fakeArts{}, registry.NewMemory(), PlaneOptions{})
+	if err := pl.refreshSystem(ctx, sys, keys, restart(d)); err != nil {
+		t.Fatal(err)
+	}
+	if d.states[gotrue] != units.StateActive {
+		t.Fatalf("a leader without a launcher for the sign-in service did not start it: %s", d.calls())
 	}
 
 	// A cluster that does not start is the cluster's error, and the sign-in service is not touched.

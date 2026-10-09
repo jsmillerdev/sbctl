@@ -74,3 +74,25 @@ func TestSessionMovesMoreThanTheWindow(t *testing.T) {
 		t.Fatal("the transfer stalled")
 	}
 }
+
+// smux keeps the slice of a write that failed in its send queue; the stream hands it a copy, so the
+// caller may reuse its buffer the moment Write returns.
+func TestAStreamWriteHandsSmuxABufferOfItsOwn(t *testing.T) {
+	var got []byte
+	rec := &recordingConn{write: func(p []byte) { got = p }}
+	buf := []byte("frame")
+	if _, err := (ownedWrites{rec}).Write(buf); err != nil {
+		t.Fatal(err)
+	}
+	copy(buf, "XXXXX") // the caller reuses its buffer
+	if string(got) != "frame" {
+		t.Fatalf("the stream kept the caller's buffer: %q", got)
+	}
+}
+
+type recordingConn struct {
+	net.Conn
+	write func([]byte)
+}
+
+func (r *recordingConn) Write(p []byte) (int, error) { r.write(p); return len(p), nil }

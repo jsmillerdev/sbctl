@@ -96,6 +96,19 @@ wait_api() { # SECONDS: the Management API answers (401 without a token) on this
   fail "the Management API does not answer on this node after ${n}s"
 }
 
+# wait_move_ended SECONDS: the newest move in the registry is no longer running. A server move goes on in the daemon of
+# the node that takes over after the old leader's daemon restarted, and the command that started it may have ended.
+wait_move_ended() {
+  local n=${1:-600} i st=""
+  for ((i = 0; i < n; i += 3)); do
+    st=$(last_move 2>/dev/null | cut -d'|' -f8) || st=""
+    [[ -n $st && $st != running ]] && return 0
+    sleep 3
+  done
+  last_move >&2 || true
+  fail "the newest move is '${st:-unknown}' after ${n}s"
+}
+
 # wait_project REF STATUS SECONDS: the registry shows the project in STATUS.
 wait_project() {
   local ref=$1 want=$2 n=${3:-300} i s=""
@@ -131,8 +144,10 @@ papi() { local m=$1 p=$2; shift 2; api "$m" "$p" -H @/root/pat.hdr "$@"; }
 
 dash_login() { # a dashboard session for the /platform routes (a personal access token does not open them)
   local jwt
-  jwt=$(api POST '/auth/v1/token?grant_type=password' -H 'Content-Type: application/json' \
-    -d '{"email":"smoke@example.com","password":"smoke-correct-horse-battery"}' | json_get 'd["access_token"]') || fail "dashboard sign-in"
+  (umask 077; printf '{"email":"smoke@example.com","password":"smoke-correct-horse-battery"}' >/root/signin-body.json)
+  jwt=$(api POST '/auth/v1/token?grant_type=password' -H 'Content-Type: application/json' -d @/root/signin-body.json \
+    | json_get 'd["access_token"]') || { rm -f /root/signin-body.json; fail "dashboard sign-in"; }
+  rm -f /root/signin-body.json
   (umask 077; printf 'Authorization: Bearer %s\n' "$jwt" >/root/jwt.hdr)
 }
 japi() { local m=$1 p=$2; shift 2; api "$m" "$p" -H @/root/jwt.hdr "$@"; }
@@ -353,31 +368,55 @@ unit_stamp() {
 
 daemon_version() { "/proc/$(systemctl show -p MainPID --value supavise.service)/exe" --version; }
 
+# fenced_refs: the PostgreSQL clusters of this node. They are the ones in the data directory: after a restart of the
+# machine `systemctl list-units` shows only the units that are loaded, and a unit that never started is not, so the
+# list alone could be empty and check nothing.
+fenced_refs() {
+  {
+    find /var/lib/supavise/projects -mindepth 2 -maxdepth 2 -name postgres -type d | awk -F/ '{print $(NF-1)}'
+    systemctl list-units 'supavise-postgres@*.service' --all --no-legend --plain | awk '{print $1}' | sed -e 's/^supavise-postgres@//' -e 's/\.service$//'
+  } | sort -u
+}
+
+# fenced_settled: the system cluster and at least two projects are here, and none runs or has a launcher. It prints the
+# first thing that is not so on standard error and returns 1.
+fenced_settled() {
+  local ref refs
+  refs=$(fenced_refs)
+  [[ $(grep -cx system <<<"$refs") == 1 && $(grep -vcx system <<<"$refs") -ge 2 ]] \
+    || { echo "the fenced node has the PostgreSQL clusters '$(paste -sd' ' - <<<"$refs")', want system and the two projects" >&2; return 1; }
+  for ref in $refs; do
+    [[ $(unit_state "supavise-postgres@$ref.service") != active ]] || { echo "supavise-postgres@$ref.service runs on a fenced node" >&2; return 1; }
+    [[ ! -e /var/lib/supavise/projects/$ref/postgres.run ]] || { echo "$ref: the fenced node still has its launcher /var/lib/supavise/projects/$ref/postgres.run" >&2; return 1; }
+  done
+}
+
 # wait_fenced SECONDS: a node that came back after its replacement records that it is fenced, runs no
 # PostgreSQL primary (no unit, and no launcher for the unit's ConditionPathExists) and answers 503.
-# The clusters are the ones in the data directory: after a restart of the machine `systemctl list-units` shows only
-# the units that are loaded, and a unit that never started is not, so the list alone could be empty and check nothing.
+# BootCheck writes the record first and then takes each launcher away and stops each cluster in turn, and systemd may
+# have started the three clusters a moment before: on a loaded runner they are in crash recovery for a while, so the
+# state is waited for, not read once.
 wait_fenced() {
-  local n=${1:-240} u ref refs
+  local n=${1:-240} i why="" u ref
   wait_for "$n" "the node to record that it is fenced" test -s /var/lib/supavise/fenced.json
-  sleep 10
-  refs=$(
-    {
-      find /var/lib/supavise/projects -mindepth 2 -maxdepth 2 -name postgres -type d | awk -F/ '{print $(NF-1)}'
-      systemctl list-units 'supavise-postgres@*.service' --all --no-legend --plain | awk '{print $1}' | sed -e 's/^supavise-postgres@//' -e 's/\.service$//'
-    } | sort -u
-  )
-  [[ $(grep -cx system <<<"$refs") == 1 && $(grep -vcx system <<<"$refs") -ge 2 ]] \
-    || fail "the fenced node has the PostgreSQL clusters '$(paste -sd' ' - <<<"$refs")', want system and the two projects"
-  for ref in $refs; do
+  for ((i = 0; i < 120; i += 3)); do
+    why=$(fenced_settled 2>&1) && break
+    sleep 3
+  done
+  [[ -z $why ]] || fail "after 120s: $why"
+  for ref in $(fenced_refs); do
     u=supavise-postgres@$ref.service
-    [[ $(unit_state "$u") != active ]] || fail "$u runs on a fenced node"
-    [[ ! -e /var/lib/supavise/projects/$ref/postgres.run ]] || fail "$ref: the fenced node still has its launcher /var/lib/supavise/projects/$ref/postgres.run"
     systemctl start "$u" 2>/dev/null || true
     [[ $(unit_state "$u") != active ]] || fail "$u started on a fenced node although its launcher is gone"
     [[ $(systemctl show -p ConditionResult --value "$u") == no ]] || fail "$u: the unit's condition is '$(systemctl show -p ConditionResult --value "$u")', want no"
   done
-  [[ $(http_code http://127.0.0.1/) == 503 ]] || fail "a fenced node answers $(http_code http://127.0.0.1/) on port 80, want 503"
+  # The record is written before the daemon listens (it decides the boot first, then serves the 503), so the listener is
+  # waited for as well: a node that never answers 503 fails after a minute.
+  for ((i = 0; i < 60; i += 2)); do
+    [[ $(http_code http://127.0.0.1/) == 503 ]] && break
+    sleep 2
+  done
+  [[ $(http_code http://127.0.0.1/) == 503 ]] || fail "a fenced node answers $(http_code http://127.0.0.1/) on port 80 after a minute, want 503"
   log "fenced.json: leader and epoch $(python3 -c 'import json; d=json.load(open("/var/lib/supavise/fenced.json")); print(d.get("leader", ""), d.get("epoch", ""))')"
 }
 
@@ -546,14 +585,15 @@ lb_route() {
 }
 
 # ---- the writer ----------------------------------------------------------------------------------------
-# writer_start REF RUN: a continuous writer of REF through this node's proxy (writer.py, 20 rows a second), as a
-# transient unit. Its attempts are in /root/writer/RUN/acked and failed.
+# writer_start REF RUN RATE: a continuous writer of REF through this node's proxy (writer.py, RATE rows a second; the
+# runner's WRITER_RATE, which bounds the rows an unplanned failover may lose), as a transient unit. Its attempts are in
+# /root/writer/RUN/acked and failed.
 writer_start() {
-  local ref=$1 run=$2
+  local ref=$1 run=$2 rate=${3:?writer_start REF RUN RATE}
   mkdir -p "/root/writer/$run"
   systemd-run --quiet --unit="sv-writer-$run" --collect --property=Type=exec \
     /usr/bin/python3 /root/writer.py --host "$ref.api.$SUPAVISE_DOMAIN" --key-file "/root/keys/$ref.sec" \
-    --out "/root/writer/$run" --start $((run * RUN_SPAN)) --rate 20
+    --out "/root/writer/$run" --start $((run * RUN_SPAN)) --rate "$rate"
   sleep 3
   [[ $(unit_state "sv-writer-$run.service") == active ]] || fail "the writer $run does not run: $(journalctl --no-pager -u "sv-writer-$run.service" -n 10)"
 }
@@ -581,10 +621,12 @@ replay_lag_max() {
 }
 
 # ---- what the test leaves for the artifact ---------------------------------------------------------------------
-redact() { sed -E 's/^([A-Za-z0-9_]*(secret|password|token|key|credential)[A-Za-z0-9_]*) *=.*/\1 = "<removed>"/I'; }
+# A name that suggests a secret, or a URL or DSN (which can carry a password), loses its value: the artifact of a public
+# repository is world-readable.
+redact() { sed -E 's/^([A-Za-z0-9_]*(secret|pass|token|key|credential|dsn|url)[A-Za-z0-9_]*) *=.*/\1 = "<removed>"/I'; }
 
-# node_dump: this node's view of the cluster, for a failed check and for the end of the run. Nothing in it is a
-# secret: the configuration is printed with every value whose name suggests one removed.
+# node_dump: this node's view of the cluster, for a failed check and for the end of the run. The test sets no secret in
+# the configuration, and the configuration is printed with every value whose name suggests one (see redact) removed.
 node_dump() {
   set +e +u +o pipefail
   local d ref f
@@ -598,6 +640,7 @@ node_dump() {
   echo "-- data directories"; ls -d /var/lib/supavise/projects/*/postgres/data* 2>&1
   echo "-- status"; supavise status 2>&1 | head -n 80
   echo "-- node ls"; supavise node ls 2>&1
+  echo "-- host layer"; supavise system converge --check --json 2>&1 | head -c 4000; echo
   echo "-- registry"
   reg "select id, name, state, region, version, peer_addr from supavise.nodes order by id" 2>&1
   reg "select leader, epoch, maintenance from supavise.cluster" 2>&1

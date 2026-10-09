@@ -368,6 +368,11 @@ func (pl *PostgresPlane) startRendered(ctx context.Context, p *registry.Project)
 	}
 	unit := config.UnitName(config.SvcPostgres, p.Ref)
 	files := units.FilesFor(pl.cfg, units.Spec{Service: config.SvcPostgres, Ref: p.Ref})
+	// A planned stop of the system cluster moved its launcher aside (failover quiesce); the node that
+	// starts the cluster again, after the fence check above, puts it back.
+	if err := files.Unhold(); err != nil {
+		return err
+	}
 	if _, err := os.Stat(files.Run); err != nil {
 		return fmt.Errorf("lifecycle: %s was never rendered (%w); is the state directory %s intact?", unit, err, pl.cfg.StateDir)
 	}

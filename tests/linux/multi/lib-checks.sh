@@ -220,10 +220,18 @@ c_prep() {
 }
 
 c_net() {
-  local n=$1 code
+  local n=$1 code i
   needs "prep@$n" services
-  code=$(on "$n" curl -sL -o /dev/null -w '%{http_code}' -m 30 https://github.com/supabase/slim-services) || true
-  [[ $code == 200 ]] || fail "$n: github.com answered '$code'"
+  # The check asks whether the machine reaches the internet. github.com's web front answers 502 and 504 for minutes at a
+  # time now and then, and an answer of any status proves the way out works (000 is no answer): the downloads that the
+  # install makes are the check of GitHub itself. A 200 is waited for a little, so that a 5xx shows in the log.
+  for ((i = 0; i < 3; i++)); do
+    code=$(on "$n" curl -sL -o /dev/null -w '%{http_code}' -m 30 https://github.com/supabase/slim-services) || true
+    [[ $code == 200 ]] && break
+    sleep 5
+  done
+  [[ $code =~ ^[1-5][0-9][0-9]$ ]] || fail "$n: github.com does not answer ('$code')"
+  [[ $code == 200 ]] || echo "# github.com answered $code to the probe three times: the way out works, GitHub's front is unwell"
   code=$(on "$n" curl -s -o /dev/null -w '%{http_code}' -m 10 "http://$BRIDGE_IP:$S3_PORT/") || true
   [[ $code =~ ^(200|400|403|404)$ ]] || fail "$n: Garage on the bridge answered '$code'"
   code=$(on "$n" curl -s -o /dev/null -w '%{http_code}' -m 10 "http://$BRIDGE_IP:$RELEASE_PORT/download/v0.0.1/SHA256SUMS") || true

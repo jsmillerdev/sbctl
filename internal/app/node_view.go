@@ -38,7 +38,20 @@ func nodeSeenBy(n *lifecycle.Node, boot cluster.BootDecision) *lifecycle.Node {
 	if !boot.Joined || boot.SelfID == "" {
 		return n
 	}
+	return atHome(n, boot.SelfID)
+}
+
+// NodeAtHome is n as `supavise status` sees it: the same view as the daemon's health, with the projects
+// homed on this node only. A server with no cluster is its own founder, so it sees all its projects.
+func NodeAtHome(n *lifecycle.Node) *lifecycle.Node {
+	if n.Engine == nil || n.Engine.NodeID() == "" {
+		return n
+	}
+	return atHome(n, n.Engine.NodeID())
+}
+
+func atHome(n *lifecycle.Node, self string) *lifecycle.Node {
 	c := *n
-	c.Registry = homedHere{Registry: n.Registry, self: boot.SelfID}
+	c.Registry = homedHere{Registry: n.Registry, self: self}
 	return &c
 }

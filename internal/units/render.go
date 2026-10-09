@@ -19,6 +19,39 @@ type Files struct {
 	Run string // launcher script the unit template executes, 0750
 }
 
+// Held is the name the launcher takes while a planned stop keeps its unit from starting (Hold).
+func (f Files) Held() string { return f.Run + ".held" }
+
+// Hold moves the launcher aside. The unit template requires the launcher to exist
+// (ConditionPathExists), so systemd does not start the unit again, not by a dependency that wants
+// it (supavise.service wants the system cluster when the daemon restarts) and not at boot. A
+// launcher that is not there is not an error: the hold is repeatable.
+func (f Files) Hold() error {
+	if err := os.Rename(f.Run, f.Held()); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("units: holding %s: %w", f.Run, err)
+	}
+	return nil
+}
+
+// Unhold puts a held launcher back. It does nothing when nothing is held, and does not replace a
+// launcher that was rendered again in the meantime (that one is newer; the held copy is dropped).
+func (f Files) Unhold() error {
+	if _, err := os.Stat(f.Held()); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return fmt.Errorf("units: %w", err)
+	}
+	if _, err := os.Stat(f.Run); err == nil {
+		_ = os.Remove(f.Held())
+		return nil
+	}
+	if err := os.Rename(f.Held(), f.Run); err != nil {
+		return fmt.Errorf("units: releasing the hold of %s: %w", f.Run, err)
+	}
+	return nil
+}
+
 // instanceRef is the directory name a unit's files live under: the project ref, or
 // "system" for fleet singletons.
 func instanceRef(s Spec) string {
@@ -227,7 +260,7 @@ func renderFiles(cfg *config.Config, s Spec) (changed bool, err error) {
 // removeFiles deletes what renderFiles wrote.
 func removeFiles(f Files) error {
 	var first error
-	for _, p := range []string{f.Env, f.Run} {
+	for _, p := range []string{f.Env, f.Run, f.Held()} {
 		if err := os.Remove(p); err != nil && !errors.Is(err, os.ErrNotExist) && first == nil {
 			first = err
 		}

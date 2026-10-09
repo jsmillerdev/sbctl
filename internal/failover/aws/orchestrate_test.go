@@ -173,6 +173,14 @@ func (p *peers) Fence(context.Context, string, failover.FenceCall) (peerapi.Fenc
 	return peerapi.FenceResponse{}, errors.New("no session")
 }
 
+func (p *peers) Hold(context.Context, string, string, int64, string) error {
+	return errors.New("no session")
+}
+
+func (p *peers) Release(context.Context, string, string, int64) error {
+	return errors.New("no session")
+}
+
 type marker struct {
 	mu sync.Mutex
 	m  *backup.LeaderMarker
