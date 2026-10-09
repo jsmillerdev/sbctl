@@ -131,7 +131,7 @@ func (e *Engine) BeginRestore(ctx context.Context, ref string) (RestoreRun, erro
 	if err := e.onHome(p, "restore", "a restore replaces the data directory of its home; move the project to this node first"); err != nil {
 		return nil, err
 	}
-	if !active(p.Status) && p.Status != registry.StatusRestoreFailed {
+	if !p.Status.Running() && p.Status != registry.StatusRestoreFailed {
 		return nil, invalidState(p, "restore")
 	}
 	if spaceErr != nil {
@@ -173,9 +173,9 @@ func (r *Restore) Run(ctx context.Context, req RestoreRequest) error {
 	return nil
 }
 
-// rolePasswordPlane is implemented by a data plane that can set every service role's password
+// RolePasswordPlane is implemented by a data plane that can set every service role's password
 // in a running cluster from the project's keys; PostgresPlane has it.
-type rolePasswordPlane interface {
+type RolePasswordPlane interface {
 	SetRolePasswords(ctx context.Context, p *registry.Project, keys *secrets.ProjectKeys) error
 }
 
@@ -185,7 +185,7 @@ type rolePasswordPlane interface {
 // cluster back in line, the invariant SetDatabasePassword keeps. A failure is logged and
 // recorded as a restore.passwords_failed event; the restore itself stands.
 func (e *Engine) reapplyRolePasswords(ctx context.Context, ref string) {
-	pp, ok := e.plane.(rolePasswordPlane)
+	pp, ok := e.plane.(RolePasswordPlane)
 	if !ok {
 		return
 	}

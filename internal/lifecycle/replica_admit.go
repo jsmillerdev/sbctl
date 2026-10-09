@@ -75,7 +75,7 @@ func (e *Engine) AdmitReplica(ctx context.Context, p *registry.Project, identifi
 	}
 	if need := replicaNeed(backupBytes); free < need {
 		return &diskError{fmt.Sprintf("the disk has %s free and a replica seeded from a base backup of %s needs about %s",
-			humanBytes(free), humanBytes(backupBytes), humanBytes(need))}
+			HumanBytes(free), HumanBytes(backupBytes), HumanBytes(need))}
 	}
 	return nil
 }

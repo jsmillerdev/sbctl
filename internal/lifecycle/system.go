@@ -127,8 +127,6 @@ type OpenOptions struct {
 	Supervisor units.Supervisor
 	// Artifacts replaces the artifact store (tests).
 	Artifacts Artifacts
-	// Store options for the default artifact store.
-	StoreOptions []artifacts.Option
 	// UpgradeNotify is Options.UpgradeNotify of the Engine (the daemon raises alerts through it).
 	UpgradeNotify func(ctx context.Context, n UpgradeNotice)
 	// RegistryDSN replaces RegistryDSN(cfg), the system cluster's private socket (a command run
@@ -251,8 +249,7 @@ func (o *OpenOptions) artifactStore(cfg *config.Config) (Artifacts, error) {
 	if o.Artifacts != nil {
 		return o.Artifacts, nil
 	}
-	opts := append([]artifacts.Option{artifacts.WithLogger(o.log())}, o.StoreOptions...)
-	return artifacts.New(cfg, opts...)
+	return artifacts.New(cfg, artifacts.WithLogger(o.log()))
 }
 
 // ErrRegistryUnreachable is wrapped by Open when the registry in the system cluster does

@@ -155,7 +155,7 @@ func (pl *PostgresPlane) SystemStandbyJoinPreflight(ctx context.Context) error {
 		free = diskFree(dir)
 	}
 	if free >= 0 && free < minSystemStandbyFree {
-		return fmt.Errorf("lifecycle: %s has %s free, and the standby of the system cluster wants at least %s", dir, humanBytes(free), humanBytes(minSystemStandbyFree))
+		return fmt.Errorf("lifecycle: %s has %s free, and the standby of the system cluster wants at least %s", dir, HumanBytes(free), HumanBytes(minSystemStandbyFree))
 	}
 	return nil
 }

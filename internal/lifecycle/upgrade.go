@@ -2,10 +2,9 @@ package lifecycle
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -400,7 +399,7 @@ func (e *Engine) BeginUpgrade(ctx context.Context, ref string, req UpgradeReques
 		return nil, err
 	}
 	for svc := range req.Target {
-		if !isProjectService(svc) {
+		if !slices.Contains(config.ProjectServices, svc) {
 			return nil, fmt.Errorf("%w: %q is not a service a project upgrades", ErrUpgradeUnsupported, svc)
 		}
 	}
@@ -445,7 +444,7 @@ func (e *Engine) BeginUpgrade(ctx context.Context, ref string, req UpgradeReques
 		return nil, ErrUpgradeNotNeeded
 	}
 	now := e.opts.Now().UTC()
-	up := registry.Upgrade{TrackingID: newTrackingID(), Ref: ref, From: el.Current, To: el.Target, TargetVersion: req.TargetVersion,
+	up := registry.Upgrade{TrackingID: secrets.NewUUID(), Ref: ref, From: el.Current, To: el.Target, TargetVersion: req.TargetVersion,
 		Status: registry.UpgradeRunning, Progress: ProgressRequested, InitiatedAt: now, LatestStatusAt: now}
 	if err := store.PutUpgrade(ctx, &up); err != nil {
 		return nil, fmt.Errorf("lifecycle: record the upgrade of %s: %w", ref, err)
@@ -571,26 +570,6 @@ func (e *Engine) upgradeBusy(ref, op string) error {
 		return fmt.Errorf("%w: cannot %s %s while it is being upgraded", ErrInvalidState, op, ref)
 	}
 	return nil
-}
-
-func isProjectService(svc string) bool {
-	for _, s := range config.ProjectServices {
-		if s == svc {
-			return true
-		}
-	}
-	return false
-}
-
-func newTrackingID() string {
-	var b [16]byte
-	if _, err := rand.Read(b[:]); err != nil {
-		panic(err) // crypto/rand does not fail on supported platforms
-	}
-	b[6] = b[6]&0x0f | 0x40
-	b[8] = b[8]&0x3f | 0x80
-	h := hex.EncodeToString(b[:])
-	return h[0:8] + "-" + h[8:12] + "-" + h[12:16] + "-" + h[16:20] + "-" + h[20:]
 }
 
 func describeChanges(cs []ServiceChange) string {
@@ -1174,7 +1153,7 @@ func (e *Engine) PendingRestart(ctx context.Context, ref string) (bool, error) {
 		return false, nil
 	}
 	p, err := e.reg.GetProject(ctx, ref)
-	if err != nil || !active(p.Status) {
+	if err != nil || !p.Status.Running() {
 		return false, err
 	}
 	// The look renders the project's units from this node's files. A project homed on another node has
@@ -1216,7 +1195,7 @@ func (e *Engine) RestartPending(ctx context.Context, ref string) (bool, error) {
 	if err := e.onHome(p, "restart the held-back units of", "the units, files and marks it looks at are this node's own"); err != nil {
 		return false, err
 	}
-	if !active(p.Status) {
+	if !p.Status.Running() {
 		return false, nil
 	}
 	keys, err := e.loadKeys(ctx, ref)

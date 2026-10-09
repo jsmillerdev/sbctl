@@ -21,9 +21,6 @@ func ConfString(s string) string {
 	return "'" + strings.ReplaceAll(strings.ReplaceAll(s, `\`, `\\`), "'", "''") + "'"
 }
 
-// KVQuote quotes s as the value of a libpq key/value connection string.
-func KVQuote(s string) string { return kvQuote(s) }
-
 // recoverySettingNames are the settings of a cluster in recovery that a primary must not carry.
 // hot_standby is the one the backup service's seeder writes and a primary ignores; the replica's units
 // pass it on the command line.

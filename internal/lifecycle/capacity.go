@@ -280,7 +280,7 @@ func ComputeNodeCapacity(cfg *config.Config, n NodeResources, node string, ps []
 	}
 	for _, r := range rs {
 		p := byRef[r.Ref]
-		if p == nil || p.Ref == config.SystemRef || p.Ref == exclude || p.Status == registry.StatusRemoved || !replicaCounts(r.Status) {
+		if p == nil || r.IsSystemStandby() || p.Ref == exclude || p.Status == registry.StatusRemoved || !replicaCounts(r.Status) {
 			continue
 		}
 		c.CommittedBytes += projectMemory(p)

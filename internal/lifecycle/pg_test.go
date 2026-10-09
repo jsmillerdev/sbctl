@@ -81,3 +81,11 @@ func TestScramVerifierAppliesSASLprep(t *testing.T) {
 		t.Errorf("invalid UTF-8 changed: %q", got)
 	}
 }
+
+func TestHumanBytes(t *testing.T) {
+	for n, want := range map[int64]string{0: "0 B", 1023: "1023 B", 1024: "1.0 KiB", 300_000: "293.0 KiB", 80 << 20: "80.0 MiB", 3 << 30: "3.0 GiB"} {
+		if got := HumanBytes(n); got != want {
+			t.Errorf("HumanBytes(%d) = %q, want %q", n, got, want)
+		}
+	}
+}

@@ -542,10 +542,6 @@ func (e *Engine) cleanup(ctx context.Context, p *registry.Project, keepData bool
 	}
 }
 
-func active(s registry.Status) bool {
-	return s == registry.StatusActiveHealthy || s == registry.StatusActiveUnhealthy
-}
-
 func invalidState(p *registry.Project, op string) error {
 	return fmt.Errorf("%w: cannot %s %s while it is %s", ErrInvalidState, op, p.Ref, p.Status)
 }
@@ -570,7 +566,7 @@ func (e *Engine) Pause(ctx context.Context, ref string) error {
 	}
 	// A project whose restore failed can be paused, and resumed after: the way back to ACTIVE_HEALTHY
 	// when the original data is intact.
-	if ref == config.SystemRef || !(active(p.Status) || p.Status == registry.StatusRestoreFailed || inRestore(ctx, p)) {
+	if ref == config.SystemRef || !(p.Status.Running() || p.Status == registry.StatusRestoreFailed || inRestore(ctx, p)) {
 		return invalidState(p, "pause")
 	}
 	if err := e.setStatus(ctx, ref, registry.StatusPausing); err != nil {
@@ -924,7 +920,7 @@ func (e *Engine) RotateKeys(ctx context.Context, ref string) (*secrets.ProjectKe
 	if err := e.atHome(p, "rotate keys of"); err != nil {
 		return nil, err
 	}
-	if p.Status != registry.StatusInactive && !active(p.Status) {
+	if p.Status != registry.StatusInactive && !p.Status.Running() {
 		return nil, invalidState(p, "rotate keys of")
 	}
 	old, err := e.loadKeys(ctx, ref)
@@ -947,7 +943,7 @@ func (e *Engine) RotateKeys(ctx context.Context, ref string) (*secrets.ProjectKe
 			e.log.Error("rotate-keys: could not restore previous keys", "ref", ref, "error", err)
 		} else if err := e.storeRecords(cctx, ref, old, revived); err != nil {
 			e.log.Error("rotate-keys: could not restore the previous key records", "ref", ref, "error", err)
-		} else if active(p.Status) {
+		} else if p.Status.Running() {
 			if err := e.plane.Reconfigure(cctx, p, old); err != nil {
 				e.log.Error("rotate-keys: could not restart on previous keys", "ref", ref, "error", err)
 			}
@@ -960,7 +956,7 @@ func (e *Engine) RotateKeys(ctx context.Context, ref string) (*secrets.ProjectKe
 	if err := e.putRecords(ctx, ref, revived); err != nil {
 		return rollback(err)
 	}
-	if active(p.Status) {
+	if p.Status.Running() {
 		if err := e.plane.Reconfigure(ctx, p, &nk); err != nil {
 			return rollback(err)
 		}
@@ -990,7 +986,7 @@ func (e *Engine) StartActive(ctx context.Context) map[string]error {
 	}
 	for i := range ps {
 		p := ps[i]
-		if p.Ref == config.SystemRef || !active(p.Status) || !e.homedHere(&p) {
+		if p.Ref == config.SystemRef || !p.Status.Running() || !e.homedHere(&p) {
 			continue
 		}
 		if err := e.startOne(ctx, &p); err != nil {
@@ -1022,7 +1018,7 @@ func (e *Engine) EnsureTenants(ctx context.Context) map[string]error {
 		return errs
 	}
 	for i := range ps {
-		if ps[i].Ref == config.SystemRef || !active(ps[i].Status) || (e.opts.ReadOnly && !e.homedHere(&ps[i])) {
+		if ps[i].Ref == config.SystemRef || !ps[i].Status.Running() || (e.opts.ReadOnly && !e.homedHere(&ps[i])) {
 			continue
 		}
 		if err := e.ensureTenantsLocked(ctx, ps[i].Ref); err != nil {
@@ -1104,7 +1100,7 @@ func (e *Engine) ensureTenantsOf(ctx context.Context, ref string, peers bool) er
 	// A project that is moving to another home stays RESTARTING until the move ends, and the move registers
 	// it at the new home while it is (peers is the call of a move). The sweep at start leaves every project
 	// that is not active to its own operation.
-	if !active(p.Status) && !(peers && p.Status == registry.StatusRestarting) {
+	if !p.Status.Running() && !(peers && p.Status == registry.StatusRestarting) {
 		return nil // paused, upgrading or being restored since the list: its own operation registers it
 	}
 	keys, err := e.loadKeys(ctx, ref)
@@ -1137,7 +1133,7 @@ func (e *Engine) ensureReplicaTenants(ctx context.Context, p *registry.Project, 
 	}
 	var first error
 	for _, r := range rs {
-		if r.Status != string(registry.StatusActiveHealthy) && r.Status != string(registry.StatusActiveUnhealthy) {
+		if !registry.Status(r.Status).Running() {
 			continue // being set up or removed: the replica controller registers it when it is healthy
 		}
 		spec := base
@@ -1172,7 +1168,7 @@ func (e *Engine) startOne(ctx context.Context, listed *registry.Project) error {
 	if err != nil {
 		return err
 	}
-	if !active(p.Status) {
+	if !p.Status.Running() {
 		return nil
 	}
 	// A primary that a peer replaced does not start at boot, whatever this node's copy of the registry
@@ -1218,7 +1214,7 @@ func (e *Engine) Health(ctx context.Context, ref string) ([]ServiceHealth, error
 		return nil, err
 	}
 	hs := e.plane.Health(ctx, p, nil)
-	if active(p.Status) && !e.opts.ReadOnly {
+	if p.Status.Running() && !e.opts.ReadOnly {
 		want := registry.StatusActiveHealthy
 		for _, h := range hs {
 			if !h.Healthy {
@@ -1272,19 +1268,6 @@ func (e *Engine) ConnString(ctx context.Context, ref, role string) (string, erro
 		return "", fmt.Errorf("lifecycle: ConnString supports roles %q and %q, not %q", RolePostgres, RoleAdmin, role)
 	}
 	return dsnURL(role, pw, e.cfg.PortsFor(ref, p.Seq).Postgres, "postgres"), nil
-}
-
-// FormatHealth renders health results as one line per service.
-func FormatHealth(hs []ServiceHealth) string {
-	var b strings.Builder
-	for _, h := range hs {
-		fmt.Fprintf(&b, "%-10s %-15s", h.Name, h.Status)
-		if h.Error != "" {
-			b.WriteString(" " + h.Error)
-		}
-		b.WriteString("\n")
-	}
-	return b.String()
 }
 
 // Recovered describes one project Recover moved out of a transitional status.

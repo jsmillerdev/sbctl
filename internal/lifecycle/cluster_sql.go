@@ -1,11 +1,12 @@
 package lifecycle
 
 import (
+	"cmp"
 	"context"
 	"fmt"
-	"strconv"
-	"strings"
 	"time"
+
+	"github.com/supavise/supavise/internal/pglsn"
 )
 
 // ClusterAddr says where a cluster's unix socket is: the directory and the port in the socket's name.
@@ -115,38 +116,17 @@ func (pgSQL) ReplayedTo(ctx context.Context, a ClusterAddr, lsn string) (bool, e
 // receiver wrote ("" when it has none). A replay position equal to lsn means the record before lsn
 // is the last one replayed, so the record at lsn itself is still to come.
 func replayedPast(replay, receive, lsn string) (bool, error) {
-	want, err := parseLSN(lsn)
-	if err != nil {
-		return false, err
-	}
-	at, err := parseLSN(replay)
-	if err != nil {
-		return false, err
-	}
+	want, wantErr := pglsn.Parse(lsn)
+	at, atErr := pglsn.Parse(replay)
 	var got uint64
+	var gotErr error
 	if receive != "" {
-		if got, err = parseLSN(receive); err != nil {
-			return false, err
-		}
+		got, gotErr = pglsn.Parse(receive)
+	}
+	if err := cmp.Or(wantErr, atErr, gotErr); err != nil {
+		return false, fmt.Errorf("lifecycle: %w", err)
 	}
 	return at > want && at >= got, nil
-}
-
-// parseLSN reads a pg_lsn in its text form, two hexadecimal numbers around a slash ("0/3000060").
-func parseLSN(s string) (uint64, error) {
-	hi, lo, ok := strings.Cut(s, "/")
-	if !ok {
-		return 0, fmt.Errorf("lifecycle: %q is not an LSN", s)
-	}
-	h, err := strconv.ParseUint(hi, 16, 32)
-	if err != nil {
-		return 0, fmt.Errorf("lifecycle: %q is not an LSN", s)
-	}
-	l, err := strconv.ParseUint(lo, 16, 32)
-	if err != nil {
-		return 0, fmt.Errorf("lifecycle: %q is not an LSN", s)
-	}
-	return h<<32 | l, nil
 }
 
 func (pgSQL) ReplayLSN(ctx context.Context, a ClusterAddr) (string, error) {

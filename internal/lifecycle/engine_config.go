@@ -13,22 +13,22 @@ import (
 	"github.com/supavise/supavise/internal/secrets"
 )
 
-// configPlane is what ApplyConfig needs of the data plane beyond Plane; PostgresPlane has it.
-type configPlane interface {
+// ConfigPlane is what Engine.ApplyConfig needs of the data plane beyond Plane; PostgresPlane has it.
+type ConfigPlane interface {
 	ReconfigureService(ctx context.Context, p *registry.Project, keys *secrets.ProjectKeys, svc string) error
 	ApplyPostgresSettings(ctx context.Context, p *registry.Project, keys *secrets.ProjectKeys, restart bool, beforeRestart func(context.Context)) (bool, error)
 	SetRolePassword(ctx context.Context, p *registry.Project, role, password string) error
 }
 
-// recoverPlane is what ApplyConfig needs of a data plane to honor ApplyOptions.Recover;
+// RecoverPlane is what ApplyConfig needs of a data plane to honor ApplyOptions.Recover;
 // PostgresPlane has it.
-type recoverPlane interface {
+type RecoverPlane interface {
 	RecoverPostgres(ctx context.Context, p *registry.Project, keys *secrets.ProjectKeys) error
 }
 
-// renderChecker renders a service's units from the saved settings without starting anything;
+// RenderChecker renders a service's units from the saved settings without starting anything;
 // PostgresPlane has it.
-type renderChecker interface {
+type RenderChecker interface {
 	CheckRender(ctx context.Context, p *registry.Project, keys *secrets.ProjectKeys, svc projectconfig.Service) error
 }
 
@@ -59,7 +59,7 @@ func (e *Engine) ApplyConfig(ctx context.Context, ref string, svc projectconfig.
 		return ApplyResult{}, err
 	}
 	if p.Status == registry.StatusInactive {
-		if rc, ok := e.plane.(renderChecker); ok {
+		if rc, ok := e.plane.(RenderChecker); ok {
 			keys, err := e.loadKeys(ctx, ref)
 			if err != nil {
 				return ApplyResult{}, err
@@ -70,14 +70,14 @@ func (e *Engine) ApplyConfig(ctx context.Context, ref string, svc projectconfig.
 		}
 		return ApplyResult{}, nil
 	}
-	if !active(p.Status) {
+	if !p.Status.Running() {
 		return ApplyResult{}, invalidState(p, "apply settings to")
 	}
 	keys, err := e.loadKeys(ctx, ref)
 	if err != nil {
 		return ApplyResult{}, err
 	}
-	cp, ok := e.plane.(configPlane)
+	cp, ok := e.plane.(ConfigPlane)
 	if !ok {
 		return ApplyResult{}, ErrNotSupported
 	}
@@ -94,7 +94,7 @@ func (e *Engine) ApplyConfig(ctx context.Context, ref string, svc projectconfig.
 		}
 	case projectconfig.Postgres:
 		if opts.Recover {
-			if rp, ok := cp.(recoverPlane); ok {
+			if rp, ok := cp.(RecoverPlane); ok {
 				if err = rp.RecoverPostgres(ctx, p, keys); err != nil {
 					return ApplyResult{}, fmt.Errorf("lifecycle: recover the database of %s: %w", ref, err)
 				}
@@ -136,7 +136,7 @@ func (e *Engine) applySavedSettings(ctx context.Context, p *registry.Project, ke
 	}
 	// The Postgres settings of a project homed elsewhere are not this node's to apply: the router
 	// answers ErrNotSupported for them, which is no failure of the resume.
-	if cp, ok := e.plane.(configPlane); ok && e.homedHere(p) {
+	if cp, ok := e.plane.(ConfigPlane); ok && e.homedHere(p) {
 		pending, err := cp.ApplyPostgresSettings(ctx, p, keys, false, nil)
 		if err != nil {
 			fail(string(projectconfig.Postgres)+" settings", err)
@@ -176,14 +176,14 @@ func (e *Engine) SetDatabasePassword(ctx context.Context, ref, password string) 
 	if err := e.atHome(p, "change the database password of"); err != nil {
 		return err
 	}
-	if !active(p.Status) {
+	if !p.Status.Running() {
 		return invalidState(p, "change the database password of")
 	}
 	keys, err := e.loadKeys(ctx, ref)
 	if err != nil {
 		return err
 	}
-	cp, ok := e.plane.(configPlane)
+	cp, ok := e.plane.(ConfigPlane)
 	if !ok {
 		return ErrNotSupported
 	}

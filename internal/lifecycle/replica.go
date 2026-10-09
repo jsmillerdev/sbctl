@@ -216,12 +216,9 @@ func replicaRESTURI(password string, replicaPort, primaryPort int) string {
 // daemon calls it while it wires the cluster features, before any request is served.
 func (pl *PostgresPlane) SetRestoreCommand(f func(ref string) string) { pl.opts.RestoreCommandFor = f }
 
-func (pl *PostgresPlane) replicaReadyTimeout() time.Duration {
-	if pl.opts.ReplicaReadyTimeout > 0 {
-		return pl.opts.ReplicaReadyTimeout
-	}
-	return 10 * time.Minute
-}
+// replicaReadyTimeout bounds the start of a standby until it accepts connections: it may replay a
+// backlog of archived WAL first.
+const replicaReadyTimeout = 10 * time.Minute
 
 // StartReplicaDatabase starts the standby's cluster (restarting it when its settings changed) and
 // waits until it accepts connections, which a hot standby does once it is consistent.
@@ -246,7 +243,7 @@ func (pl *PostgresPlane) StartReplicaDatabase(ctx context.Context, t ReplicaTarg
 			return err
 		}
 	}
-	return pl.startCluster(ctx, spec, pp, pl.replicaReadyTimeout())
+	return pl.startCluster(ctx, spec, pp, replicaReadyTimeout)
 }
 
 // StartReplicaAPI starts the replica's PostgREST (restarting it when its settings changed) and
