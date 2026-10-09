@@ -1,12 +1,11 @@
-//go:build unix
-
 package artifacts
 
 import (
 	"io/fs"
 	"os"
 	"path/filepath"
-	"syscall"
+
+	"github.com/supavise/supavise/internal/fsutil"
 )
 
 // handOver gives a freshly unpacked tree to the owner of the state directory when root
@@ -17,18 +16,14 @@ func handOver(tree, stateDir string) error {
 	if os.Geteuid() != 0 {
 		return nil
 	}
-	fi, err := os.Stat(stateDir)
-	if err != nil {
-		return nil // no state directory to take an owner from
-	}
-	st, ok := fi.Sys().(*syscall.Stat_t)
-	if !ok || st.Uid == 0 {
+	uid, gid, ok := fsutil.OwnerOf(stateDir) // not ok: no state directory to take an owner from
+	if !ok || uid == 0 {
 		return nil
 	}
 	return filepath.WalkDir(tree, func(p string, _ fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
-		return os.Lchown(p, int(st.Uid), int(st.Gid))
+		return os.Lchown(p, uid, gid)
 	})
 }

@@ -144,7 +144,7 @@ func (p Project) Effective(svc string, node map[string]string) string {
 
 // Active reports whether the project's services run (and so can be backed up and upgraded).
 func (p Project) Active() bool {
-	return p.Status == string(registry.StatusActiveHealthy) || p.Status == string(registry.StatusActiveUnhealthy)
+	return registry.Status(p.Status).Running()
 }
 
 // ProjectsOf converts registry rows, the system project included. newestBackup gives the end

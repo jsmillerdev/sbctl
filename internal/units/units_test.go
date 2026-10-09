@@ -15,6 +15,7 @@ import (
 
 	"github.com/supavise/supavise/deploy/systemd"
 	"github.com/supavise/supavise/internal/config"
+	"github.com/supavise/supavise/internal/procutil"
 )
 
 func TestEnvRoundTrip(t *testing.T) {
@@ -265,7 +266,7 @@ func TestExecBackendLifecycle(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitState(t, e, unit, StateInactive)
-	if pidAlive(pid) {
+	if procutil.Alive(pid) {
 		t.Fatal("main process survived Stop")
 	}
 	// The background sleeps shared the process group and must be gone too.
@@ -320,7 +321,7 @@ func TestExecKillsStubbornProcess(t *testing.T) {
 	if err := e.Stop(ctx, spec.Unit()); err != nil {
 		t.Fatal(err)
 	}
-	if pidAlive(st.MainPID) {
+	if procutil.Alive(st.MainPID) {
 		t.Fatal("SIGKILL fallback did not run")
 	}
 }
@@ -371,7 +372,7 @@ func TestExecAcrossProcesses(t *testing.T) {
 	if err := e2.Stop(ctx, spec.Unit()); err != nil {
 		t.Fatal(err)
 	}
-	if pidAlive(st.MainPID) {
+	if procutil.Alive(st.MainPID) {
 		t.Fatal("not stopped")
 	}
 }

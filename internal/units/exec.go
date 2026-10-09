@@ -6,7 +6,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -20,6 +19,7 @@ import (
 	"time"
 
 	"github.com/supavise/supavise/internal/config"
+	"github.com/supavise/supavise/internal/procutil"
 )
 
 // Exec is the development and test Supervisor: it runs each unit's launcher as a
@@ -223,16 +223,16 @@ func (e *Exec) reapGroup(pgid int) {
 func (e *Exec) waitGone(ctx context.Context, pid int, d time.Duration) bool {
 	deadline := time.Now().Add(d)
 	for time.Now().Before(deadline) {
-		if !pidAlive(pid) {
+		if !procutil.Alive(pid) {
 			return true
 		}
 		select {
 		case <-ctx.Done():
-			return !pidAlive(pid)
+			return !procutil.Alive(pid)
 		case <-time.After(50 * time.Millisecond):
 		}
 	}
-	return !pidAlive(pid)
+	return !procutil.Alive(pid)
 }
 
 // Status implements Supervisor. A pid file whose process has gone means the unit
@@ -279,7 +279,7 @@ func (e *Exec) running(unit string) (*pidRecord, bool) {
 	if json.Unmarshal(b, &rec) != nil || rec.PID <= 0 {
 		return nil, false
 	}
-	if !pidAlive(rec.PID) {
+	if !procutil.Alive(rec.PID) {
 		return &rec, false
 	}
 	if rec.Started != "" && processStart(rec.PID) != rec.Started {
@@ -301,11 +301,6 @@ func (e *Exec) tail(unit string, n int) string {
 		lines = lines[len(lines)-n:]
 	}
 	return strings.Join(lines, "\n")
-}
-
-func pidAlive(pid int) bool {
-	err := syscall.Kill(pid, 0)
-	return err == nil || errors.Is(err, syscall.EPERM)
 }
 
 // processStart returns ps's start time string of pid, "" if it cannot be read.

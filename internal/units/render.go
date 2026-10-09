@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/supavise/supavise/internal/config"
+	"github.com/supavise/supavise/internal/fsutil"
 )
 
 // Files are the paths Render owns for one unit.
@@ -206,26 +207,7 @@ func writeIfChanged(path string, b []byte, mode os.FileMode) (bool, error) {
 			return false, nil
 		}
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
-		return false, err
-	}
-	tmp, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".")
-	if err != nil {
-		return false, err
-	}
-	defer os.Remove(tmp.Name())
-	if err := tmp.Chmod(mode); err != nil {
-		tmp.Close()
-		return false, err
-	}
-	if _, err := tmp.Write(b); err != nil {
-		tmp.Close()
-		return false, err
-	}
-	if err := tmp.Close(); err != nil {
-		return false, err
-	}
-	return true, os.Rename(tmp.Name(), path)
+	return true, fsutil.WriteFile(path, b, mode, fsutil.Options{MkdirMode: 0o750})
 }
 
 // renderFiles writes the env file and run script for s and reports whether either changed.

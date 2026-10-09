@@ -47,6 +47,9 @@ func refused(format string, a ...any) error {
 // change set and waits for the operator to type apply.
 var ErrAWSUnattended = errors.New("--aws changes the AWS stack with your credentials and asks you to confirm it: it cannot run with --unattended")
 
+// backupParallel bounds the base backups taken at once.
+const backupParallel = 3
+
 // Phases written to the upgrade marker (<state_dir>/system/upgrade.json), which `supavise status`
 // and the dashboard banner read. The last four end the upgrade.
 const (
@@ -169,8 +172,6 @@ type Options struct {
 	StackSets []string
 	// Canary, Batch and Keep are the [upgrade] settings.
 	Canary, Batch, Keep int
-	// BackupParallel bounds the base backups taken at once (default 3).
-	BackupParallel int
 	// VerifyTimeout is how long the node has to report a verdict no worse than before the
 	// upgrade (default 5 minutes); VerifyEvery is the polling interval (default 10 seconds).
 	VerifyTimeout, VerifyEvery time.Duration
@@ -386,11 +387,7 @@ func (r *run) apply(ctx context.Context, staged *Staged) error {
 	if refs := BackupRefs(node); len(refs) > 0 {
 		r.mark(PhasePreparing, fmt.Sprintf("backing up %d project(s)", len(refs)))
 		o.say("taking a base backup of %d project(s) (the projects keep running)", len(refs))
-		par := o.BackupParallel
-		if par <= 0 {
-			par = 3
-		}
-		if err := h.Backup(ctx, refs, par); err != nil {
+		if err := h.Backup(ctx, refs, backupParallel); err != nil {
 			return r.endRefused(ctx, fmt.Errorf("the base backups failed: %w; nothing was stopped or changed", err))
 		}
 	}

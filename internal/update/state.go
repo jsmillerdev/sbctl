@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/supavise/supavise/internal/fsutil"
 )
 
 // State is what `supavise update run` remembers between runs, as JSON in StatePath.
@@ -140,7 +142,7 @@ func (s Store) checkDir() error {
 	if !fi.IsDir() { // Lstat: a symlink to a directory is not a directory here
 		return fmt.Errorf("%s is not a plain directory (a symlink?); remove it", dir)
 	}
-	if owner, ok := ownerOf(fi); ok && owner != os.Geteuid() {
+	if owner, _, ok := fsutil.OwnerOf(dir); ok && owner != os.Geteuid() {
 		return fmt.Errorf("%s is owned by uid %d, not by uid %d that runs the update: refusing to trust it", dir, owner, os.Geteuid())
 	}
 	if fi.Mode().Perm()&0o022 != 0 {
@@ -174,33 +176,13 @@ func (s Store) Load() (State, error) {
 
 // Save writes st atomically.
 func (s Store) Save(st State) error {
-	b, err := json.MarshalIndent(st, "", "  ")
-	if err != nil {
-		return err
-	}
 	if err := s.ensureDir(); err != nil {
 		return err
 	}
 	if err := s.checkDir(); err != nil {
 		return err
 	}
-	tmp, err := os.CreateTemp(filepath.Dir(s.Path), ".state-*")
-	if err != nil {
-		return err
-	}
-	defer os.Remove(tmp.Name())
-	if _, err := tmp.Write(append(b, '\n')); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Chmod(0o644); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	return os.Rename(tmp.Name(), s.Path)
+	return fsutil.WriteJSON(s.Path, st, 0o644, fsutil.Options{})
 }
 
 // ErrBusy means another `supavise update run` holds the lock.

@@ -11,6 +11,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/supavise/supavise/internal/fsutil"
 )
 
 // MarkerName is the file converge writes into the state directory when it has completed.
@@ -85,26 +87,7 @@ func WriteMarker(stateDir string, m Marker) error {
 	if !m.At.IsZero() {
 		fmt.Fprintf(&b, "at=%s\n", m.At.UTC().Format(time.RFC3339))
 	}
-	if err := os.MkdirAll(stateDir, 0o750); err != nil {
-		return err
-	}
-	tmp, err := os.CreateTemp(stateDir, "."+MarkerName+".tmp-")
-	if err != nil {
-		return err
-	}
-	defer os.Remove(tmp.Name())
-	if err := tmp.Chmod(0o644); err != nil {
-		tmp.Close()
-		return err
-	}
-	if _, err := tmp.WriteString(b.String()); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	return os.Rename(tmp.Name(), MarkerPath(stateDir))
+	return fsutil.WriteFile(MarkerPath(stateDir), []byte(b.String()), 0o644, fsutil.Options{MkdirMode: 0o750})
 }
 
 // Status is a node's converge state against this binary's revision.
