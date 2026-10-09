@@ -22,6 +22,11 @@ type API struct {
 	// DisableDeviceLogin turns off the `supabase login` browser flow (PATs created in
 	// the dashboard keep working).
 	DisableDeviceLogin bool `toml:"disable_device_login"`
+	// DisableOAuth turns off OAuth sign-in for MCP clients and everything that serves it: the
+	// authorization server's endpoints and discovery documents, the organization's OAuth Apps, and
+	// the remote MCP endpoint (api.<domain>/mcp). All of them then answer 404, and Studio is given
+	// no MCP URL. Personal access tokens and dashboard sessions are not affected.
+	DisableOAuth bool `toml:"disable_oauth"`
 	// AdminEmails is a comma-separated allowlist of dashboard users (matched on the
 	// session's email, case-insensitively) who may use the API even without the
 	// app_metadata.supavise_admin claim that supavise sets on the users it creates.
