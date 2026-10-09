@@ -366,6 +366,10 @@ ICONS = {
     "upgrade":   '<path d="M24 36V14"/><path d="M12 24L24 12L36 24"/><path stroke="none" fill="@" d="M8 38h32v6H8z"/>',
     "bucket":    '<ellipse cx="24" cy="12" rx="16" ry="6"/><path d="M8 12V36A16 6 0 0 0 40 36V12"/>'
                  '<path stroke="none" fill="@" d="M19 24h10v6H19z"/>',
+    "terminal":  '<rect x="4" y="8" width="40" height="32"/><path d="M12 18L19 24L12 30"/>'
+                 '<path stroke="none" fill="@" d="M24 28h12v4H24z"/>',
+    "plug":      '<path d="M18 4V14M30 4V14"/><path d="M12 14H36V24A12 12 0 0 1 12 24Z"/><path d="M24 36V44"/>'
+                 '<path stroke="none" fill="@" d="M20 20h8v6H20z"/>',
 }
 
 def icon(name, x, y, size, color):
@@ -378,6 +382,8 @@ FEATURES = [
     ("project", "Every project", "Postgres, Auth, REST, GraphQL, Realtime, Storage, Edge Functions and custom domains"),
     ("chip", "Compute sizes", "Nano to 16XL per project, like hosted, resized from the dashboard"),
     ("branch", "Branching", "Schema-only branches or full copies of your data, for previews and agents"),
+    ("terminal", "Supabase CLI", "Link, push migrations and manage branches, with a profile file"),
+    ("plug", "MCP for AI tools", "Claude Code, Cursor and VS Code sign in to your server's MCP endpoint with OAuth"),
     ("backup", "Backups", "Point-in-time restore from the dashboard, including Storage files"),
     ("bucket", "Storage on S3", "Move Storage's files to an S3 bucket in place, with a short pause for writes"),
     ("replica", "Read replicas", "A copy of a project on a second server, with its own API and pooler endpoints"),
