@@ -7,17 +7,11 @@ import (
 	"log/slog"
 	"regexp"
 	"strings"
-	"time"
 
 	"github.com/supavise/supavise/internal/alerts"
 	"github.com/supavise/supavise/internal/config"
 	"github.com/supavise/supavise/internal/nodeupgrade"
 )
-
-// upgradeAlertTimeout bounds one delivery. A webhook is retried once after two seconds and SMTP can
-// take 40 seconds; the upgrade does not wait longer than this for an alert, and a lost alert is
-// logged, never an error of the upgrade.
-const upgradeAlertTimeout = 90 * time.Second
 
 // upgradeNotifier returns the Notify hook of `supavise upgrade` and `supavise rollback`. They run
 // outside the daemon (as root, from a terminal or from supavise-upgrade.service), so they build a
@@ -38,10 +32,8 @@ func upgradeNotifier(cfg *config.Config, log *slog.Logger) func(context.Context,
 func unattendedNotifier(cfg *config.Config, log *slog.Logger) func(context.Context, string, string) {
 	n := alerts.New(cfg, alerts.Options{Log: log})
 	return func(ctx context.Context, title, detail string) {
-		ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), upgradeAlertTimeout)
-		defer cancel()
 		ev := alerts.Event{Kind: alerts.KindUpgradeFailed, Severity: alerts.SeverityCritical, Title: title, Detail: detail}
-		if err := n.Notify(ctx, ev); err != nil {
+		if err := n.NotifyBounded(ctx, ev); err != nil {
 			log.Warn("could not send the upgrade alert", "event", "unattended", "error", err)
 		}
 	}
@@ -49,10 +41,9 @@ func unattendedNotifier(cfg *config.Config, log *slog.Logger) func(context.Conte
 
 func notifyWith(n *alerts.Notifier, log *slog.Logger) func(context.Context, nodeupgrade.Event) {
 	return func(ctx context.Context, ev nodeupgrade.Event) {
-		// A SIGTERM that stops the upgrade must not also drop the message that says why.
-		ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), upgradeAlertTimeout)
-		defer cancel()
-		if err := n.Notify(ctx, upgradeAlert(ev)); err != nil {
+		// A SIGTERM that stops the upgrade must not also drop the message that says why; the upgrade
+		// does not wait longer than NotifyBounded's 90 seconds for an alert.
+		if err := n.NotifyBounded(ctx, upgradeAlert(ev)); err != nil {
 			log.Warn("could not send the upgrade alert", "event", ev.Kind, "error", err)
 		}
 	}
