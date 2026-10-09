@@ -310,7 +310,7 @@ An MCP client connects to `https://api.<domain>/mcp?project_ref=<ref>`, finds th
 
 ### 13.1 The authorization server
 
-The Management API is the authorization server. The issuer is `cfg.APIURL()` (which honors `[api] public_url`) and the MCP resource is `<issuer>/mcp`. The feature needs no new host name, process or required configuration key. The code is in `internal/oauth` (rules and stores) and `internal/api/oauth_*.go` (HTTP).
+The Management API is the authorization server. The issuer is `cfg.APIURL()` (which honors `[api] public_url`) and the MCP resource is `<issuer>/mcp`. The feature needs no extra host name, process or required configuration key. The code is in `internal/oauth` (rules and stores) and `internal/api/oauth_*.go` (HTTP).
 
 | Route | What it does |
 |---|---|
@@ -358,7 +358,7 @@ One placeholder, `NEXT_PUBLIC_MCP_URL`, carries the URL into Connect > MCP (`req
 
 ### 13.6 Operations
 
-- **Audit and alerts.** Each state change writes an `oauth.*` event; payloads carry ids, the organization slug, the user id, a sanitized client name, the redirect host and scopes, and never a token, code, secret, `state` or challenge. A code or refresh-token replay raises one `oauth_token_reuse` alert per grant.
+- **Audit and alerts.** Each state change writes an `oauth.*` event; payloads carry ids, the organization slug, the user id, a sanitized client name, the redirect host and scopes, and no token, code, secret, `state` or challenge. A code or refresh-token replay raises one `oauth_token_reuse` alert per grant.
 - **Limits** (in memory, per node): 100 registrations per 10 minutes and 5,000 stored dynamic apps; 60 authorize requests per minute, 25 pending per app and 10,000 pending in all; 30 token or revoke failures per minute; 600 `/mcp` requests per minute and 8 in flight per principal. Every 429 carries `Retry-After`.
 - **Pruning.** The register and token handlers prune old authorizations, tokens, revoked grants and unused dynamic apps, at most once per 10 minutes per node.
 - **Rollback.** Migration 1350 adds five tables and changes none. Because the registry holds a migration an older release does not know, `supavise rollback` refuses until the system cluster is restored from its pre-upgrade backup (`deploy/README.md`). An older binary does not read OAuth tokens as personal access tokens, since they are not in `access_tokens`.
@@ -369,10 +369,10 @@ One placeholder, `NEXT_PUBLIC_MCP_URL`, carries the URL into Connect > MCP (`req
 |---|---|---|---|
 | PKCE | S256 and `plain` | S256 only | `plain` does not meet the MCP authorization rules |
 | Grant types | adds `jwt-bearer` | not supported | beta, and tied to higher plans |
-| Discovery hosts | an MCP host and an API host | one host | no new DNS name |
+| Discovery hosts | an MCP host and an API host | one host | no extra DNS name |
 | `revocation_endpoint` | not advertised | advertised | clients can revoke on sign-out |
 | Dynamic app logo | probably shown | never returned | a self-asserted logo spoofs the consent page |
-| Public clients | a secret is always issued | a dynamic app may omit its secret when its PKCE verifier is right | tolerates clients that registered `none` |
+| Public clients | a secret is issued even to a `none` client | a dynamic app may omit its secret when its PKCE verifier is right | tolerates clients that registered `none` |
 | CORS | echoes the origin, with credentials | `*`, no credentials | cannot leak cookies |
 | `scope` at authorize | deprecated | honored, narrowing only | least privilege |
 | `skip_elicitations` | works | accepted and ignored | stateless transport |
