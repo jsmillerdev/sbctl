@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -210,7 +211,7 @@ func TestPlacementCacheIsSwept(t *testing.T) {
 	az := &Authorizer{Cfg: cfg, Topology: regTopo{reg, "n1"}, Source: reg, Now: func() time.Time { mu.Lock(); defer mu.Unlock(); return now }}
 	ask := func(from, to int) {
 		for i := from; i < to; i++ {
-			_, _ = az.place(context.Background(), fmt.Sprintf("%020d", i))
+			_, _ = az.place(context.Background(), fmt.Sprintf("%020d", i), false)
 		}
 	}
 	size := func() int {
@@ -225,5 +226,113 @@ func TestPlacementCacheIsSwept(t *testing.T) {
 	ask(300, 600)
 	if n := size(); n > 300 {
 		t.Fatalf("%d placements kept after 600 refs, the first 300 long expired", n)
+	}
+}
+
+// slowSource counts the registry reads of the authorizer and holds GetProject until release is
+// closed, so that concurrent callers overlap.
+type slowSource struct {
+	Source
+	gets, lists atomic.Int32
+	release     chan struct{}
+}
+
+func (s *slowSource) GetProject(ctx context.Context, ref string) (*registry.Project, error) {
+	s.gets.Add(1)
+	<-s.release
+	if err := ctx.Err(); err != nil { // a read that belongs to a caller that left fails, as a real one would
+		return nil, err
+	}
+	return s.Source.GetProject(ctx, ref)
+}
+
+func (s *slowSource) ListReplicas(ctx context.Context, ref string) ([]registry.Replica, error) {
+	s.lists.Add(1)
+	return s.Source.ListReplicas(ctx, ref)
+}
+
+// Streams that ask for a ref the authorizer does not remember at the same moment share one registry
+// read, and replicas are read only for the replica kinds.
+func TestPlacementSharesReadsAndFetchesReplicasOnlyForReplicaKinds(t *testing.T) {
+	reg, cfg := authzFixture(t)
+	src := &slowSource{Source: reg, release: make(chan struct{})}
+	az := &Authorizer{Cfg: cfg, Topology: regTopo{reg, "n2"}, Source: src}
+	active := Peer{Node: "n1", State: registry.NodeActive}
+	resolve := func(k Kind) error {
+		_, err := az.Resolve(context.Background(), active, Header{T: StreamForward, Kind: k, Ref: refB})
+		return err
+	}
+
+	var wg sync.WaitGroup
+	for range 20 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := resolve(KindPostgres); err != nil {
+				t.Errorf("resolve: %v", err)
+			}
+		}()
+	}
+	time.Sleep(100 * time.Millisecond)
+	close(src.release)
+	wg.Wait()
+	if g, l := src.gets.Load(), src.lists.Load(); g != 1 || l != 0 {
+		t.Fatalf("twenty simultaneous streams of a project kind: %d project reads and %d replica reads, want 1 and 0", g, l)
+	}
+	if err := resolve(KindGoTrue); err != nil || src.gets.Load() != 1 {
+		t.Fatalf("a second kind of the same project: %v, %d project reads", err, src.gets.Load())
+	}
+
+	// The replica kinds need the replicas, which the remembered placement lacks: one more read of
+	// both, and then the placement serves every kind.
+	if err := resolve(KindReplicaPostgres); err == nil {
+		t.Fatal("a replica of a project that has none here was admitted")
+	}
+	if g, l := src.gets.Load(), src.lists.Load(); g != 2 || l != 1 {
+		t.Fatalf("after a replica kind: %d project reads and %d replica reads, want 2 and 1", g, l)
+	}
+	_ = resolve(KindReplicaPostgREST)
+	_ = resolve(KindPostgres)
+	if g, l := src.gets.Load(), src.lists.Load(); g != 2 || l != 1 {
+		t.Fatalf("a remembered placement was read again: %d project reads and %d replica reads", g, l)
+	}
+}
+
+// The registry read belongs to every caller that waits for it: the stream that started it giving up
+// neither fails the others nor leaves an error in the cache, and that stream itself returns at once.
+func TestPlacementACallerThatLeavesDoesNotFailTheOthers(t *testing.T) {
+	reg, cfg := authzFixture(t)
+	src := &slowSource{Source: reg, release: make(chan struct{})}
+	az := &Authorizer{Cfg: cfg, Topology: regTopo{reg, "n2"}, Source: src}
+	first, leave := context.WithCancel(context.Background())
+	firstDone := make(chan error, 1)
+	go func() { _, err := az.place(first, refB, false); firstDone <- err }()
+	eventually(t, "the registry read to start", func() bool { return src.gets.Load() == 1 })
+	secondDone := make(chan error, 1)
+	go func() { _, err := az.place(context.Background(), refB, false); secondDone <- err }()
+	time.Sleep(50 * time.Millisecond) // the second caller joins the read in progress
+	leave()
+	select {
+	case err := <-firstDone:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("the caller that left: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the caller that left is still waiting for the read")
+	}
+	close(src.release)
+	select {
+	case err := <-secondDone:
+		if err != nil {
+			t.Fatalf("the caller that stayed: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the caller that stayed got no answer")
+	}
+	if n := src.gets.Load(); n != 1 {
+		t.Fatalf("%d project reads, want the one the callers shared", n)
+	}
+	if _, err := az.place(context.Background(), refB, false); err != nil || src.gets.Load() != 1 {
+		t.Fatalf("the placement was not remembered: %v, %d reads", err, src.gets.Load())
 	}
 }

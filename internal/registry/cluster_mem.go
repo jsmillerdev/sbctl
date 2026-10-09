@@ -55,7 +55,7 @@ func (m *Memory) CreateNode(_ context.Context, n *Node) error {
 		}
 		id = "n" + strconv.Itoa(next)
 	}
-	if !nodeIDRe.MatchString(id) {
+	if !ValidNodeID(id) {
 		return fmt.Errorf("registry: node id %q must be n and a number", id)
 	}
 	if n.State == "" {

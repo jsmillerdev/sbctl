@@ -1,6 +1,7 @@
 package health
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -201,11 +202,11 @@ func (d *Deps) checkUpdate() Component {
 		c.Detail = "no check has run yet"
 	case rec.Available:
 		c.State = Info
-		c.Detail = fmt.Sprintf("%s is available (running %s); see `supavise upgrade --check`", rec.Latest, firstNonEmpty(rec.Installed, d.Version))
+		c.Detail = fmt.Sprintf("%s is available (running %s); see `supavise upgrade --check`", rec.Latest, cmp.Or(rec.Installed, d.Version))
 	case rec.Error != "":
 		c.State, c.Detail = Info, "the last check failed: "+shorten(rec.Error)
 	default:
-		c.Detail = fmt.Sprintf("%s is the latest release (checked %s ago)", firstNonEmpty(rec.Latest, "this version"), humanAge(d.now().Sub(rec.CheckedAt)))
+		c.Detail = fmt.Sprintf("%s is the latest release (checked %s ago)", cmp.Or(rec.Latest, "this version"), humanAge(d.now().Sub(rec.CheckedAt)))
 	}
 	return c
 }

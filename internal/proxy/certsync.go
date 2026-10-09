@@ -21,6 +21,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/supavise/supavise/internal/fsutil"
 	"github.com/supavise/supavise/internal/mesh"
 	"github.com/supavise/supavise/internal/mesh/peerapi"
 )
@@ -182,17 +183,17 @@ func CertsHandler(dir string, leader func() bool, log *slog.Logger) mesh.Handler
 	}
 	return func(w http.ResponseWriter, r *http.Request) {
 		if p, ok := mesh.PeerFrom(r.Context()); !ok || p.Node == "" {
-			writePeerError(w, http.StatusForbidden, "forbidden", "the certificate store is for the nodes of the cluster")
+			mesh.RespondError(w, http.StatusForbidden, "forbidden", "the certificate store is for the nodes of the cluster")
 			return
 		}
 		if !leader() {
-			writePeerError(w, http.StatusConflict, "not_leader", "this node is not the leader")
+			mesh.RespondError(w, http.StatusConflict, "not_leader", "this node is not the leader")
 			return
 		}
 		files, err := readCertStore(dir, log)
 		if err != nil {
 			log.Error("proxy: reading the certificate store for a peer", "err", err)
-			writePeerError(w, http.StatusInternalServerError, "", "the certificate store cannot be read")
+			mesh.RespondError(w, http.StatusInternalServerError, "", "the certificate store cannot be read")
 			return
 		}
 		snap := peerapi.CertSnapshot{Files: files}
@@ -205,12 +206,6 @@ func CertsHandler(dir string, leader func() bool, log *slog.Logger) mesh.Handler
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(snap)
 	}
-}
-
-func writePeerError(w http.ResponseWriter, status int, code, msg string) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(peerapi.Error{Message: msg, Code: code})
 }
 
 // readCertStore lists the mirrored files under dir. A site (certificates/<issuer>/<site>/) whose
@@ -440,26 +435,7 @@ func writeIfChanged(p string, data []byte) error {
 	if cur, err := os.ReadFile(p); err == nil && bytes.Equal(cur, data) {
 		return nil
 	}
-	if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
-		return err
-	}
-	f, err := os.CreateTemp(filepath.Dir(p), ".mirror-*")
-	if err != nil {
-		return err
-	}
-	defer os.Remove(f.Name())
-	if err := f.Chmod(0o600); err != nil {
-		f.Close()
-		return err
-	}
-	if _, err := f.Write(data); err != nil {
-		f.Close()
-		return err
-	}
-	if err := f.Close(); err != nil {
-		return err
-	}
-	return os.Rename(f.Name(), p)
+	return fsutil.WriteFile(p, data, 0o600, fsutil.Options{MkdirMode: 0o700})
 }
 
 // certMirror copies the leader's store into the local one, once a minute and when asked.
@@ -468,8 +444,9 @@ type certMirror struct {
 	src      CertSource
 	interval time.Duration
 	log      *slog.Logger
-	// onSnapshot is told of the store after every fetch that reached the leader and brought files,
-	// changed or not, and once at the start of run of what the node already holds on disk.
+	// onSnapshot is told of the store after every fetch that brought files, and once at the start of
+	// run of what the node already holds on disk. A fetch the leader answers with "not modified" tells
+	// it again only while the snapshot is not fully applied (see applied).
 	onSnapshot func(ctx context.Context, snap peerapi.CertSnapshot)
 	poke       chan struct{}
 	// pokeGap is the least time between two fetches that pokes ask for.
@@ -483,6 +460,10 @@ type certMirror struct {
 	shown   peerapi.CertSnapshot
 	carried map[string]bool
 	have    bool
+	// applied is the tag of the fetched snapshot once it is on disk and onSnapshot has been told, with
+	// no file carried over: the disk then holds the snapshot as it is, and a "not modified" answer has
+	// nothing left to do.
+	applied string
 }
 
 // pokeEvery is the least time between two fetches that a handshake for an unknown name asks for.
@@ -508,7 +489,7 @@ func (m *certMirror) wake() {
 // disk. A node does it before it mirrors again, because it may have written its own files while it led.
 func (m *certMirror) reset() {
 	m.mu.Lock()
-	m.tag, m.fetched, m.shown, m.carried, m.have = "", peerapi.CertSnapshot{}, peerapi.CertSnapshot{}, nil, false
+	m.tag, m.fetched, m.shown, m.carried, m.have, m.applied = "", peerapi.CertSnapshot{}, peerapi.CertSnapshot{}, nil, false, ""
 	m.mu.Unlock()
 }
 
@@ -578,17 +559,26 @@ func (m *certMirror) sync(ctx context.Context) error {
 	defer m.mu.Unlock()
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
-	snap, err := m.src.Certs(ctx, m.tag)
+	tag := m.tag
+	if !m.have {
+		// Nothing is applied yet. The tag may name a snapshot that was fetched and could not be written;
+		// asking for it by tag would be answered with "not modified" for ever, so ask for the whole store.
+		tag = ""
+	}
+	snap, err := m.src.Certs(ctx, tag)
 	switch {
 	case errors.Is(err, ErrCertsNotModified):
 		if !m.have {
 			return errors.New("the leader answered not modified to a request without a tag")
 		}
+		if m.applied == m.tag && len(m.carried) == 0 {
+			return nil // what the disk and the cache hold is this snapshot
+		}
 		snap = m.fetched
 	case err != nil:
 		return err
 	default:
-		m.fetched, m.tag = snap, snapshotTag(snap)
+		m.fetched, m.tag, m.applied = snap, snapshotTag(snap), ""
 	}
 	if len(snap.Files) == 0 {
 		// A leader that has issued nothing yet: applySnapshot would change nothing on disk, so the
@@ -603,6 +593,9 @@ func (m *certMirror) sync(ctx context.Context) error {
 	m.shown, m.have = shown, true
 	if m.onSnapshot != nil {
 		m.onSnapshot(ctx, shown)
+	}
+	if len(m.carried) == 0 {
+		m.applied = m.tag
 	}
 	return nil
 }

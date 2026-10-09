@@ -485,17 +485,7 @@ func startCluster(ctx context.Context, w *Wire, boot cluster.BootDecision, dir s
 		if ok {
 			leader = l.ID
 		}
-		verdict := string(health.Healthy)
-		if monitor != nil {
-			pctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-			defer cancel()
-			if r, err := monitor.Report(pctx); err != nil {
-				verdict = string(health.Degraded)
-			} else {
-				verdict = string(r.Verdict)
-			}
-		}
-		return peerapi.Ping{Node: selfID, Epoch: epoch, Leader: leader, Version: w.Options.Version, Schema: schema.get(), Health: verdict}
+		return peerapi.Ping{Node: selfID, Epoch: epoch, Leader: leader, Version: w.Options.Version, Schema: schema.get(), Health: string(pingVerdict(monitor))}
 	}
 	registerPeerAPI(&cluster.PeerAPI{Authority: auth, Topology: live, Cfg: cfg, Reports: reports, Ping: ping}, mesh.Handle, peerAPIServedByOthers...)
 
@@ -648,9 +638,28 @@ func (s *skewState) changed(node string, skewed bool) bool {
 	return true
 }
 
+// pingVerdict is the health a ping reports. A peer pings every few seconds, so it answers from the last
+// report when one is recent (the alert checker refreshes it every [alerts] check_interval_seconds, 60 by
+// default) and runs a check, as the monitor does for any caller, only when there is none or it is too old.
+func pingVerdict(monitor *health.Monitor) health.Verdict {
+	if monitor == nil {
+		return health.Healthy
+	}
+	if r, ok := monitor.Last(); ok {
+		return r.Verdict
+	}
+	pctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	r, err := monitor.Report(pctx)
+	if err != nil {
+		return health.Degraded
+	}
+	return r.Verdict
+}
+
 // peerSeen records what a ping says about a peer. Every node raises node_version_skew while the peer's
 // release is outside the window; the leader also keeps the peer's version in its row.
-func peerSeen(ctx context.Context, reg registry.Registry, live *cluster.Live, skews *skewState, version, node string, p peerapi.Ping, log *slog.Logger) {
+func peerSeen(ctx context.Context, reg registry.Registry, live cluster.Membership, skews *skewState, version, node string, p peerapi.Ping, log *slog.Logger) {
 	err := cluster.CheckVersionWindow(version, p.Version, nil, nil)
 	if skews.changed(node, err != nil) {
 		ev := alerts.Event{Kind: alerts.KindNodeVersionSkew, Title: "A node runs a release outside the window", Key: "version_skew/" + node}
@@ -662,15 +671,28 @@ func peerSeen(ctx context.Context, reg registry.Registry, live *cluster.Live, sk
 		}
 		_ = alerts.Notify(ctx, ev)
 	}
-	if !live.IsLeader() || p.Version == "" {
+	if !live.IsLeader() || p.Version == "" || nodeRunsVersion(live.Nodes(), node, p.Version) {
 		return
 	}
+	// The membership snapshot differs from the ping (or is behind the registry): the row is read, and
+	// written only if it does differ.
 	if n, err := reg.GetNode(ctx, node); err == nil && n.Version != p.Version {
 		n.Version = p.Version
 		if err := reg.UpdateNode(ctx, n); err != nil {
 			log.Debug("a node's version was not recorded", "node", node, "error", err)
 		}
 	}
+}
+
+// nodeRunsVersion reports whether the membership snapshot already holds version for the node, so that
+// a ping that repeats it costs no registry read.
+func nodeRunsVersion(nodes []registry.Node, id, version string) bool {
+	for _, n := range nodes {
+		if n.ID == id {
+			return n.Version == version
+		}
+	}
+	return false
 }
 
 // schemaCache holds the registry migrations the node's database has applied, for the ping, and

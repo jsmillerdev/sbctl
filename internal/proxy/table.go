@@ -297,7 +297,7 @@ func (t *table) listReplicas(ctx context.Context) (map[string]registry.Replica, 
 	}
 	reps := make(map[string]registry.Replica, len(rows))
 	for _, r := range rows {
-		if routable(r.Ref) { // the standby of the system cluster has no endpoint
+		if !r.IsSystemStandby() { // the standby of the system cluster has no endpoint
 			reps[r.Identifier] = r
 		}
 	}
@@ -462,7 +462,7 @@ func (t *table) apply(ctx context.Context, c registry.Change) {
 			case err != nil:
 				t.log.Warn("proxy table: replica refresh failed, reloading", "replica", c.Key, "err", err)
 				t.reloadReplicas(ctx)
-			case routable(r.Ref):
+			case !r.IsSystemStandby():
 				t.mu.Lock()
 				t.replicas[r.Identifier] = *r
 				t.attachLocked(r.Ref)

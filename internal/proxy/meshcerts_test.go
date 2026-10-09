@@ -202,8 +202,8 @@ func TestMeshCertsAgainstTheRealMesh(t *testing.T) {
 	if tree(t, local)["certificates/"+issuer+"/api.example.com/api.example.com.crt"] != string(crtN) {
 		t.Error("a renewal did not reach the follower")
 	}
-	if told != 3 {
-		t.Errorf("onSnapshot was told %d times in three fetches", told)
+	if told != 2 {
+		t.Errorf("onSnapshot was told %d times in three fetches, want 2: the first and the renewal, not the 304", told)
 	}
 
 	// A node that is not the leader says so.

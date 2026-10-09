@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/supavise/supavise/internal/config"
+	"github.com/supavise/supavise/internal/fsutil"
 )
 
 // FencedRecord is the local memory of being fenced. A node that restarts while it cannot reach its
@@ -51,11 +52,7 @@ func ReadFenced(cfg *config.Config) (*FencedRecord, error) {
 
 // WriteFenced records that the node is fenced.
 func WriteFenced(cfg *config.Config, r FencedRecord) error {
-	b, err := json.MarshalIndent(r, "", "  ")
-	if err != nil {
-		return err
-	}
-	return writeFile(FencedPath(cfg), append(b, '\n'), 0o644)
+	return fsutil.WriteJSON(FencedPath(cfg), r, 0o644, writeOpts)
 }
 
 // ClearFenced removes the record; a node that has none is not an error.

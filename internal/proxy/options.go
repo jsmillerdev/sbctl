@@ -27,12 +27,6 @@ type Waker interface {
 	Start(ctx context.Context, ref string) error
 }
 
-// WakerFunc adapts a function to Waker.
-type WakerFunc func(ctx context.Context, ref string) error
-
-// Start calls f.
-func (f WakerFunc) Start(ctx context.Context, ref string) error { return f(ctx, ref) }
-
 type noopWaker struct{}
 
 func (noopWaker) Start(context.Context, string) error { return nil }

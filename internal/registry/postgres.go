@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -26,6 +27,9 @@ type Postgres struct {
 	// nanoseconds), so that a daemon that migrates the registry behind this handle is noticed
 	// within legacyReprobe without a query per call.
 	probedAt atomic.Int64
+	// poller serves the Subscribe calls of a read-only registry (see changePoller), made on the first.
+	pollerOnce sync.Once
+	poller     *changePoller
 }
 
 var (

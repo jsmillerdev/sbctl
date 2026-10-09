@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/supavise/supavise/internal/config"
+	"github.com/supavise/supavise/internal/fsutil"
 	"github.com/supavise/supavise/internal/mesh"
 )
 
@@ -78,18 +79,8 @@ func OpenStore(dir string) (*Store, error) {
 	return s, nil
 }
 
-// NewStore returns a Store that holds c and persists replacements under dir.
-func NewStore(dir string, c *mesh.Credentials) *Store {
-	s := &Store{dir: dir}
-	s.cur.Store(c)
-	return s
-}
-
 // Creds returns the current credentials; nil if the store holds none.
 func (s *Store) Creds() *mesh.Credentials { return s.cur.Load() }
-
-// Dir is the cluster directory.
-func (s *Store) Dir() string { return s.dir }
 
 // ErrIdentityReadOnly: the daemon cannot write to the cluster directory (the unit may not allow it),
 // so a renewed certificate could not be kept.
@@ -191,7 +182,7 @@ func SaveIdentity(dir string, key ed25519.PrivateKey, certDER, caDER []byte) err
 	if err != nil {
 		return err
 	}
-	if err := mkdirAllOwned(dir); err != nil {
+	if err := fsutil.MkdirAllOwned(dir, 0o750); err != nil {
 		return err
 	}
 	files := []struct {

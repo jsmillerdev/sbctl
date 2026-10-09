@@ -8,6 +8,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"golang.org/x/sync/singleflight"
+
 	"github.com/supavise/supavise/internal/config"
 	"github.com/supavise/supavise/internal/mesh/peerapi"
 	"github.com/supavise/supavise/internal/registry"
@@ -51,6 +53,7 @@ type Authorizer struct {
 
 	cache  sync.Map // ref -> *placement, kept for placementTTL
 	stored atomic.Int64
+	flight singleflight.Group // the registry reads in progress, by ref
 }
 
 // placementTTL is how long a project's home and replicas are remembered. A forward stream costs
@@ -62,7 +65,10 @@ type placement struct {
 	until    time.Time
 	project  registry.Project
 	replicas []registry.Replica
-	err      error
+	// haveReplicas says that replicas was read: only the replica kinds need them, so a placement
+	// made for another kind has none.
+	haveReplicas bool
+	err          error
 }
 
 func (a *Authorizer) now() time.Time {
@@ -72,30 +78,63 @@ func (a *Authorizer) now() time.Time {
 	return time.Now()
 }
 
-func (a *Authorizer) place(ctx context.Context, ref string) (*placement, error) {
+// placeTimeout bounds the registry read for a placement. The read is shared by everyone who asks for
+// the same ref while it runs, so it does not belong to the stream that started it.
+const placeTimeout = 15 * time.Second
+
+// place returns where ref lives. withReplicas asks for its replicas as well, which only the replica
+// kinds need. Concurrent calls for a ref that is not remembered share one registry read.
+func (a *Authorizer) place(ctx context.Context, ref string, withReplicas bool) (*placement, error) {
 	if v, ok := a.cache.Load(ref); ok {
-		if p := v.(*placement); a.now().Before(p.until) {
+		if p := v.(*placement); a.now().Before(p.until) && (p.haveReplicas || !withReplicas || p.err != nil) {
 			return p, p.err
 		}
 	}
+	key := ref
+	if withReplicas {
+		key += "+replicas"
+	}
+	ch := a.flight.DoChan(key, func() (any, error) {
+		lctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), placeTimeout)
+		defer cancel()
+		return a.load(lctx, ref, withReplicas)
+	})
+	select {
+	case res := <-ch:
+		if res.Err != nil {
+			return nil, res.Err
+		}
+		p := res.Val.(*placement)
+		return p, p.err
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+// load reads ref from the registry and remembers the answer. A registry error is returned and not
+// remembered: a hiccup is not a verdict.
+func (a *Authorizer) load(ctx context.Context, ref string, withReplicas bool) (*placement, error) {
 	p := &placement{until: a.now().Add(placementTTL)}
 	proj, err := a.Source.GetProject(ctx, ref)
 	switch {
 	case errors.Is(err, registry.ErrNotFound):
 		p.err = refuse("unknown project %s", ref)
 	case err != nil:
-		return nil, err // not cached: a registry hiccup is not a verdict
+		return nil, err
 	default:
 		p.project = *proj
-		if p.replicas, err = a.Source.ListReplicas(ctx, ref); err != nil {
-			return nil, err
+		if withReplicas {
+			if p.replicas, err = a.Source.ListReplicas(ctx, ref); err != nil {
+				return nil, err
+			}
+			p.haveReplicas = true
 		}
 	}
 	a.cache.Store(ref, p)
 	if a.stored.Add(1)%sweepEvery == 0 {
 		a.sweep()
 	}
-	return p, p.err
+	return p, nil
 }
 
 // sweepEvery is how many stored placements pass between looks for expired ones: an admitted peer that
@@ -141,7 +180,7 @@ func (a *Authorizer) Resolve(ctx context.Context, peer Peer, h Header) (int, err
 			return 0, refuse("%s runs on the leader, and node %s is not the leader", h.Kind, self)
 		}
 	default:
-		p, err := a.place(ctx, h.Ref)
+		p, err := a.place(ctx, h.Ref, h.Kind != KindPostgres && h.Kind != KindGoTrue && h.Kind != KindPostgREST)
 		if err != nil {
 			return 0, err
 		}
@@ -176,10 +215,9 @@ func hasReplicaOn(rs []registry.Replica, node string) bool {
 // rpcAllowed is the request policy of the peer server: which endpoints a caller may reach given
 // its state. A caller with no certificate reaches the join endpoint; a joining node confirms its
 // join (and asks again to rejoin, when an earlier rejoin stopped); a fenced node hears the ping, the
-// fence and the rejoin; an active node reaches every
-// endpoint, and the handler of an endpoint that only the leader may call checks the caller itself
-// (RequireLeader). The endpoints other workstreams register are not listed because they are for
-// active nodes.
+// fence and the rejoin; an active node reaches every endpoint. An endpoint that only the leader may
+// call checks the caller in its handler (RequireLeader is the shared check). The endpoints other
+// workstreams register are not listed because they are for active nodes.
 func rpcAllowed(p Peer, path string) (ok bool, why string) {
 	switch {
 	case p.Node == "":

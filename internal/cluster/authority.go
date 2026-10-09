@@ -2,7 +2,6 @@ package cluster
 
 import (
 	"context"
-	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/x509"
 	"encoding/base64"
@@ -468,7 +467,7 @@ func (a *Authority) systemBootstrap(ctx context.Context, node *registry.Node) (*
 func (a *Authority) removeJoining(ctx context.Context, id string) {
 	if rs, err := a.Reg.ListReplicasOn(ctx, id); err == nil {
 		for _, r := range rs {
-			if r.Ref == config.SystemRef {
+			if r.IsSystemStandby() {
 				_ = a.Reg.DeleteReplica(ctx, r.Identifier)
 			}
 		}
@@ -504,7 +503,7 @@ func (a *Authority) Confirm(ctx context.Context, caller string, c peerapi.JoinCo
 	}
 	if rs, err := a.Reg.ListReplicasOn(ctx, caller); err == nil {
 		for _, r := range rs {
-			if r.Ref == config.SystemRef && r.InitStep != registry.ReplicaStepDone {
+			if r.IsSystemStandby() && r.InitStep != registry.ReplicaStepDone {
 				_ = a.Reg.SetReplicaStatus(ctx, r.Identifier, string(registry.StatusActiveHealthy), registry.ReplicaStepDone, "")
 			}
 		}
@@ -570,22 +569,6 @@ func (a *Authority) Renew(ctx context.Context, caller string, req peerapi.CertRe
 	}
 	a.changed(ctx)
 	return &peerapi.CertRenewResponse{Cert: issued.PEM(), Serial: issued.Serial, NotAfter: issued.NotAfter}, nil
-}
-
-// SelfIssue gives the leader its own certificate for the public key pub and records the serial: a
-// leader does not ask itself.
-func (a *Authority) SelfIssue(ctx context.Context, nodeID string, pub ed25519.PublicKey) (*Issued, error) {
-	if err := a.needLeader(); err != nil {
-		return nil, err
-	}
-	issued, err := a.CA.Issue(pub, nodeID, a.now(), NodeCertTTL)
-	if err != nil {
-		return nil, err
-	}
-	if err := a.Reg.SetNodeCert(ctx, nodeID, issued.Serial); err != nil {
-		return nil, err
-	}
-	return issued, nil
 }
 
 // Rejoin lets a fenced node back in: its row goes to joining, its system replica row is kept (or
