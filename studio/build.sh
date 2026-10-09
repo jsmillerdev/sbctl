@@ -91,6 +91,9 @@ SHORT_SHA="${TAG##*-sha-}"
 COMMIT="${STUDIO_COMMIT:-$PINNED_COMMIT}"
 case "$COMMIT" in "$SHORT_SHA"*) ;; *) die "commit $COMMIT does not match internal/versions/versions.yaml studio.tag $TAG; update PINNED_COMMIT in studio/build.sh" ;; esac
 PATCHSET="$(tr -d '[:space:]' < "$HERE/PATCHSET")"
+# The binary names the build it runs from versions.yaml (studio.patchset); the asset must carry the same.
+PIN_PATCHSET="$(awk '/^studio:/{s=1;next} s&&/^[^ ]/{s=0} s&&/^[ ]+patchset:/{print $2; exit}' "$REPO/internal/versions/versions.yaml")"
+[[ "$PIN_PATCHSET" == "$PATCHSET" ]] || die "studio/PATCHSET is $PATCHSET and internal/versions/versions.yaml studio.patchset is ${PIN_PATCHSET:-missing}: change them together"
 ARTIFACT="supavise-studio-${TAG}-p${PATCHSET}-${PLATFORM}.tar.zst"
 
 WORK="${STUDIO_WORK:-$HERE/.build-cache/work-$PLATFORM}"

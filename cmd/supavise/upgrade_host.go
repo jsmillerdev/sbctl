@@ -23,6 +23,7 @@ import (
 
 	"golang.org/x/sync/errgroup"
 
+	"github.com/supavise/supavise/internal/artifacts"
 	"github.com/supavise/supavise/internal/backup"
 	"github.com/supavise/supavise/internal/config"
 	"github.com/supavise/supavise/internal/fleet"
@@ -77,8 +78,11 @@ type nodeHost struct {
 	maint *maintenanceHold
 	// follower is set by Inspect for a server of a cluster that does not lead: its registry is the
 	// leader's copy, which the commands the run starts as workers cannot open for writing.
-	follower  bool
-	from, to  string
+	follower bool
+	from, to string
+	// release is the verified release Resolve found. A run on the installed release stages no binary,
+	// and Prefetch takes the release's Studio archive from its signed list.
+	release   *selfupdate.Verified
 	started   time.Time
 	swappedAt time.Time
 	stageDir  string
@@ -126,16 +130,9 @@ func (h *nodeHost) asSupavise(ctx context.Context, stdout io.Writer, env []strin
 
 // asSupaviseTo is asSupavise with the worker's stderr sent to stderr.
 func (h *nodeHost) asSupaviseTo(ctx context.Context, stdout, stderr io.Writer, env []string, bin string, args ...string) error {
-	full := append([]string{bin, "--config", h.cfgPath}, args...)
-	c := exec.CommandContext(ctx, full[0], full[1:]...)
-	c.Env = append(os.Environ(), env...)
-	if h.root {
-		cred, err := h.superviseCredential()
-		if err != nil {
-			return err
-		}
-		c.SysProcAttr = &syscall.SysProcAttr{Credential: cred}
-		c.Env = append(os.Environ(), append([]string{"HOME=" + h.cfg.StateDir, "USER=" + installUser, "LOGNAME=" + installUser}, env...)...)
+	c, err := supaviseCommand(ctx, h.root, h.cfgPath, h.cfg.StateDir, env, bin, args...)
+	if err != nil {
+		return err
 	}
 	if stdout == nil {
 		stdout = h.out
@@ -151,8 +148,22 @@ func (h *nodeHost) asSupaviseTo(ctx context.Context, stdout, stderr io.Writer, e
 	return nil
 }
 
-// superviseCredential is the uid, gid and groups of the supavise user.
-func (h *nodeHost) superviseCredential() (*syscall.Credential, error) { return supaviseCredential() }
+// supaviseCommand is `bin --config cfgPath args...` with env added, run as the supavise user when
+// root (with that user's HOME, the state directory) and as the caller otherwise.
+func supaviseCommand(ctx context.Context, root bool, cfgPath, stateDir string, env []string, bin string, args ...string) (*exec.Cmd, error) {
+	full := append([]string{bin, "--config", cfgPath}, args...)
+	c := exec.CommandContext(ctx, full[0], full[1:]...)
+	c.Env = append(os.Environ(), env...)
+	if root {
+		cred, err := supaviseCredential()
+		if err != nil {
+			return nil, err
+		}
+		c.SysProcAttr = &syscall.SysProcAttr{Credential: cred}
+		c.Env = append(os.Environ(), append([]string{"HOME=" + stateDir, "USER=" + installUser, "LOGNAME=" + installUser}, env...)...)
+	}
+	return c, nil
+}
 
 // supaviseCredential is the uid, gid and groups of the supavise user.
 func supaviseCredential() (*syscall.Credential, error) {
@@ -421,7 +432,7 @@ func (h *nodeHost) Resolve(ctx context.Context, tag string, n *nodeupgrade.Node)
 			return nil, err
 		}
 	}
-	h.to = ver.Release.Tag
+	h.to, h.release = ver.Release.Tag, ver
 	return &nodeupgrade.Candidate{Tag: ver.Release.Tag, Data: &resolved{ver: ver, opts: o}}, nil
 }
 
@@ -489,14 +500,28 @@ func (h *nodeHost) Discard(s *nodeupgrade.Staged) {
 
 // Prefetch implements nodeupgrade.Host: the staged binary fetches the artifacts its release pins
 // that the node does not have, as the supavise user. It reads no registry and so migrates nothing.
+//
+// A run on the installed release stages no binary: the installed one fetches. When Studio moves
+// there (the binary pins a build its unit does not run yet, after a converge that could not fetch
+// it), the build comes from the release's own signed list, which Resolve verified with the options
+// of this run; a release that lists no archive of that build leaves the fetch to the build on disk
+// and config.toml, and a fetch that fails refuses the run before anything changed.
 func (h *nodeHost) Prefetch(ctx context.Context, s *nodeupgrade.Staged, n *nodeupgrade.Node, p *nodeupgrade.Plan) error {
 	bin, env := h.binPath, []string(nil)
 	studio := false
+	m, studioMoves := moved(p.Shared, config.SvcStudio)
 	if sd, ok := s.Data.(*staged); ok && sd != nil {
 		bin = sd.st.Path
-		if _, moves := moved(p.Shared, config.SvcStudio); moves && sd.studio.url != "" {
+		if studioMoves && sd.studio.url != "" {
 			studio = true
 			env = []string{"SUPAVISE_STUDIO_ARTIFACT_URL=" + sd.studio.url, "SUPAVISE_STUDIO_ARTIFACT_SHA256=" + sd.studio.sha}
+		}
+	} else if studioMoves {
+		studio = true
+		if h.release != nil && h.release.Release.Tag == n.Version {
+			if name, url, sha, ok := h.release.Studio(n.Platform); ok && name == artifacts.StudioAsset(m.To, n.Platform) {
+				env = []string{"SUPAVISE_STUDIO_ARTIFACT_URL=" + url, "SUPAVISE_STUDIO_ARTIFACT_SHA256=" + sha}
+			}
 		}
 	}
 	args := []string{"artifacts", "fetch"}
@@ -713,6 +738,13 @@ func (h *nodeHost) activate(ctx context.Context, converge bool) error {
 	return restartAndWait(ctx, h.cfg, h.wait)
 }
 
+// RestartDaemon implements nodeupgrade.DaemonRestarter: for a run on the installed release whose
+// services are behind it, the installed binary renders the units (`system install-units`, which is
+// converge on a release with a host layer, and whose Studio step makes config.toml name the build
+// Prefetch installed) and the daemon restarts, which moves the services. WaitShared then waits for
+// them as it does after a swap.
+func (h *nodeHost) RestartDaemon(ctx context.Context) error { return h.activate(ctx, false) }
+
 // Converge implements nodeupgrade.HostConverger: the host layer of the installed binary, for an
 // upgrade that does not swap the binary.
 func (h *nodeHost) Converge(ctx context.Context) error {
@@ -776,6 +808,11 @@ func (h *nodeHost) Restore(ctx context.Context, from string, rec nodeupgrade.Rec
 	}
 	if err := h.activate(ctx, false); err != nil {
 		return err
+	}
+	// The restored binary runs the Studio build it pins, from the directory it left (the GC keeps the
+	// kept releases' builds); config.toml names that build again, as it did before the upgrade.
+	if _, err := syncStudioConfigTo(h.cfg, h.cfgPath, stored.Pins[config.SvcStudio], h.out); err != nil {
+		fmt.Fprintf(h.errw, "warning: config.toml still names the dashboard build of %s: %v\n", from, err)
 	}
 	if err := h.rel.Touch(rec.Version, time.Now()); err != nil {
 		return err
@@ -856,10 +893,19 @@ func (h *nodeHost) waitService(ctx context.Context, sup units.Supervisor, mgr *f
 	if system {
 		unit = config.UnitName(m.Service, config.SystemRef)
 	}
+	// A follower parks the shared services but Supavisor (fleet.Parked): its daemon renders their
+	// units for the new release and keeps them stopped, so such a service has moved once its unit is
+	// set to run the new release. Waiting for it to run would wait the whole serviceWait and fail.
+	h.mu.Lock()
+	parked := !system && fleet.Parked(h.follower, m.Service)
+	h.mu.Unlock()
 	deadline := time.Now().Add(serviceWait)
 	var last string
 	for {
 		tag, terr := fleet.RenderedTag(h.cfg, m.Service)
+		if parked && terr == nil && tag == m.To {
+			return nil
+		}
 		st, serr := sup.Status(ctx, unit)
 		switch {
 		case terr != nil:

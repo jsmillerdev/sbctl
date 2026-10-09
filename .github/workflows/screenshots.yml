@@ -48,6 +48,12 @@ jobs:
           gh run download "$run" --name studio-linux-amd64 --dir "$RUNNER_TEMP/studio"
           f=$(ls "$RUNNER_TEMP"/studio/*.tar.zst)
           ls -l "$f"
+          # The binary refuses a build other than the one versions.yaml pins (a newer patch set merged
+          # before its studio run finished): build that one instead.
+          tag=$(awk '/^studio:/{s=1;next} s&&/^[^ ]/{s=0} s&&/^[ ]+tag:/{print $2; exit}' internal/versions/versions.yaml)
+          ps=$(awk '/^studio:/{s=1;next} s&&/^[^ ]/{s=0} s&&/^[ ]+patchset:/{print $2; exit}' internal/versions/versions.yaml)
+          want="supavise-studio-${tag}${ps:+-p$ps}-linux-amd64.tar.zst"
+          [[ $(basename "$f") == "$want" ]] || { echo "the newest Studio build on main is $(basename "$f"), and this checkout pins $want"; exit 1; }
           echo "STUDIO_TARBALL=$f" >> "$GITHUB_ENV"
       - name: build Studio (when no run could be downloaded)
         if: steps.studio_dl.outcome != 'success'

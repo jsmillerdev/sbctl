@@ -11,7 +11,7 @@ Platform-mode Studio for `supavise`: a build of upstream Studio with `NEXT_PUBLI
 | `verify.sh` | Starts a packaged build on a loopback port and checks it, including the MCP route of patch 0004 (`build.sh` runs it before it writes the artifact). |
 | `runtime/` | What goes into the artifact: launcher, entrypoint, runtime substitution and its tests. |
 | `placeholders.json` | The per-install values baked into the build as placeholders. |
-| `PATCHSET` | Revision `N` in the artifact name; bump it when the patches or `runtime/` change without a new upstream tag. |
+| `PATCHSET` | Revision `N` in the artifact name; bump it when the patches or `runtime/` change without a new upstream tag, together with `studio.patchset` in `internal/versions/versions.yaml` (`build.sh`, a Go test and the release tool refuse a difference). The build `<tag>-p<N>` is what a node runs and `supavise upgrade` compares, so a bump moves Studio on every node. |
 | `mock/` | Stand-in Management API for `spike.sh` (Go, `package main`), with the endpoints behind the OAuth consent page. See `mock/README.md`. |
 | `spike.sh`, `spike/` | The CI spike: small stack plus mock plus Studio, driven by Playwright. Besides the project pages it opens Connect > MCP, approves and declines a request on the consent page, and calls `/api/mcp`. |
 

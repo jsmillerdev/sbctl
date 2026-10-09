@@ -35,8 +35,9 @@ type Info struct {
 	// Version is the release tag the binary was built as ("v1.4.0").
 	Version  string `json:"version"`
 	Platform string `json:"platform,omitempty"`
-	// Pins maps a service (config.Svc*) to the slim-services release tag it runs, Studio's build
-	// tag included under "studio".
+	// Pins maps a service (config.Svc*) to the slim-services release tag it runs, and "studio" to
+	// the Studio build (artifacts.Versions.StudioBuild: the upstream tag and the patch set, so that a
+	// release that changes only the patches moves Studio too).
 	Pins map[string]string `json:"pins"`
 	// RegistrySchema is the newest registry migration the binary embeds (a label for people);
 	// RegistryMigrations lists all of them: the binary can run on a registry that holds these
@@ -61,8 +62,8 @@ func PinsOf(v *artifacts.Versions) map[string]string {
 	for name, tag := range v.Artifacts {
 		pins[serviceOfArtifact(name)] = tag
 	}
-	if v.Studio.Tag != "" {
-		pins[config.SvcStudio] = v.Studio.Tag
+	if b := v.StudioBuild(); b != "" {
+		pins[config.SvcStudio] = b
 	}
 	return pins
 }
@@ -156,8 +157,10 @@ func DiffPins(from, to map[string]string) []ServiceMove {
 }
 
 // CheckManifestPins compares the pins a binary reports with those in the signed release manifest
-// (artifacts by release name, as versions.yaml keys them, and Studio's tag). A manifest that lists
-// none (an older manifest) has nothing to compare.
+// (artifacts by release name, as versions.yaml keys them, and the Studio build). A manifest that
+// lists none (an older manifest) has nothing to compare. The manifest's studio and the binary's
+// Studio pin come from one versions.yaml through the same artifacts.Versions.StudioBuild, so a
+// release from before the patch set (the tag alone on both sides) passes as it did.
 func CheckManifestPins(info *Info, artifacts map[string]string, studio string) error {
 	for name, tag := range artifacts {
 		if got := info.Pins[serviceOfArtifact(name)]; got != tag {

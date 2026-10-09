@@ -147,6 +147,22 @@ func fetchArtifacts(ctx context.Context, arts lifecycle.Artifacts, svcs ...strin
 	return nil
 }
 
+// fetchStandby fetches svcs in order. A Studio build that cannot be fetched goes to warn and the
+// others are fetched: Studio is optional on a node (the daemon starts without it), and a follower
+// keeps it parked; any other failure stops the seeding.
+func fetchStandby(ctx context.Context, arts lifecycle.Artifacts, svcs []string, warn func(error)) error {
+	for _, svc := range svcs {
+		if err := fetchArtifacts(ctx, arts, svc); err != nil {
+			if svc == config.SvcStudio {
+				warn(err)
+				continue
+			}
+			return err
+		}
+	}
+	return nil
+}
+
 // standbyServices are the artifacts a follower needs on disk: Postgres, GoTrue and PostgREST for the
 // system standby and the replicas, and the shared services, which a follower runs cold (Supavisor
 // runs) so that a promotion has them. It is the set `system init` and `fleet start` fetch.
@@ -215,7 +231,9 @@ func (s *systemStandby) Seed(ctx context.Context, b peerapi.SystemBootstrap) err
 	if err != nil {
 		return err
 	}
-	if err := fetchArtifacts(ctx, lo.Artifacts, standbyServices(cfg)...); err != nil {
+	if err := fetchStandby(ctx, lo.Artifacts, standbyServices(cfg), func(err error) {
+		s.log.Warn("the Studio build was not fetched; a follower parks Studio, and a promotion runs it once `sudo supavise system converge` has fetched it", "error", err)
+	}); err != nil {
 		return err
 	}
 	pl, closeUnits, err := s.openPlane(cfg, lo)

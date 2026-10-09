@@ -69,8 +69,10 @@ done
 
 # A stand-in for Studio: the unit is rendered like the real one (its environment decides whether
 # the sign-in page offers SSO) and answers the health check.
+# The directory is named by the build: the upstream tag and the patch set (<tag>-p<patchset>).
 STAG=$(awk '/^studio:/{f=1;next} f&&/^ *tag:/{print $2;exit}' "$REPO_ROOT/internal/versions/versions.yaml")
-SDIR="$SUPAVISE_STATE/artifacts/studio/$STAG"
+SPATCH=$(awk '/^studio:/{f=1;next} f&&/^[^ ]/{f=0} f&&/^ *patchset:/{print $2;exit}' "$REPO_ROOT/internal/versions/versions.yaml")
+SDIR="$SUPAVISE_STATE/artifacts/studio/$STAG${SPATCH:+-p$SPATCH}"
 install -d -o "$SUPAVISE_USER" -g "$SUPAVISE_USER" "$SDIR/bin"
 cat >"$SDIR/bin/studio" <<'STUB'
 #!/bin/sh

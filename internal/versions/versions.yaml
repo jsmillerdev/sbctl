@@ -15,6 +15,11 @@ studio:
   # Upstream Studio git ref we build in platform mode (studio/build.sh). The slim
   # studio artifact of the same upstream version is studio-2026.10.05-sha-94b8b06-r0.
   tag: 2026.10.05-sha-94b8b06
+  # Revision of our patches and runtime on top of tag; equal to studio/PATCHSET (a test, build.sh
+  # and the release tool refuse a difference). The build is <tag>-p<patchset>: the release asset
+  # name, the directory under artifacts/studio and the pin `supavise upgrade` compares, so a new
+  # patch set moves Studio on every node like a new tag does.
+  patchset: 3
 cli:
   # The Supabase CLI release the conformance suite runs (tests/conformance/pins.env).
   version_tested: "2.120.0"

@@ -137,6 +137,12 @@ binary expects. A second run changes nothing. The steps, in order:
   packages     the packages the release declares, if any
   config.d     on a node that is in a cluster, the cluster settings from the leader
 
+After the steps, on a node that runs a dashboard, converge puts the Studio build this release pins
+in place when it is missing (the build on disk when it is the same one, else the release's own
+archive from its signed checksum list) and makes [studio] artifact_url and artifact_sha256 in
+config.toml name the installed build. That part prints a warning when it cannot, and never fails
+converge or counts toward its revision.
+
 Each step prints what it changed. When every step succeeded, converge writes the revision it
 completed to <state_dir>/converged; the daemon raises host_not_converged while that file is behind
 the binary, and ` + "`supavise upgrade`" + ` runs converge after it swaps the binary and fails, and rolls back,

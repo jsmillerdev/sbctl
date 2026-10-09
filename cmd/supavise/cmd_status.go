@@ -8,16 +8,19 @@ import (
 	"io/fs"
 	"log/slog"
 	"os"
+	"time"
 
 	"github.com/spf13/cobra"
 
 	"github.com/supavise/supavise/internal/app"
+	"github.com/supavise/supavise/internal/artifacts"
 	"github.com/supavise/supavise/internal/config"
 	"github.com/supavise/supavise/internal/failover"
 	"github.com/supavise/supavise/internal/fleet"
 	"github.com/supavise/supavise/internal/health"
 	"github.com/supavise/supavise/internal/infra"
 	"github.com/supavise/supavise/internal/lifecycle"
+	"github.com/supavise/supavise/internal/notice"
 	"github.com/supavise/supavise/internal/units"
 )
 
@@ -101,6 +104,8 @@ type statusSections struct {
 	Cluster        *clusterBlock       `json:"cluster,omitempty"`
 	Failover       *failover.Readiness `json:"failover,omitempty"`
 	Infrastructure *infra.Report       `json:"infrastructure,omitempty"`
+	// Studio is set while the dashboard runs a build other than the one this binary pins.
+	Studio *studioBlock `json:"studio,omitempty"`
 	// Errors are the blocks that could not be read, by name.
 	Errors map[string]string `json:"errors,omitempty"`
 }
@@ -134,7 +139,45 @@ func collectStatusSections(ctx context.Context, cfg *config.Config) statusSectio
 	if s.Infrastructure, err = infraStatus(ctx, cfg); err != nil {
 		fail("infrastructure", err)
 	}
+	s.Studio = studioStatus(cfg, time.Now())
 	return s
+}
+
+// studioBlock says that Studio runs a build other than the one the installed binary pins: the
+// binary came with `supavise self-update` and its converge could not fetch the build, or the daemon
+// has not restarted since. Nothing else says so: Studio answers on the build it runs.
+type studioBlock struct {
+	Runs   string `json:"runs"`
+	Pinned string `json:"pinned"`
+}
+
+func (b *studioBlock) render(w io.Writer) {
+	fmt.Fprintf(w, "studio  runs the build %s and this release pins %s.\n", b.Runs, b.Pinned)
+	fmt.Fprintln(w, "        Run `sudo supavise upgrade`: it fetches the build and restarts Studio on it (the projects keep running).")
+}
+
+// studioStatus is the Studio block of a node whose Studio unit runs a build other than the pinned
+// one, outside an upgrade (which moves it), and nil otherwise, a node without a dashboard included.
+func studioStatus(cfg *config.Config, now time.Time) *studioBlock {
+	if cfg.Studio.ArtifactURL == "" {
+		return nil
+	}
+	if _, running := notice.UpgradeRunning(cfg.Paths(), now); running {
+		return nil
+	}
+	runs, err := fleet.RenderedTag(cfg, config.SvcStudio)
+	if err != nil {
+		return nil
+	}
+	v, err := artifacts.LoadVersions(cfg)
+	if err != nil {
+		return nil
+	}
+	pinned, err := v.Tag(config.SvcStudio)
+	if err != nil || pinned == runs {
+		return nil
+	}
+	return &studioBlock{Runs: runs, Pinned: pinned}
 }
 
 // render writes the blocks, each after a blank line.
@@ -154,6 +197,10 @@ func (s statusSections) render(w io.Writer) {
 	if s.Infrastructure != nil && s.Infrastructure.Behind() {
 		fmt.Fprintln(w)
 		s.Infrastructure.Render(w)
+	}
+	if s.Studio != nil {
+		fmt.Fprintln(w)
+		s.Studio.render(w)
 	}
 	for _, name := range []string{"host", "cluster", "failover", "infrastructure"} {
 		if msg, ok := s.Errors[name]; ok {

@@ -74,12 +74,13 @@ func Diff(old, new *artifacts.Versions) []Change {
 			out = append(out, Change{n, o, w})
 		}
 	}
+	// Studio is compared as the build, so a release that changes only the patch set lists it.
 	var oldStudio, oldCLI string
 	if old != nil {
-		oldStudio, oldCLI = old.Studio.Tag, old.CLI.VersionTested
+		oldStudio, oldCLI = old.StudioBuild(), old.CLI.VersionTested
 	}
-	if oldStudio != new.Studio.Tag {
-		out = append(out, Change{"studio", oldStudio, new.Studio.Tag})
+	if oldStudio != new.StudioBuild() {
+		out = append(out, Change{"studio", oldStudio, new.StudioBuild()})
 	}
 	if oldCLI != new.CLI.VersionTested {
 		out = append(out, Change{"cli", oldCLI, new.CLI.VersionTested})
@@ -87,7 +88,9 @@ func Diff(old, new *artifacts.Versions) []Change {
 	return out
 }
 
-var shaRe = regexp.MustCompile(`-sha-([0-9a-f]{7,40})$`)
+// shaRe finds the upstream commit in a Studio build name: <date>-sha-<commit>, with -p<N> when the
+// build has a patch set.
+var shaRe = regexp.MustCompile(`-sha-([0-9a-f]{7,40})(?:-p\d+)?$`)
 
 // Link renders where a pin's release can be read: the upstream release page and, for the
 // artifacts, the slim-services release that packages it. It returns "" for an empty pin.
@@ -157,7 +160,7 @@ func compareLink(c Change) string {
 	switch c.Name {
 	case "studio":
 		o, n := shaRe.FindStringSubmatch(c.Old), shaRe.FindStringSubmatch(c.New)
-		if o != nil && n != nil {
+		if o != nil && n != nil && o[1] != n[1] { // one commit: only our patches changed
 			return fmt.Sprintf("[all changes](https://github.com/%s/compare/%s...%s)", studioRepo, o[1], n[1])
 		}
 	case "cli":

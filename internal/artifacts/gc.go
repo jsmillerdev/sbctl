@@ -28,14 +28,14 @@ type Release struct {
 }
 
 // Pins returns the tag of every artifact the loaded versions.yaml pins, by directory name
-// under artifacts/ (Studio is "studio").
+// under artifacts/ (Studio is "studio", and its tag is the build, StudioBuild).
 func (v *Versions) Pins() map[string]string {
 	pins := make(map[string]string, len(v.Artifacts)+1)
 	for name, tag := range v.Artifacts {
 		pins[name] = tag
 	}
-	if v.Studio.Tag != "" {
-		pins[config.SvcStudio] = v.Studio.Tag
+	if b := v.StudioBuild(); b != "" {
+		pins[config.SvcStudio] = b
 	}
 	return pins
 }

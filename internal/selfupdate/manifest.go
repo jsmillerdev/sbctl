@@ -30,7 +30,7 @@ const ManifestSchema = 1
 //	  "version": "v1.4.0",
 //	  "min_upgrade_from": "v1.2.0",
 //	  "artifacts": {"postgres": "postgres-17.11.0.004-r1", "auth": "auth-v2.195.0-r1", ...},
-//	  "studio": "2026.10.05-sha-94b8b06"
+//	  "studio": "2026.10.05-sha-94b8b06-p3"
 //	}
 //
 // version is the release tag; Fetch refuses a release whose tag is another (an older signed
@@ -38,7 +38,9 @@ const ManifestSchema = 1
 // upgrade to this release directly: a node on an older one must go through min_upgrade_from first
 // (CheckUpgradeFrom says so). artifacts and studio are the Supabase service releases the binary
 // installs (internal/versions/versions.yaml of that release), so that a plan can show what an
-// upgrade changes before it downloads anything else.
+// upgrade changes before it downloads anything else. studio is the Studio build, the upstream tag
+// and the patch set ("<tag>-p<N>"), the same string the binary reports as its Studio pin; a
+// release up to v0.2.0 wrote the tag alone, which its binary reported too.
 type Manifest struct {
 	Schema         int               `json:"schema"`
 	Version        string            `json:"version"`

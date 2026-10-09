@@ -10,6 +10,19 @@ under `<state_dir>/artifacts/<service>/<tag>/` (`config.Paths.Artifact`).
   (`<base_url>/<tag>/SHA256SUMS`). A cached archive with another digest is downloaded again.
   Our Studio build (`supavise artifacts fetch --studio`) is verified against
   `[studio] artifact_sha256`.
+- **Studio build:** the build is named by the upstream tag and the patch set,
+  `<studio.tag>-p<studio.patchset>` (`Versions.StudioBuild`), and lives under
+  `<state_dir>/artifacts/studio/<build>/`. `Tag(SvcStudio)`, `Pins()` and so the GC, the upgrade plan
+  and the release manifest all use that name, so a release that changes only the patch set moves
+  Studio. A versions file without `patchset` (every release up to v0.2.0) names the build by the tag
+  alone. A directory holds the build its name says and no other: a `[studio] artifact_url` whose file
+  name is the release asset of another build (`supavise-studio-<build>-<platform>.tar.zst`) is
+  refused before the download, and an archive whose `share/supavise/build-info.json` names another
+  build is refused before it is put in place. A node that a release before the patch set installed
+  has the build under `artifacts/studio/<tag>/`; when that build is the pinned one (its build-info
+  says so, or, for a stand-in without build-info, its marker has the configured digest), the fetch
+  links it into the new directory file by file (hard links, `adopted_from` in the marker) instead of
+  downloading it, and the old directory stays for the Studio that runs from it and for a rollback.
 - **Unpacking:** zstd + tar, no path traversal, no links that leave the destination, no
   device or FIFO entries, setuid/setgid/sticky dropped, modes and symlinks kept. The tree is
   unpacked next to its destination and renamed into place, so a directory either does not
@@ -32,7 +45,8 @@ under `<state_dir>/artifacts/<service>/<tag>/` (`config.Paths.Artifact`).
   with a dot (the archive cache, unpacking in progress) are never touched. Entry points:
   `supavise artifacts gc [--dry-run] [--keep N]` and, after a successful `supavise projects upgrade`,
   `Engine.CollectArtifacts`.
-- **CLI:** `supavise artifacts fetch [service...] [--studio]`, `supavise artifacts list`, `supavise artifacts gc`.
+- **CLI:** `supavise artifacts fetch [service...] [--studio]` (`--studio` without a service fetches Studio alone),
+  `supavise artifacts list`, `supavise artifacts gc`.
 
 ## Tests
 

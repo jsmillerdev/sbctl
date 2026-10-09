@@ -446,6 +446,18 @@ func (r *run) apply(ctx context.Context, staged *Staged) error {
 	}
 
 	moves := append(append([]ServiceMove{}, plan.System...), plan.Shared...)
+	if len(moves) > 0 && !plan.BinaryChange {
+		// The installed release pins services its units do not run yet. Prefetch put their artifacts
+		// on disk; the daemon moves them when it starts, and no swap restarts it here.
+		if dr, ok := h.(DaemonRestarter); ok {
+			r.mark(PhaseSwitching, "restarting the daemon")
+			o.say("restarting the daemon, which moves the services onto the release it runs")
+			if err := dr.RestartDaemon(ctx); err != nil {
+				r.sharedFailed = true
+				return r.rollback(ctx, prev, nil, fmt.Errorf("restarting the daemon to move the services failed: %w", err))
+			}
+		}
+	}
 	if len(moves) > 0 {
 		r.mark(PhaseServices, "rolling the shared services")
 		o.say("rolling %d service(s) onto the new release, one at a time", len(moves))
