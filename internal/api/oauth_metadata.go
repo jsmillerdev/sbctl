@@ -84,6 +84,13 @@ func (s *Server) oauthWellKnown(mux *muxSet) {
 	mux.handle("GET "+oauth.AuthorizationServerMetadataPath, s.wrap("", authNone, s.oauthGuard(func(w http.ResponseWriter, r *http.Request) error {
 		return writeMetadata(w, authorizationServerMetadata(s.cfg.APIURL()))
 	})))
+	// Any other discovery path is a plain 404 without credentials. Clients probe a few
+	// (/.well-known/openid-configuration, the protected-resource document without /mcp) before
+	// the ones above, and the authenticated fallback would answer them 401, which reads as "sign
+	// in to see this" rather than "there is no such document".
+	mux.handle("GET /.well-known/", s.wrap("", authNone, func(w http.ResponseWriter, r *http.Request) error {
+		return errf(http.StatusNotFound, "Not Found")
+	}))
 }
 
 // writeMetadata answers 200 with a discovery document that clients may cache for an hour.

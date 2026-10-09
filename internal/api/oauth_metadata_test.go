@@ -212,3 +212,24 @@ func TestMetadataOffWhenOAuthDisabled(t *testing.T) {
 		}
 	}
 }
+
+// Other discovery paths are a 404 without credentials, not the authenticated fallback's 401: a
+// client probing /.well-known/openid-configuration or the protected-resource document without /mcp
+// learns there is no such document, and the two real documents still answer.
+func TestOtherWellKnownPathsAreNotFound(t *testing.T) {
+	f := newFixture(t)
+	for _, path := range []string{"/.well-known/openid-configuration", "/.well-known/oauth-protected-resource", "/.well-known/oauth-protected-resource/other", "/.well-known/"} {
+		if rec := f.epDo("", http.MethodGet, path, ""); rec.Code != http.StatusNotFound {
+			t.Errorf("%s: %d, want 404", path, rec.Code)
+		}
+	}
+	for _, path := range []string{"/.well-known/oauth-authorization-server", "/.well-known/oauth-protected-resource/mcp"} {
+		if rec := f.epDo("", http.MethodGet, path, ""); rec.Code != http.StatusOK {
+			t.Errorf("%s: %d, want 200", path, rec.Code)
+		}
+	}
+	// Elsewhere an unknown route still asks for credentials first.
+	if rec := f.epDo("", http.MethodGet, "/v1/not-a-route", ""); rec.Code != http.StatusUnauthorized {
+		t.Errorf("an unknown /v1 route without credentials: %d, want 401", rec.Code)
+	}
+}
