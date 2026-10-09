@@ -19,6 +19,7 @@ import (
 	"github.com/supavise/supavise/internal/config"
 	"github.com/supavise/supavise/internal/failover/fenced"
 	"github.com/supavise/supavise/internal/mesh/peerapi"
+	"github.com/supavise/supavise/internal/pglsn"
 	"github.com/supavise/supavise/internal/registry"
 	"github.com/supavise/supavise/internal/units"
 )
@@ -116,7 +117,7 @@ func f64(v float64) *float64 { return &v }
 // position: the stop position is where the shutdown checkpoint record starts, replay is where the
 // last record it replayed ends.
 func caughtUp(stop string) string {
-	n, err := ParseLSN(stop)
+	n, err := pglsn.Parse(stop)
 	if err != nil {
 		return stop
 	}

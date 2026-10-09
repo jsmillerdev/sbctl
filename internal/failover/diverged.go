@@ -12,6 +12,7 @@ import (
 
 	"github.com/supavise/supavise/internal/config"
 	"github.com/supavise/supavise/internal/failover/fenced"
+	"github.com/supavise/supavise/internal/pglsn"
 	"github.com/supavise/supavise/internal/procutil"
 )
 
@@ -65,8 +66,8 @@ func SetAsideDiverged(cfg *config.Config, ref string, epoch int64, controlLSN, f
 		return Diverged{}, fmt.Errorf("failover: setting %s aside: %w", data, err)
 	}
 	d := Diverged{Ref: ref, Epoch: epoch, At: now.UTC(), ControlLSN: controlLSN, ForkLSN: forkLSN, Path: dest}
-	if c, err := ParseLSN(controlLSN); err == nil {
-		if f, err := ParseLSN(forkLSN); err == nil && c > f {
+	if c, err := pglsn.Parse(controlLSN); err == nil {
+		if f, err := pglsn.Parse(forkLSN); err == nil && c > f {
 			d.LostBytes = c - f
 		}
 	}

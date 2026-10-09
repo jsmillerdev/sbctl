@@ -7,6 +7,7 @@ import (
 
 	"github.com/supavise/supavise/internal/alerts"
 	"github.com/supavise/supavise/internal/mesh/peerapi"
+	"github.com/supavise/supavise/internal/pglsn"
 	"github.com/supavise/supavise/internal/registry"
 	"github.com/supavise/supavise/internal/replicas/replicaid"
 )
@@ -355,11 +356,11 @@ func (c *Controller) estimate(ctx context.Context, r *registry.Replica) InitStat
 		out.BaseBackupDownloadEstimateSeconds = int(float64(seed)/rate + 0.5)
 	}
 	if idx < stepIndex(StepReplayed) {
-		from, ok := parseLSN(replay)
-		if !ok {
-			from, ok = parseLSN(backupLSN)
+		from, err := pglsn.Parse(replay)
+		if err != nil {
+			from, err = pglsn.Parse(backupLSN)
 		}
-		if ok && head > from {
+		if err == nil && head > from {
 			out.WALArchiveReplayEstimateSeconds = int(float64(head-from)/replayRate + 0.5)
 		}
 	}
@@ -375,7 +376,7 @@ func (c *Controller) headLSN(ref string) uint64 {
 			continue
 		}
 		for _, l := range []string{s.obs.ReceiveLSN, s.obs.ReplayLSN} {
-			if v, ok := parseLSN(l); ok {
+			if v, err := pglsn.Parse(l); err == nil {
 				head = max(head, v)
 			}
 		}

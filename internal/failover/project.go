@@ -16,6 +16,7 @@ import (
 	"github.com/supavise/supavise/internal/lifecycle"
 	"github.com/supavise/supavise/internal/mesh"
 	"github.com/supavise/supavise/internal/mesh/peerapi"
+	"github.com/supavise/supavise/internal/pglsn"
 	"github.com/supavise/supavise/internal/placement"
 	"github.com/supavise/supavise/internal/registry"
 )
@@ -270,7 +271,7 @@ func (o *Orchestrator) projectSteps(ctx context.Context, j *journal, run *projec
 			// The position is what the promotion waits for. Without one the replica could be
 			// promoted before it has the old primary's last WAL, and a switchover loses nothing
 			// only because it waits. Nothing is recorded, so a resume stops again and reads it again.
-			if _, perr := ParseLSN(lsn); perr != nil {
+			if !pglsn.Valid(lsn) {
 				return "", &abortError{cause: fmt.Errorf("%w: %s reported %q for %s", ErrNoFinalPosition, run.from.Name, lsn, ref)}
 			}
 			return lsn, nil

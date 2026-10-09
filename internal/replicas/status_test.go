@@ -343,19 +343,6 @@ func TestEstimations(t *testing.T) {
 	}
 }
 
-func TestParseLSN(t *testing.T) {
-	for in, want := range map[string]uint64{"0/3000100": 0x3000100, "1/0": 1 << 32, "A/FFFFFFFF": 0xA<<32 | 0xFFFFFFFF} {
-		if got, ok := parseLSN(in); !ok || got != want {
-			t.Errorf("parseLSN(%q) = %#x %v", in, got, ok)
-		}
-	}
-	for _, in := range []string{"", "0", "x/y", "0/", "/1"} {
-		if _, ok := parseLSN(in); ok {
-			t.Errorf("parseLSN(%q) accepted", in)
-		}
-	}
-}
-
 // The ring keeps one point per minute (the mean of its samples) for 24 hours.
 func TestLagRing(t *testing.T) {
 	var r lagRing
