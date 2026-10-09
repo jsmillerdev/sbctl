@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
-	"net/url"
 	"regexp"
 	"strconv"
 	"strings"
@@ -341,18 +340,6 @@ func str(m map[string]any, k string) string {
 func mustJSON(v any) json.RawMessage {
 	b, _ := json.Marshal(v)
 	return b
-}
-
-// withQuery returns u with the given query values added.
-func withQuery(u string, kv url.Values) string {
-	if len(kv) == 0 {
-		return u
-	}
-	sep := "?"
-	if strings.Contains(u, "?") {
-		sep = "&"
-	}
-	return u + sep + kv.Encode()
 }
 
 func itoa(n int64) string { return strconv.FormatInt(n, 10) }

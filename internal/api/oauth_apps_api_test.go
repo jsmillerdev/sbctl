@@ -27,8 +27,7 @@ import (
 // The organization's OAuth Apps API (oauth_apps_api.go) over a fake of oauth.Authority that keeps
 // the contract of authority.go: an app of another organization, a dynamic app (where the method is
 // for published apps) and a deleted one are ErrNotFound; input the Service refuses is ErrInvalid; a
-// cap is ErrLimit. TestOAuthAppsWithService runs the same routes over the real Service once
-// workstream W2 has written it.
+// cap is ErrLimit. TestOAuthAppsWithService runs the same routes over the real Service.
 
 const (
 	oauthAppsListKey    = "GET /platform/organizations/{slug}/oauth/apps"
@@ -1030,16 +1029,12 @@ func TestOAuthAppsServiceErrors(t *testing.T) {
 	if rec.Code != http.StatusInternalServerError || oauthAppsObject(t, rec)["message"] != "Internal server error" || strings.Contains(rec.Body.String(), "10.0.0.7") {
 		t.Errorf("a failing Service: %d %s", rec.Code, rec.Body)
 	}
-	fake.fail["ListPublishedApps"] = oauth.ErrNotImplemented
-	if rec := f.do("GET", oauthAppsBase+"?type=published", nil); rec.Code != http.StatusInternalServerError {
-		t.Errorf("a Service that is not written: %d", rec.Code)
-	}
 }
 
 // ---- over the real Service --------------------------------------------------------------------
 
 // The same page over oauth.Service and its memory store, with a grant made the way a client makes
-// one. It runs once workstream W2 has written the Service and skips until then.
+// one.
 func TestOAuthAppsWithService(t *testing.T) {
 	f := newFixture(t)
 	svc, ok := f.srv.oauth.(*oauth.Service)
@@ -1047,9 +1042,6 @@ func TestOAuthAppsWithService(t *testing.T) {
 		t.Fatalf("Server.oauth is %T, want the *oauth.Service the server builds", f.srv.oauth)
 	}
 	ctx := context.Background()
-	if _, err := svc.ListPublishedApps(ctx, f.org.ID); errors.Is(err, oauth.ErrNotImplemented) {
-		t.Skip("oauth.Service is not written yet (workstream W2); this test runs over it once it is")
-	}
 	// Whether the user may hold grants is the server's own check (oauthAdmit, tested with it).
 	svc.Admit = func(context.Context, string, int64) error { return nil }
 

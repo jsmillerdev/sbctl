@@ -228,20 +228,6 @@ func pgNullInt(v int64) any {
 	return v
 }
 
-func pgNullTime(t time.Time) any {
-	if t.IsZero() {
-		return nil
-	}
-	return t
-}
-
-func pgNullBytes(b []byte) any {
-	if len(b) == 0 {
-		return nil
-	}
-	return b
-}
-
 func pgCopyGrant(g Grant) Grant {
 	g.Scopes = slices.Clone(g.Scopes)
 	return g

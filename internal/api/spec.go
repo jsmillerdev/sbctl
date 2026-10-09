@@ -115,14 +115,3 @@ func fillResponse(o *Operation, op *openapi3.Operation) {
 		}
 	}
 }
-
-// pathParams returns the names of the {wildcards} of a ServeMux pattern path.
-func pathParams(path string) []string {
-	var out []string
-	for _, seg := range strings.Split(path, "/") {
-		if strings.HasPrefix(seg, "{") && strings.HasSuffix(seg, "}") {
-			out = append(out, strings.TrimSuffix(strings.TrimPrefix(seg, "{"), "}"))
-		}
-	}
-	return out
-}
