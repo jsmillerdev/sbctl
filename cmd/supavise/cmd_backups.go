@@ -283,7 +283,9 @@ func init() {
 			"  --to backup          the exact state of a base backup (--backup-id, default newest).\n\n" +
 			"With --as <newref> the result is a new project (the source is untouched; <newref> must\n" +
 			"have no archive of its own). Without --as the project itself is replaced, which needs\n" +
-			"--force; its old data directory is kept next to it as <dir>.pre-restore-<time>.\n\n" +
+			"--force; its old data directory is kept next to it as <dir>.pre-restore-<time>. The project's\n" +
+			"read replicas cannot follow the restored cluster and are removed first; while one is still\n" +
+			"being removed (the leader's daemon finishes it) the command stops, and runs again later.\n\n" +
 			"The project's Storage objects and Edge Functions come back too, from the newest nightly\n" +
 			"backup at or before the target: objects return to that copy, not to the exact second (unlike\n" +
 			"the database they have no log to replay), and a Storage object newer than the copy is\n" +

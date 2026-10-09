@@ -191,6 +191,10 @@ func init() {
 			fmt.Fprintf(cmd.OutOrStdout(), "%s deleted\n", a[0])
 			return nil
 		})
+	del.Long = `Takes a final base backup (unless --skip-final-backup), removes the project's read replicas, its
+tenants and units, and deletes its data. The replicas go first: this command marks them for removal and the
+leader's daemon removes them on their nodes. While one is still there the command stops and names it; run it
+again when ` + "`supavise replicas ls`" + ` no longer lists it.`
 	del.Flags().BoolVar(&pSkipBackup, "skip-final-backup", false, "delete without the final base backup (the data is gone)")
 
 	rotate := projectCmd("rotate-keys <ref>", "Issue a new JWT secret and API keys and restart GoTrue and PostgREST", cobra.ExactArgs(1),
