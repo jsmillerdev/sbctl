@@ -135,7 +135,6 @@ func abortServerFailover(ctx context.Context, out io.Writer, c failoverClient, o
 	return nil
 }
 
-// planError words an error of the plan request.
 // openFailover loads the config and reaches the daemon of this node for a failover command. It
 // returns the command's context and its output.
 func openFailover(cmd *cobra.Command) (context.Context, failoverClient, io.Writer, error) {
@@ -169,6 +168,7 @@ func reviewMovePlan(out io.Writer, plan *failover.Plan, force, resume, dryRun bo
 	return true, nil
 }
 
+// planError words an error of the plan request.
 func planError(err error) error {
 	if errors.Is(err, failover.ErrNoCluster) {
 		return errors.New("this server is not part of a cluster: there is nothing to fail over to")

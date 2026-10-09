@@ -26,7 +26,6 @@ import (
 	"github.com/supavise/supavise/internal/backup"
 	"github.com/supavise/supavise/internal/config"
 	"github.com/supavise/supavise/internal/fleet"
-	"github.com/supavise/supavise/internal/fsutil"
 	"github.com/supavise/supavise/internal/hostsetup"
 	"github.com/supavise/supavise/internal/infra"
 	"github.com/supavise/supavise/internal/lifecycle"
@@ -789,11 +788,28 @@ func (h *nodeHost) Restore(ctx context.Context, from string, rec nodeupgrade.Rec
 
 // replaceFile copies src next to dst and renames it over dst, so a reader sees one or the other.
 func replaceFile(src, dst string) error {
-	b, err := os.ReadFile(src)
+	in, err := os.Open(src)
 	if err != nil {
 		return err
 	}
-	return fsutil.WriteFile(dst, b, 0o755, fsutil.Options{})
+	defer in.Close()
+	tmp, err := os.CreateTemp(filepath.Dir(dst), "."+filepath.Base(dst)+".restore-*")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(tmp.Name())
+	if _, err := io.Copy(tmp, in); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Chmod(0o755); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmp.Name(), dst)
 }
 
 // WaitShared implements nodeupgrade.Host: for each service in order, wait until its unit is set to
