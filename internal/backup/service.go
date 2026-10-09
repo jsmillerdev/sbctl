@@ -153,7 +153,7 @@ func (s *Service) need(what string, ok bool) error {
 
 // validRef accepts a user project ref or "system"; it is also what keeps ref safe as a key prefix.
 func validRef(ref string) error {
-	if ref == config.SystemRef || secrets.ValidRef(ref) {
+	if secrets.ValidProjectRef(ref) {
 		return nil
 	}
 	return fmt.Errorf("backup: invalid project ref %q", ref)

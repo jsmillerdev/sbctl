@@ -183,7 +183,7 @@ func projectsWithWALDir(c *config.Config) []string {
 	var refs []string
 	for _, e := range ents {
 		name := e.Name()
-		if !e.IsDir() || (name != config.SystemRef && !secrets.ValidRef(name)) {
+		if !e.IsDir() || !secrets.ValidProjectRef(name) {
 			continue
 		}
 		if fi, err := os.Stat(c.Paths().WALDir(name)); err == nil && fi.IsDir() {
