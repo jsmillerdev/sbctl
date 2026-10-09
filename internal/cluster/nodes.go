@@ -1,6 +1,7 @@
 package cluster
 
 import (
+	"cmp"
 	"context"
 	"crypto/ed25519"
 	"errors"
@@ -39,8 +40,8 @@ func EnsureFounder(ctx context.Context, reg registry.Registry, ca *CA, cfg *conf
 	n.Name = cfg.NodeName()
 	n.Region = cfg.NodeRegion()
 	n.PeerAddr = cfg.PeerAddr()
-	n.PublicHost = firstNonEmpty(n.PublicHost, cfg.PublicIP)
-	n.Version = firstNonEmpty(version, n.Version)
+	n.PublicHost = cmp.Or(n.PublicHost, cfg.PublicIP)
+	n.Version = cmp.Or(version, n.Version)
 	if err := reg.UpdateNode(ctx, n); err != nil {
 		return false, fmt.Errorf("cluster: recording this node in the registry: %w", err)
 	}
@@ -135,7 +136,7 @@ func RemoveNode(ctx context.Context, reg registry.Registry, id string, o RemoveO
 		return err
 	}
 	for _, r := range rs {
-		if r.Origin == registry.ReplicaSystem || o.Force {
+		if r.IsSystemStandby() || o.Force {
 			if err := reg.DeleteReplica(ctx, r.Identifier); err != nil && !errors.Is(err, registry.ErrNotFound) {
 				return err
 			}

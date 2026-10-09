@@ -1,10 +1,10 @@
 package health
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"net"
 	"sort"
@@ -79,13 +79,6 @@ func (d *Deps) now() time.Time {
 		return d.Now()
 	}
 	return time.Now()
-}
-
-func (d *Deps) log() *slog.Logger {
-	if d.Log != nil {
-		return d.Log
-	}
-	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
 
 // CheckNode looks at the whole node: the daemon, the edge, the system cluster, each shared
@@ -165,11 +158,11 @@ func (d *Deps) checkNode(ctx context.Context) []Component {
 			switch {
 			case h.Healthy:
 			case h.Optional:
-				c.State, c.Detail = Info, firstNonEmpty(h.Error, strings.ToLower(h.Status))
+				c.State, c.Detail = Info, cmp.Or(h.Error, strings.ToLower(h.Status))
 			case h.Status == "COMING_UP":
-				c.State, c.Detail = Warn, firstNonEmpty(h.Error, "starting")
+				c.State, c.Detail = Warn, cmp.Or(h.Error, "starting")
 			default:
-				c.State, c.Detail = Fail, firstNonEmpty(h.Error, strings.ToLower(h.Status))
+				c.State, c.Detail = Fail, cmp.Or(h.Error, strings.ToLower(h.Status))
 			}
 			out = append(out, c)
 		}
@@ -185,16 +178,7 @@ func serviceState(h lifecycle.ServiceHealth) State {
 }
 
 func serviceDetail(h lifecycle.ServiceHealth) string {
-	return firstNonEmpty(h.Error, strings.ToLower(h.Status))
-}
-
-func firstNonEmpty(ss ...string) string {
-	for _, s := range ss {
-		if s != "" {
-			return s
-		}
-	}
-	return ""
+	return cmp.Or(h.Error, strings.ToLower(h.Status))
 }
 
 // checkProjects probes every project the registry lists and the system cluster's backups.
@@ -291,7 +275,7 @@ func (d *Deps) checkProject(ctx context.Context, p *registry.Project) ProjectRes
 			if s.rank() > pr.State.rank() {
 				pr.State = s
 			}
-			problems = append(problems, h.Name+" "+firstNonEmpty(h.Error, strings.ToLower(h.Status)))
+			problems = append(problems, h.Name+" "+cmp.Or(h.Error, strings.ToLower(h.Status)))
 		}
 	}
 	for _, t := range d.Tenants.TenantPresence(pctx, p.Ref) {
@@ -354,7 +338,7 @@ func freshness(rows []registry.Backup, created, now time.Time, stale time.Durati
 		}
 	}
 	if len(rows) > 0 && rows[0].Status == registry.BackupFailed && (last == nil || rows[0].StartedAt.After(*last.FinishedAt)) {
-		b.LastFailed = firstNonEmpty(rows[0].Error, "failed")
+		b.LastFailed = cmp.Or(rows[0].Error, "failed")
 	}
 	if last == nil {
 		if created.IsZero() || now.Sub(created) < stale {
@@ -419,9 +403,9 @@ func (d *Deps) checkEscrow(ctx context.Context) *Component {
 	case err != nil:
 		c.State, c.Detail = Info, "could not check the backup backend: "+shorten(err.Error())
 	case !e.Covered:
-		c.State, c.Detail = Info, firstNonEmpty(e.Detail, "the master key is not in the backups; see `supavise backups status`")
+		c.State, c.Detail = Info, cmp.Or(e.Detail, "the master key is not in the backups; see `supavise backups status`")
 	default:
-		c.Detail = firstNonEmpty(e.Detail, "an encrypted copy is in the backup backend")
+		c.Detail = cmp.Or(e.Detail, "an encrypted copy is in the backup backend")
 	}
 	return c
 }

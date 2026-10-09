@@ -2,6 +2,7 @@ package cluster
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -133,7 +134,7 @@ func (c *ConfigSync) fetch(ctx context.Context, creds *mesh.Credentials, id, add
 	defer cancel()
 	// The call is made beside the daemon, which holds the node's session to the leader: it asks as a short
 	// call and is not taken for that session (mesh.OneShot).
-	cl, err := mesh.DialClient(cctx, addr, firstNonEmpty(id, "leader"), mesh.OneShot(mesh.ClientTLS(func() *mesh.Credentials { return creds }, id, nil, c.now)))
+	cl, err := mesh.DialClient(cctx, addr, cmp.Or(id, "leader"), mesh.OneShot(mesh.ClientTLS(func() *mesh.Credentials { return creds }, id, nil, c.now)))
 	if err != nil {
 		return err
 	}

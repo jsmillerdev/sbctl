@@ -58,13 +58,8 @@ func (s *Static) Role() Role             { return s.get().Role }
 func (s *Static) IsLeader() bool         { return s.get().Role == RoleLeader }
 
 func (s *Static) Leader() (registry.Node, bool) {
-	snap := s.get()
-	for _, n := range snap.Nodes {
-		if n.ID == snap.Leader {
-			return n, true
-		}
-	}
-	return registry.Node{}, false
+	leader, ok, _ := s.LeaderAndEpoch()
+	return leader, ok
 }
 
 // LeaderAndEpoch is Leader and Epoch from one snapshot. Two reads can straddle a change (the leader of the

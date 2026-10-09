@@ -17,6 +17,7 @@ import (
 	"golang.org/x/crypto/hkdf"
 
 	"github.com/supavise/supavise/internal/mesh"
+	"github.com/supavise/supavise/internal/registry"
 )
 
 // CALabel is the label the cluster CA's key is derived under (secrets.AESGCM.Derive). Rotating the
@@ -130,7 +131,7 @@ func (i *Issued) PEM() []byte {
 // Issue signs a certificate for the node's public key: SAN URI supavise://node/<id>, valid for
 // ttl from now, usable as a server and as a client certificate.
 func (ca *CA) Issue(pub ed25519.PublicKey, nodeID string, now time.Time, ttl time.Duration) (*Issued, error) {
-	if !validNodeID(nodeID) {
+	if !registry.ValidNodeID(nodeID) {
 		return nil, fmt.Errorf("cluster: %q is not a node id", nodeID)
 	}
 	serial, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 127))
@@ -178,16 +179,4 @@ func NewCSR(key ed25519.PrivateKey, name string) ([]byte, error) {
 	return x509.CreateCertificateRequest(rand.Reader, &x509.CertificateRequest{
 		Subject: pkix.Name{CommonName: name},
 	}, key)
-}
-
-func validNodeID(id string) bool {
-	if len(id) < 2 || len(id) > 5 || id[0] != 'n' {
-		return false
-	}
-	for _, c := range id[1:] {
-		if c < '0' || c > '9' {
-			return false
-		}
-	}
-	return true
 }

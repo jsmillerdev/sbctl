@@ -1,6 +1,7 @@
 package cluster
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -105,7 +106,7 @@ func Rejoin(ctx context.Context, o RejoinOptions) (*RejoinResult, error) {
 	}
 
 	getCreds := func() *mesh.Credentials { return creds }
-	c, err := mesh.DialClient(ctx, addr, firstNonEmpty(want, "leader"), mesh.ClientTLS(getCreds, want, nil, now))
+	c, err := mesh.DialClient(ctx, addr, cmp.Or(want, "leader"), mesh.ClientTLS(getCreds, want, nil, now))
 	if err != nil {
 		return nil, fmt.Errorf("cluster: cannot reach the leader at %s: %w", addr, err)
 	}
@@ -128,7 +129,7 @@ func Rejoin(ctx context.Context, o RejoinOptions) (*RejoinResult, error) {
 			return nil, fmt.Errorf("cluster: writing %s: %w", p, err)
 		}
 	}
-	if err := markFollower(dir, creds.NodeID, addr, firstNonEmpty(resp.System.Leader, want), now()); err != nil {
+	if err := markFollower(dir, creds.NodeID, addr, cmp.Or(resp.System.Leader, want), now()); err != nil {
 		return nil, fmt.Errorf("cluster: writing %s: %w", FollowerFile, err)
 	}
 	st := &JoinState{NodeID: creds.NodeID, Leader: addr, System: resp.System, At: now().UTC(), Rebuild: refsOfDiverged(o.Cfg, moved)}

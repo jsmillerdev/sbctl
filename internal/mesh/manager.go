@@ -355,13 +355,6 @@ func (m *Manager) LastPing(node string) (peerapi.Ping, time.Time, bool) {
 	return peerapi.Ping{}, time.Time{}, false
 }
 
-// Pinger is implemented by a Mesh that remembers the last ping of each node.
-type Pinger interface {
-	LastPing(node string) (p peerapi.Ping, at time.Time, ok bool)
-}
-
-var _ Pinger = (*Manager)(nil)
-
 // peerOf is the Peer of a node id as the registry has it now.
 func (m *Manager) peerOf(node string) Peer {
 	if node == "" {

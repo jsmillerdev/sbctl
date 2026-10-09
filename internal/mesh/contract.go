@@ -26,13 +26,14 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"regexp"
+	"slices"
 	"strconv"
 	"sync"
 	"time"
 
 	"github.com/supavise/supavise/internal/config"
 	"github.com/supavise/supavise/internal/registry"
+	"github.com/supavise/supavise/internal/secrets"
 )
 
 // ALPN is the application protocol the mesh negotiates in the TLS handshake.
@@ -78,27 +79,10 @@ var (
 )
 
 // IsService reports whether k is one of the shared services, which are not tied to a ref.
-func (k Kind) IsService() bool {
-	for _, s := range ServiceKinds {
-		if s == k {
-			return true
-		}
-	}
-	return false
-}
+func (k Kind) IsService() bool { return slices.Contains(ServiceKinds, k) }
 
 // Valid reports whether k is one of the kinds above.
-func (k Kind) Valid() bool {
-	if k.IsService() {
-		return true
-	}
-	for _, p := range ProjectKinds {
-		if p == k {
-			return true
-		}
-	}
-	return false
-}
+func (k Kind) Valid() bool { return k.IsService() || slices.Contains(ProjectKinds, k) }
 
 // Errors of the mesh. Wrapped errors answer errors.Is.
 var (
@@ -143,8 +127,6 @@ type Header struct {
 	Ref string `json:"ref,omitempty"`
 }
 
-var refRe = regexp.MustCompile(`^(system|[a-z]{20})$`)
-
 // Validate checks the header the way the receiving end must before it opens a port: a known
 // type and kind, a ref that has the shape of one exactly when the kind needs one, and nothing
 // on an rpc stream.
@@ -161,7 +143,7 @@ func (h Header) Validate() error {
 		switch {
 		case h.Kind.IsService() && h.Ref != "":
 			return fmt.Errorf("mesh: %s takes no ref", h.Kind)
-		case !h.Kind.IsService() && !refRe.MatchString(h.Ref):
+		case !h.Kind.IsService() && !secrets.ValidProjectRef(h.Ref):
 			return fmt.Errorf("mesh: %s needs a project ref, not %q", h.Kind, h.Ref)
 		}
 	default:

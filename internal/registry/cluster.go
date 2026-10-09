@@ -246,6 +246,9 @@ var (
 	replicaIDRe = regexp.MustCompile(`^(system|[a-z]{20})-rr-[a-z0-9-]+-[a-z0-9]{6}$`)
 )
 
+// ValidNodeID reports whether s can be the id of a node: "n" and a number of one to four digits.
+func ValidNodeID(s string) bool { return nodeIDRe.MatchString(s) }
+
 // ValidNodeName reports whether s can be the name of a node.
 func ValidNodeName(s string) bool { return nodeNameRe.MatchString(s) }
 
