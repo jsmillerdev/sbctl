@@ -126,16 +126,9 @@ func (h *nodeHost) asSupavise(ctx context.Context, stdout io.Writer, env []strin
 
 // asSupaviseTo is asSupavise with the worker's stderr sent to stderr.
 func (h *nodeHost) asSupaviseTo(ctx context.Context, stdout, stderr io.Writer, env []string, bin string, args ...string) error {
-	full := append([]string{bin, "--config", h.cfgPath}, args...)
-	c := exec.CommandContext(ctx, full[0], full[1:]...)
-	c.Env = append(os.Environ(), env...)
-	if h.root {
-		cred, err := h.superviseCredential()
-		if err != nil {
-			return err
-		}
-		c.SysProcAttr = &syscall.SysProcAttr{Credential: cred}
-		c.Env = append(os.Environ(), append([]string{"HOME=" + h.cfg.StateDir, "USER=" + installUser, "LOGNAME=" + installUser}, env...)...)
+	c, err := supaviseCommand(ctx, h.root, h.cfgPath, h.cfg.StateDir, env, bin, args...)
+	if err != nil {
+		return err
 	}
 	if stdout == nil {
 		stdout = h.out
@@ -151,8 +144,22 @@ func (h *nodeHost) asSupaviseTo(ctx context.Context, stdout, stderr io.Writer, e
 	return nil
 }
 
-// superviseCredential is the uid, gid and groups of the supavise user.
-func (h *nodeHost) superviseCredential() (*syscall.Credential, error) { return supaviseCredential() }
+// supaviseCommand is `bin --config cfgPath args...` with env added, run as the supavise user when
+// root (with that user's HOME, the state directory) and as the caller otherwise.
+func supaviseCommand(ctx context.Context, root bool, cfgPath, stateDir string, env []string, bin string, args ...string) (*exec.Cmd, error) {
+	full := append([]string{bin, "--config", cfgPath}, args...)
+	c := exec.CommandContext(ctx, full[0], full[1:]...)
+	c.Env = append(os.Environ(), env...)
+	if root {
+		cred, err := supaviseCredential()
+		if err != nil {
+			return nil, err
+		}
+		c.SysProcAttr = &syscall.SysProcAttr{Credential: cred}
+		c.Env = append(os.Environ(), append([]string{"HOME=" + stateDir, "USER=" + installUser, "LOGNAME=" + installUser}, env...)...)
+	}
+	return c, nil
+}
 
 // supaviseCredential is the uid, gid and groups of the supavise user.
 func supaviseCredential() (*syscall.Credential, error) {
@@ -776,6 +783,11 @@ func (h *nodeHost) Restore(ctx context.Context, from string, rec nodeupgrade.Rec
 	}
 	if err := h.activate(ctx, false); err != nil {
 		return err
+	}
+	// The restored binary runs the Studio build it pins, from the directory it left (the GC keeps the
+	// kept releases' builds); config.toml names that build again, as it did before the upgrade.
+	if _, err := syncStudioConfigTo(h.cfg, h.cfgPath, stored.Pins[config.SvcStudio], h.out); err != nil {
+		fmt.Fprintf(h.errw, "warning: config.toml still names the dashboard build of %s: %v\n", from, err)
 	}
 	if err := h.rel.Touch(rec.Version, time.Now()); err != nil {
 		return err

@@ -57,6 +57,11 @@ func runConverge(cmd *cobra.Command, check, asJSON bool) error {
 	if err != nil {
 		return err
 	}
+	if !sandbox {
+		// The dashboard build this binary pins, and config.toml naming it (studio_build.go). It is
+		// not a host step: it never fails converge and is not part of the revision.
+		newStudioSetup(cfg, selfUpdateConfigPath(), progress, errOut).run(cmd.Context())
+	}
 	if !asJSON && !sandbox && len(changedLines(rs)) == 0 {
 		fmt.Fprintf(out, "host is converged (revision %d)\n", hostsetup.Revision)
 	}

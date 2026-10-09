@@ -27,8 +27,10 @@ var artifactsFetchCmd = &cobra.Command{
 against the release SHA256SUMS and unpacks it under <state_dir>/artifacts. Without
 arguments every pinned artifact is fetched. Services are named as in unit names
 (postgres, gotrue, postgrest, supavisor, realtime, storage, pgmeta, imgproxy,
-edge-runtime); the release names auth and pooler are accepted too. --studio also fetches
-our Studio build from [studio] artifact_url and artifact_sha256.`,
+edge-runtime); the release names auth and pooler are accepted too. --studio fetches
+our Studio build from [studio] artifact_url and artifact_sha256, alone when no service is
+named: the build the binary pins (the upstream tag and the patch set), under
+artifacts/studio/<tag>-p<patchset>. A URL that names another build is refused.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		cfg, err := loadConfig()
 		if err != nil {
@@ -42,7 +44,9 @@ our Studio build from [studio] artifact_url and artifact_sha256.`,
 		for _, a := range args {
 			svcs = append(svcs, serviceOf(a))
 		}
-		if len(svcs) == 0 {
+		// `supavise upgrade` runs `artifacts fetch --studio` when Studio is the only thing that moves,
+		// which asks for Studio and nothing else.
+		if len(svcs) == 0 && !artifactsFetchStudio {
 			for name := range store.Versions().Artifacts {
 				svcs = append(svcs, serviceOf(name))
 			}
@@ -152,7 +156,7 @@ func serviceOf(name string) string {
 }
 
 func init() {
-	artifactsFetchCmd.Flags().BoolVar(&artifactsFetchStudio, "studio", false, "also fetch our Studio build")
+	artifactsFetchCmd.Flags().BoolVar(&artifactsFetchStudio, "studio", false, "fetch our Studio build (with the services named, if any)")
 	artifactsGCCmd.Long = `Removes the unpacked artifacts that nothing needs: not the versions this binary pins,
 not the versions any project runs (or is being upgraded to), and not those of the last
 [upgrade] keep_releases releases this node ran (default 3: the current one and the two before, so a

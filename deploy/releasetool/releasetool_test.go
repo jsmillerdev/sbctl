@@ -443,3 +443,73 @@ func mustRead(t *testing.T, p string) []byte {
 	}
 	return b
 }
+
+// The manifest's studio is the Studio build, the tag and the patch set, which is what the release's
+// binary reports; the patch set of the Studio archives (studio/PATCHSET) and of the pin file must
+// agree, and a binary that pins another build stops the release.
+func TestManifestStudioIsTheBuild(t *testing.T) {
+	dir := t.TempDir()
+	withPatchset := strings.Replace(newYAML, "  tag: 2026.10.12-sha-abcdef1\n", "  tag: 2026.10.12-sha-abcdef1\n  patchset: 3\n", 1)
+	vf := filepath.Join(dir, "versions.yaml")
+	if err := os.WriteFile(vf, []byte(withPatchset), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	write := func(name, body string, mode os.FileMode) string {
+		p := filepath.Join(dir, name)
+		if err := os.WriteFile(p, []byte(body), mode); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	out := filepath.Join(dir, "m.json")
+	manifest := func(extra ...string) (*selfupdate.Manifest, error) {
+		os.Remove(out)
+		if err := cmdManifest(append([]string{"-version", "v1.1.0", "-min-upgrade-from", "v1.0.0", "-versions", vf, "-out", out}, extra...)); err != nil {
+			return nil, err
+		}
+		return selfupdate.ParseManifest(mustRead(t, out))
+	}
+	const build = "2026.10.12-sha-abcdef1-p3"
+	if m, err := manifest("-patchset", write("PATCHSET", "3\n", 0o644)); err != nil || m.Studio != build {
+		t.Fatalf("manifest: %+v, %v", m, err)
+	}
+	if _, err := manifest("-patchset", write("PATCHSET-2", "2\n", 0o644)); err == nil || !strings.Contains(err.Error(), "change them together") {
+		t.Fatalf("a patch set that differs: %v", err)
+	}
+	if _, err := os.Stat(out); err == nil {
+		t.Fatal("a refused manifest was written")
+	}
+	good := write("good", `#!/bin/sh
+echo '{"version":"v1.1.0","converge_revision":1,"pins":{"studio":"`+build+`"}}'`, 0o755)
+	if m, err := manifest("-binary", good); err != nil || m.Studio != build {
+		t.Fatalf("a binary of the release: %+v, %v", m, err)
+	}
+	tagOnly := write("tag-only", `#!/bin/sh
+echo '{"version":"v1.1.0","converge_revision":1,"pins":{"studio":"2026.10.12-sha-abcdef1"}}'`, 0o755)
+	if _, err := manifest("-binary", tagOnly); err == nil || !strings.Contains(err.Error(), "not of one release") {
+		t.Fatalf("a binary that pins another build: %v", err)
+	}
+	// The repository's own files agree.
+	repo, err := readVersions(filepath.Join("..", "..", "internal", "versions", "versions.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := checkPatchset(filepath.Join("..", "..", "studio", "PATCHSET"), repo); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A release that changes only the patch set lists Studio as moved, linked to its upstream commit
+// and without a comparison of a commit with itself.
+func TestNotesListAPatchsetOnlyStudioChange(t *testing.T) {
+	old := parse(t, oldYAML)
+	neu := parse(t, strings.Replace(oldYAML, "  tag: 2026.10.05-sha-94b8b06\n", "  tag: 2026.10.05-sha-94b8b06\n  patchset: 3\n", 1))
+	d := Diff(old, neu)
+	if len(d) != 1 || d[0] != (Change{"studio", "2026.10.05-sha-94b8b06", "2026.10.05-sha-94b8b06-p3"}) {
+		t.Fatalf("diff = %+v", d)
+	}
+	table := ServiceTable(d)
+	if !strings.Contains(table, "[2026.10.05-sha-94b8b06-p3](https://github.com/supabase/supabase/commit/94b8b06)") || strings.Contains(table, "compare") {
+		t.Fatalf("table:\n%s", table)
+	}
+}

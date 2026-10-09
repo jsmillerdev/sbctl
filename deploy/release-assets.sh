@@ -99,6 +99,9 @@ if [[ -n $tag ]]; then
   case $wal in true | false) ;; *) echo "SUPAVISE_WAL_COMPAT $wal is not true or false" >&2; exit 1 ;; esac
   extra=(-min-peer-from "$peer" "-wal-compat=$wal")
   [[ ${SUPAVISE_REQUIRE_CONVERGE:-} != 1 ]] || extra+=(-require-converge)
+  # The release's own pin file must name the patch set its Studio archives carry (studio/PATCHSET);
+  # a test that passes its own pin file (SUPAVISE_VERSIONS_FILE) ships stand-in archives.
+  [[ -n ${SUPAVISE_VERSIONS_FILE:-} ]] || extra+=(-patchset "$here/../studio/PATCHSET")
   # The binary that reports the host converge revision is the one this machine can run.
   case $(uname -m) in aarch64|arm64) probe=supavise-linux-arm64 ;; *) probe=supavise-linux-amd64 ;; esac
   # upload-artifact and download-artifact do not keep the execute bit, so the binary of the release

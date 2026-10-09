@@ -4,7 +4,7 @@
 // .github/workflows/bump-proposals.yml call it; it reads and writes files, runs a built binary's
 // release-info when the manifest is given one, and never touches the network.
 //
-//	releasetool manifest -version v1.4.0 -min-upgrade-from v1.2.0 [-min-peer-from v1.3.0] [-wal-compat=false] [-versions FILE] [-binary FILE [-require-converge]] [-template FILE] [-out FILE]
+//	releasetool manifest -version v1.4.0 -min-upgrade-from v1.2.0 [-min-peer-from v1.3.0] [-wal-compat=false] [-versions FILE] [-patchset FILE] [-binary FILE [-require-converge]] [-template FILE] [-out FILE]
 //	releasetool notes    -tag v1.4.0 [-prev-tag v1.3.0] -repo owner/name -new FILE [-old FILE] [-log FILE] [-min-upgrade-from v1.2.0]
 //	releasetool bump     -versions FILE -service auth -to auth-v2.196.0-r0
 //	releasetool table    -old FILE -new FILE        (the service version table alone, for a pull request)
@@ -14,6 +14,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 
 	"github.com/supavise/supavise/internal/artifacts"
@@ -77,14 +78,23 @@ func cmdManifest(args []string) error {
 	template := fs.String("template", "", "the CloudFormation template as attached to the release: the manifest names its stack revision, asset and SHA-256; with -binary the two must agree on the stack revision")
 	minPeer := fs.String("min-peer-from", "", "the oldest release a joined server may run alongside this one (min_peer_from; empty leaves the field out)")
 	walCompat := fs.Bool("wal-compat", true, "false when this release's PostgreSQL cannot read the WAL of the releases before it, so that the servers holding standbys must upgrade first (wal_compat)")
+	patchset := fs.String("patchset", "", "studio/PATCHSET of the tree the Studio archives were built from: it must equal studio.patchset in -versions (empty skips the check)")
 	out := fs.String("out", "-", "output file")
 	_ = fs.Parse(args)
 	v, err := readVersions(*versions)
 	if err != nil {
 		return err
 	}
+	if *patchset != "" {
+		if err := checkPatchset(*patchset, v); err != nil {
+			return err
+		}
+	}
+	// studio is the Studio build, the upstream tag and the patch set (artifacts.Versions.StudioBuild),
+	// which is the Studio pin the release's binary reports: every reader of the manifest compares the
+	// two as strings (nodeupgrade.CheckManifestPins), so the meaning of the field and the schema stay.
 	m := &selfupdate.Manifest{Schema: selfupdate.ManifestSchema, Version: *version, MinUpgradeFrom: *min,
-		MinPeerFrom: *minPeer, Artifacts: v.Artifacts, Studio: v.Studio.Tag}
+		MinPeerFrom: *minPeer, Artifacts: v.Artifacts, Studio: v.StudioBuild()}
 	if !*walCompat {
 		m.WALCompat = walCompat
 	}
@@ -96,6 +106,11 @@ func cmdManifest(args []string) error {
 				return fmt.Errorf("%s (a release must say which host layer its binary expects; build the binary from a tree that has `supavise release-info` report converge_revision)", built.Why)
 			}
 			fmt.Fprintln(os.Stderr, "releasetool: warning:", built.Why)
+		}
+		// Every node refuses a binary whose Studio pin is not the manifest's (CheckManifestPins), so a
+		// release that would be refused everywhere is stopped here.
+		if built.HasStudio && built.Studio != m.Studio {
+			return fmt.Errorf("the binary %s pins the Studio build %q and %s pins %q: they are not of one release", *binary, built.Studio, *versions, m.Studio)
 		}
 		m.Host = &selfupdate.ManifestHost{ConvergeRevision: built.Converge}
 	}
@@ -114,6 +129,23 @@ func cmdManifest(args []string) error {
 		return err
 	}
 	return output(*out, b)
+}
+
+// checkPatchset compares studio/PATCHSET (the patch set in the name of the Studio archives that
+// studio/build.sh wrote) with studio.patchset of the versions the binary was built with.
+func checkPatchset(path string, v *artifacts.Versions) error {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(string(b)))
+	if err != nil {
+		return fmt.Errorf("%s: %w", path, err)
+	}
+	if n != v.Studio.Patchset {
+		return fmt.Errorf("%s says patch set %d and versions.yaml studio.patchset says %d: the release would ship Studio archives of one build and a binary that runs another; change them together", path, n, v.Studio.Patchset)
+	}
+	return nil
 }
 
 func cmdBump(args []string) error {

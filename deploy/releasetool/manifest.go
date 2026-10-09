@@ -27,6 +27,10 @@ type probed struct {
 	// Stack is the AWS stack revision (infra_revision); HasStack is false when the binary reports none.
 	Stack    int
 	HasStack bool
+	// Studio is the Studio build the binary pins (pins.studio); HasStudio is false when it reports
+	// none.
+	Studio    string
+	HasStudio bool
 }
 
 // probe runs the binary's `release-info --json` and reads the revisions. The binary is a build of
@@ -48,6 +52,12 @@ func probe(binary string) probed {
 		return probed{Why: fmt.Sprintf("%s release-info printed no JSON: %v", binary, err)}
 	}
 	var p probed
+	if raw, ok := info["pins"]; ok {
+		var pins map[string]string
+		if json.Unmarshal(raw, &pins) == nil && pins["studio"] != "" {
+			p.Studio, p.HasStudio = pins["studio"], true
+		}
+	}
 	if raw, ok := info["infra_revision"]; ok {
 		if err := json.Unmarshal(raw, &p.Stack); err != nil || p.Stack < 0 {
 			p.Stack = 0
