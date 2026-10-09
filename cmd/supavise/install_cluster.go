@@ -174,7 +174,7 @@ func stageToken(token []byte, uid, gid int) (path string, cleanup func(), err er
 // joinCluster is the part of the install that replaces the system project: the server joins the
 // leader the token names, then its daemon runs.
 func (in *installer) joinCluster(o installOptions, configChanged, existed bool, uid, gid int) error {
-	if err := in.joinStep(cliJoiner{in}, o.JoinTokenFile, config.DefaultPath, uid, gid); err != nil {
+	if err := in.joinAndConverge(cliJoiner{in}, o.JoinTokenFile, config.DefaultPath, uid, gid); err != nil {
 		return err
 	}
 	if err := in.startDaemon(configChanged, existed); err != nil {
@@ -186,6 +186,18 @@ func (in *installer) joinCluster(o installOptions, configChanged, existed bool, 
 	}
 	printJoinSummary(in.out)
 	return nil
+}
+
+// joinAndConverge joins with j and converges the host again. The converge before the join ran on a
+// server without a cluster identity, so it left out what only a cluster node has (the refresh of the
+// cluster settings from the leader); this one has the identity the join wrote, and the install ends with
+// `supavise system converge --check` listing nothing.
+func (in *installer) joinAndConverge(j clusterJoiner, tokenFile, configPath string, uid, gid int) error {
+	if err := in.joinStep(j, tokenFile, configPath, uid, gid); err != nil {
+		return err
+	}
+	in.step("converging the host as a cluster node")
+	return in.converge()
 }
 
 // joinStep joins with j: it continues a join that got as far as a certificate, and otherwise hands
