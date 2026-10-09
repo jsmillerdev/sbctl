@@ -7,9 +7,12 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/supavise/supavise/internal/config"
+	"github.com/supavise/supavise/internal/failover/fenced"
 	"github.com/supavise/supavise/internal/registry"
+	"github.com/supavise/supavise/internal/units"
 )
 
 func systemStandbyPlan() SystemStandbyPlan {
@@ -214,3 +217,42 @@ type closingSup struct {
 }
 
 func (c *closingSup) Close() { c.closed++ }
+
+// The system cluster starts from the files it was rendered with, with an empty registry and no key: the
+// registry is this cluster, and a planned move that stopped it starts it again this way. A cluster that was
+// never rendered, and one this node is fenced for, do not start.
+func TestStartSystemDatabaseNeedsNoRegistryAndNoCredentials(t *testing.T) {
+	ctx := context.Background()
+	f := newReplicaFixture(t)
+	pl := NewPostgresPlane(f.cfg, f.sup, fakeArts{}, registry.NewMemory(), PlaneOptions{PostgresReadyTimeout: 200 * time.Millisecond})
+
+	if err := pl.StartSystemDatabase(ctx); err == nil || !strings.Contains(err.Error(), "never rendered") {
+		t.Fatalf("a system cluster that was never rendered: %v", err)
+	}
+	if strings.Contains(f.sup.ops(), "start") {
+		t.Fatalf("a unit was started:\n%s", f.sup.ops())
+	}
+
+	run := units.FilesFor(f.cfg, units.Spec{Service: config.SvcPostgres, Ref: config.SystemRef}).Run
+	if err := os.MkdirAll(filepath.Dir(run), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(run, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// The unit is started; nothing answers on the socket of a test, so the wait ends in its own error.
+	err := pl.StartSystemDatabase(ctx)
+	if err == nil || !strings.Contains(err.Error(), "not ready") {
+		t.Fatalf("StartSystemDatabase = %v", err)
+	}
+	if !strings.Contains(f.sup.ops(), "start supavise-postgres@system.service") {
+		t.Fatalf("the system unit was not started:\n%s", f.sup.ops())
+	}
+
+	if err := fenced.WriteNode(f.cfg.Paths(), fenced.Record{Epoch: 4, Leader: "n2", Reason: "replaced by n2"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := pl.StartSystemDatabase(ctx); !errors.Is(err, ErrFenced) {
+		t.Fatalf("a fenced node started its system cluster: %v", err)
+	}
+}

@@ -1,6 +1,7 @@
 package app
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -31,11 +32,16 @@ type localPrimaries struct {
 	timers lifecycle.Timers // nil: the node has no backup timers (the exec supervisor)
 	log    *slog.Logger
 	now    func() time.Time
+	// registryWait is how often, and registryTries how many times, Start of the system cluster looks for
+	// the registry that the cluster has just started to hold; zero is two seconds and thirty tries.
+	registryWait  time.Duration
+	registryTries int
 }
 
 // primaryPlane is the part of *lifecycle.PostgresPlane that a move uses.
 type primaryPlane interface {
 	Start(ctx context.Context, p *registry.Project, keys *secrets.ProjectKeys) error
+	StartSystemDatabase(ctx context.Context) error
 	Stop(ctx context.Context, ref string) error
 	Health(ctx context.Context, p *registry.Project, keys *secrets.ProjectKeys) []lifecycle.ServiceHealth
 	FinalCheckpoint(ref string) (lifecycle.ControlInfo, error)
@@ -72,9 +78,19 @@ func (l *localPrimaries) Stop(ctx context.Context, ref string) (string, error) {
 
 // Start starts ref's units as a primary and its backup timer. A project the node is fenced for does
 // not start (the fence record is what keeps a replaced primary down); units that run are left alone.
+//
+// The registry is the system cluster, which a planned move stops: a project's row and credentials
+// cannot be read while it is down, so the system cluster starts first, from its rendered files, and the
+// rest (its GoTrue) once the registry answers again. Without that a resume or an abort could not bring the
+// old leader back.
 func (l *localPrimaries) Start(ctx context.Context, ref string) error {
 	if rec, blocked := fenced.Blocks(l.cfg.Paths(), ref); blocked {
 		return fmt.Errorf("%s may not start as a primary on this node: it is fenced (%s)", ref, rec.Reason)
+	}
+	if ref == config.SystemRef {
+		if err := l.plane.StartSystemDatabase(ctx); err != nil {
+			return err
+		}
 	}
 	p, keys, err := l.project(ctx, ref)
 	if err != nil {
@@ -127,16 +143,36 @@ func (l *localPrimaries) SetAside(ctx context.Context, ref string, epoch int64) 
 	return nil
 }
 
+// project reads ref's row and credentials. The system cluster has just been started when it is asked
+// for, and its registry answers a moment later, so the read is repeated for it.
 func (l *localPrimaries) project(ctx context.Context, ref string) (*registry.Project, *secrets.ProjectKeys, error) {
-	p, err := l.reg().GetProject(ctx, ref)
-	if err != nil {
-		return nil, nil, err
+	tries, every := 1, time.Duration(0)
+	if ref == config.SystemRef {
+		tries, every = cmp.Or(l.registryTries, 30), cmp.Or(l.registryWait, 2*time.Second)
 	}
-	keys, err := l.keys(ctx, ref)
-	if err != nil {
-		return nil, nil, err
+	var err error
+	for i := 0; i < tries; i++ {
+		if i > 0 {
+			select {
+			case <-ctx.Done():
+				return nil, nil, ctx.Err()
+			case <-time.After(every):
+			}
+		}
+		var p *registry.Project
+		if p, err = l.reg().GetProject(ctx, ref); err != nil {
+			continue
+		}
+		var keys *secrets.ProjectKeys
+		if keys, err = l.keys(ctx, ref); err != nil {
+			continue
+		}
+		return p, keys, nil
 	}
-	return p, keys, nil
+	if ref == config.SystemRef {
+		return nil, nil, fmt.Errorf("the system cluster is back, but the registry in it does not answer: %w", err)
+	}
+	return nil, nil, err
 }
 
 // postmasterAlive reports whether the postmaster.pid in dir names a process that exists.
