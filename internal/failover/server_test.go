@@ -1201,3 +1201,63 @@ func TestAbortOfASwitchoverWhoseLogHoldsOnlyThePlanStartsTheLeaderAgain(t *testi
 		}
 	})
 }
+
+// The old leader's system cluster is demoted with no registry to read (it is the database the leader
+// stopped for the move): the request carries the replication password, and only that request does.
+func TestTheDemotionOfTheSystemClusterCarriesTheReplicationPassword(t *testing.T) {
+	w := serverWorld(t)
+	o := w.orch(func(d *Deps) {
+		d.SystemReplicationPassword = func(context.Context) (string, error) { return "s3cret", nil }
+	})
+	mv, err := o.FailoverServer(w.ctx, ServerOptions{})
+	if err != nil || mv.State != registry.MoveDone {
+		t.Fatalf("move: %+v, %v", mv, err)
+	}
+	sys, other := 0, 0
+	for id, pw := range w.demotePasswords {
+		if strings.HasPrefix(id, config.SystemRef+"-rr-") {
+			sys++
+			if pw != "s3cret" {
+				t.Errorf("the demotion of %s carried %q", id, pw)
+			}
+		} else {
+			other++
+			if pw != "" {
+				t.Errorf("the demotion of %s carried a password", id)
+			}
+		}
+	}
+	if sys != 1 || other == 0 {
+		t.Fatalf("demotions: %d of the system cluster, %d of projects: %v", sys, other, w.demotePasswords)
+	}
+	// Without a source the request carries none: the old leader reads its registry, as it did.
+	w2 := serverWorld(t)
+	if _, err := w2.orch().FailoverServer(w2.ctx, ServerOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	for id, pw := range w2.demotePasswords {
+		if pw != "" {
+			t.Errorf("without a source, the demotion of %s carried a password", id)
+		}
+	}
+}
+
+// A leader that stopped for a switchover accepts as its successor the node the record names, at the epoch
+// the switchover runs at or a later one, and no other; the record ends with the cluster's epoch.
+func TestAuthorizesSuccessorFollowsTheRecordOfTheQuiesce(t *testing.T) {
+	w := newWorld(t)
+	o := w.orch()
+	if o.AuthorizesSuccessor("n2", 2) {
+		t.Fatal("a leader that stopped for nobody has a successor")
+	}
+	must(t, o.saveQuiesce(&quiesceRecord{To: "n2", Epoch: 2, At: w.now()}))
+	for _, tc := range []struct {
+		node  string
+		epoch int64
+		want  bool
+	}{{"n2", 2, true}, {"n2", 3, true}, {"n2", 1, false}, {"n3", 2, false}, {"", 2, false}} {
+		if got := o.AuthorizesSuccessor(tc.node, tc.epoch); got != tc.want {
+			t.Errorf("AuthorizesSuccessor(%q, %d) = %v, want %v", tc.node, tc.epoch, got, tc.want)
+		}
+	}
+}

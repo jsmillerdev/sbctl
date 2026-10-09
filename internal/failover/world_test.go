@@ -60,6 +60,8 @@ type world struct {
 	markErr error
 	// markerRace, when set, replaces the marker right after the next write.
 	markerRace *backup.LeaderMarker
+	// demotePasswords: the replication password each demote request carried, by identifier.
+	demotePasswords map[string]string
 	// held: the holds of a planned stop on the nodes other than this one (node/ref); this node's is a
 	// file in cfg.StateDir, read with fenced.Project.
 	held map[string]bool
@@ -676,6 +678,12 @@ func (i *worldInstances) Do(_ context.Context, node, identifier string, a peerap
 		if err := w.do("demote %s/%s epoch=%d", node, identifier, req.Epoch); err != nil {
 			return peerapi.InstanceStatus{}, err
 		}
+		w.mu.Lock()
+		if w.demotePasswords == nil {
+			w.demotePasswords = map[string]string{}
+		}
+		w.demotePasswords[identifier] = req.ReplicationPassword
+		w.mu.Unlock()
 		ref, _, _, ok := registry.ParseReplicaIdentifier(identifier)
 		if !ok {
 			return peerapi.InstanceStatus{}, fmt.Errorf("bad identifier %s", identifier)

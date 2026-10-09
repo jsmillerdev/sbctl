@@ -34,6 +34,12 @@ type LiveOptions struct {
 	// which it checks, and its verdict decides: false leaves the node leading. An error with a true verdict
 	// is logged; the node is fenced all the same.
 	Fence func(ctx context.Context, source string, epoch int64, leader string) (fenced bool, err error)
+	// Successor, when set, says whether node is the one this node stopped its cluster for and handed the
+	// leadership to, at epoch or a later one (the failover orchestrator's record of a planned switchover).
+	// The system cluster of the old leader of such a switchover is stopped, so it cannot read the registry
+	// that would name the new leader; it follows the word of its successor (ObserveEpoch) and answers
+	// the leader's requests as those of the leader, which the demotion of its own clusters needs.
+	Successor func(node string, epoch int64) bool
 	// OnFenced is called once, when a running leader learns that another node holds the leadership
 	// (ObserveEpoch). The daemon stops the clusters, raises the alert and restarts into fenced mode.
 	OnFenced func(FencedRecord)
@@ -323,17 +329,34 @@ func (l *Live) probeRole(ctx context.Context) {
 		return
 	}
 	rec, err := l.o.InRecovery(ctx)
+	l.mu.Lock()
+	l.primary = err == nil && !rec
+	l.mu.Unlock()
 	if err != nil {
 		return
 	}
-	l.mu.Lock()
-	l.primary = !rec
-	l.mu.Unlock()
 	if rec {
 		l.watchRole(RoleFollower)
 	} else {
 		l.watchRole(RoleLeader)
 	}
+}
+
+// followSuccessor makes the node it stopped for the leader the membership reports, when this node's system
+// cluster is not a primary (it is stopped for a planned switchover, or a standby already) and a peer says
+// that node leads at a higher epoch. The epoch the snapshot carries stays: the record of the switchover
+// ends when the registry shows the new epoch, and the registry is read again once the cluster is a standby.
+func (l *Live) followSuccessor(leader string, epoch int64) {
+	if l.o.Successor == nil || !l.o.Successor(leader, epoch) {
+		return
+	}
+	snap := l.get()
+	if snap.Leader == leader {
+		return
+	}
+	snap.Leader = leader
+	l.Set(snap)
+	l.o.Log.Info("membership: the node this one stopped for leads; its requests are the leader's", "leader", leader, "epoch", epoch)
 }
 
 // watchRole closes Changed when the role differs from the boot role on two polls in a row (one
@@ -372,8 +395,13 @@ func (l *Live) observe(source string, epoch int64, leader string) {
 		return
 	}
 	l.mu.Lock()
-	if l.fencing || l.fenced != nil || (l.o.InRecovery != nil && !l.primary) {
+	if l.fencing || l.fenced != nil {
 		l.mu.Unlock()
+		return
+	}
+	if l.o.InRecovery != nil && !l.primary {
+		l.mu.Unlock()
+		l.followSuccessor(leader, epoch)
 		return
 	}
 	l.fencing = true

@@ -113,6 +113,18 @@ func (l *lateFencer) set(f interface {
 	l.mu.Unlock()
 }
 
+// successor is cluster.LiveOptions.Successor: whether the orchestrator's record of a planned switchover
+// names node as the one this leader stopped for. Without an orchestrator there is no record.
+func (l *lateFencer) successor(node string, epoch int64) bool {
+	l.mu.Lock()
+	f := l.f
+	l.mu.Unlock()
+	s, ok := f.(interface {
+		AuthorizesSuccessor(node string, epoch int64) bool
+	})
+	return ok && s.AuthorizesSuccessor(node, epoch)
+}
+
 func (l *lateFencer) fence(ctx context.Context, source string, epoch int64, leader string) (bool, error) {
 	l.mu.Lock()
 	f := l.f
@@ -382,7 +394,7 @@ func startCluster(ctx context.Context, w *Wire, boot cluster.BootDecision, dir s
 	Provide(w, fencer)
 	live := cluster.NewLive(cluster.LiveOptions{
 		Cfg: cfg, Reg: reg, SelfID: selfID, Boot: boot, Log: log,
-		Fence: fencer.fence, Marker: &lazyMarker{cfg: cfg},
+		Fence: fencer.fence, Successor: fencer.successor, Marker: &lazyMarker{cfg: cfg},
 		InRecovery: systemInRecovery(dsns, RegistryDSNs(cfg)[0], cluster.InRecovery),
 		OnFenced: func(rec cluster.FencedRecord) {
 			_ = alerts.Notify(context.Background(), alerts.Event{

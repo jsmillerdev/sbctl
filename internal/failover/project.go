@@ -738,6 +738,14 @@ func (o *Orchestrator) demoteOld(ctx context.Context, from registry.Node, ref, i
 	if identifier == "" || identifier == "-" {
 		return "", errors.New("there is no replica row for the old home")
 	}
+	req := peerapi.InstanceAction{Epoch: epoch, TimeoutSeconds: timeout}
+	if ref == config.SystemRef && o.d.SystemReplicationPassword != nil {
+		pw, err := o.d.SystemReplicationPassword(ctx)
+		if err != nil {
+			return "", fmt.Errorf("reading the replication password of the system cluster: %w", err)
+		}
+		req.ReplicationPassword = pw
+	}
 	var err error
 	for attempt := 0; attempt < 4; attempt++ {
 		if attempt > 0 {
@@ -745,7 +753,7 @@ func (o *Orchestrator) demoteOld(ctx context.Context, from registry.Node, ref, i
 				return "", werr
 			}
 		}
-		_, err = o.d.Instances.Do(ctx, from.ID, identifier, peerapi.ActionDemote, peerapi.InstanceAction{Epoch: epoch, TimeoutSeconds: timeout})
+		_, err = o.d.Instances.Do(ctx, from.ID, identifier, peerapi.ActionDemote, req)
 		if err == nil {
 			return identifier + " on " + from.Name, nil
 		}

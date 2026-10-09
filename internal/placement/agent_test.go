@@ -117,6 +117,12 @@ func (f *fakeReplicaPlane) PromoteReplica(_ context.Context, t lifecycle.Replica
 func (f *fakeReplicaPlane) DemoteToReplica(_ context.Context, t lifecycle.ReplicaTarget) error {
 	return f.rec("demote "+t.Project.Ref, &t)
 }
+func (f *fakeReplicaPlane) SystemStandbyTarget(identifier, password string) (lifecycle.ReplicaTarget, error) {
+	return lifecycle.ReplicaTarget{
+		Identifier: identifier, Project: &registry.Project{Ref: config.SystemRef, Name: "system"},
+		Keys: &secrets.ProjectKeys{ReplicationPassword: password},
+	}, nil
+}
 
 type agentEnv struct {
 	a     *NodeAgent
@@ -1141,5 +1147,35 @@ func TestStartLocalAndObserveAllRunABoundedNumberAtOnce(t *testing.T) {
 		if got[i-1].Identifier >= got[i].Identifier {
 			t.Fatalf("the report is not in the order of the identifiers: %s before %s", got[i-1].Identifier, got[i].Identifier)
 		}
+	}
+}
+
+// The old leader of a planned switchover demotes its system cluster with no registry to read (that registry
+// is the cluster it stopped for the move): the request carries the replication password, and the project row
+// is the system project's.
+func TestDemoteOfTheSystemClusterNeedsNoRegistry(t *testing.T) {
+	ctx := context.Background()
+	e := newAgentEnv(t) // its registry has no system project
+	id := registry.ReplicaIdentifier(config.SystemRef, "us-east-1", "sys123")
+	e.plane.obs.Role = lifecycle.ReplicaRoleReplica
+	e.plane.obs.InRecovery = true
+	if _, err := e.a.Do(ctx, id, peerapi.ActionDemote, peerapi.InstanceAction{Epoch: 5}); err == nil {
+		t.Fatal("a demotion of the system cluster with no password and no registry succeeded")
+	}
+	if e.plane.all() != "" {
+		t.Fatalf("the plane was driven: %s", e.plane.all())
+	}
+	st, err := e.a.Do(ctx, id, peerapi.ActionDemote, peerapi.InstanceAction{Epoch: 5, ReplicationPassword: "s3cret"})
+	if err != nil || st.Step != StepCompleted {
+		t.Fatalf("demote: %+v %v", st, err)
+	}
+	if e.plane.all() != "demote system" {
+		t.Fatalf("calls = %s", e.plane.all())
+	}
+	if got := e.plane.targets[len(e.plane.targets)-1].Keys.ReplicationPassword; got != "s3cret" {
+		t.Fatalf("the plane got the password %q", got)
+	}
+	if e.a.get(id) == nil {
+		t.Fatal("the demoted cluster is not recorded as a replica")
 	}
 }

@@ -219,6 +219,11 @@ type InstanceAction struct {
 	// the project's size and the node's copy of the registry may not have caught up. Empty: the
 	// size in the node's copy.
 	Class string `json:"class,omitempty"`
+	// ReplicationPassword (demote, system cluster only): the opened password of the system cluster's
+	// replication role. The old leader of a planned switchover cannot read it from its registry, which is
+	// the database it stopped for the move; the leader that took over sends it with the request, over the
+	// mesh. It is a secret: the node writes it into the 0600 postgresql.auto.conf of the standby, and no log.
+	ReplicationPassword string `json:"replication_password,omitempty"`
 }
 
 // PlaneMethod names a method of lifecycle.Plane. placement's reflection test fails when the

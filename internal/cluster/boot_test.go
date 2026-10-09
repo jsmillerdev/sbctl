@@ -1141,3 +1141,37 @@ type unreadable struct{ registry.Registry }
 func (unreadable) GetCluster(context.Context) (*registry.Cluster, error) {
 	return nil, errors.New("the socket of the standby is gone")
 }
+
+// The old leader of a planned switchover has stopped its database, so it cannot read the registry that
+// names the new leader. It follows the word of the node its record says it stopped for, and only that one:
+// its requests are then the leader's (the demotion of the node's own clusters), and the node is not fenced.
+func TestLiveFollowsTheSuccessorItStoppedFor(t *testing.T) {
+	p := &probe{}
+	l, _, _ := newLive(t, BootDecision{Role: RoleLeader, SelfID: "n1"}, p)
+	l.o.Successor = func(node string, epoch int64) bool { return node == "n2" && epoch >= 2 }
+	ctx := context.Background()
+	l.Refresh(ctx)
+	if lead, ok := l.Leader(); !ok || lead.ID != "n1" {
+		t.Fatalf("leader %+v", lead)
+	}
+	// The quiesce stopped the database: the probe fails, and the node is not a primary.
+	p.set(false, errors.New("the cluster is stopped"))
+	l.Refresh(ctx)
+	l.ObserveEpoch("n3", 2, "n3") // a node nobody stopped for
+	if lead, _ := l.Leader(); lead.ID != "n1" || l.Fenced() != nil {
+		t.Fatalf("a stranger took the leadership: %+v", lead)
+	}
+	l.ObserveEpoch("n2", 2, "n2")
+	if lead, ok := l.Leader(); !ok || lead.ID != "n2" {
+		t.Fatalf("the successor does not lead: %+v %v", lead, ok)
+	}
+	if l.Epoch() != 1 || l.Role() != RoleLeader || l.Fenced() != nil {
+		t.Fatalf("epoch %d, role %s, fenced %v: the snapshot keeps all but the leader", l.Epoch(), l.Role(), l.Fenced())
+	}
+	// A refresh with an unreadable registry (the database is still stopped) leaves it so.
+	l.o.Reg = unreadable{l.o.Reg}
+	l.Refresh(ctx)
+	if lead, _ := l.Leader(); lead.ID != "n2" {
+		t.Fatalf("a refresh took the successor back: %+v", lead)
+	}
+}

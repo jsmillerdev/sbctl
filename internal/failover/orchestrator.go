@@ -49,6 +49,11 @@ type Deps struct {
 	// the node's supervisor). When it is set, a fence of the whole node uses it in place of stopping
 	// the primaries and the shared services one by one; a fence of one project never does.
 	FenceNode func(ctx context.Context) (stopped []string, err error)
+	// SystemReplicationPassword is the opened password of the system cluster's replication role. The old
+	// leader of a planned switchover demotes its system cluster in place and has no registry to read it
+	// from (the registry is that cluster, stopped for the move), so the request that demotes it carries
+	// the password. Nil: the request carries none, and the old leader reads the registry as before.
+	SystemReplicationPassword func(ctx context.Context) (string, error)
 
 	// Extra adds checks to the preflight of a server move.
 	Extra ExtraChecks
