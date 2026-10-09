@@ -1,4 +1,4 @@
-From 6f575427c32b375242b2a57d5dbcdd138e178ef8 Mon Sep 17 00:00:00 2001
+From 22dbada4d7c6343d636f6740e7a0f9d26d31b819 Mon Sep 17 00:00:00 2001
 From: supavise <supavise@users.noreply.invalid>
 Date: Thu, 8 Oct 2026 22:50:29 -0700
 Subject: [PATCH 4/4] feat(studio): serve the MCP route in platform mode
@@ -33,20 +33,20 @@ files). The token is never logged or put into a response.
 Only the pages router is changed; the TanStack twin of the route is not built
 by this deployment.
 ---
- apps/studio/lib/api/platform-mcp.test.ts | 299 +++++++++++++++++++++++
- apps/studio/lib/api/platform-mcp.ts      | 137 +++++++++++
+ apps/studio/lib/api/platform-mcp.test.ts | 322 +++++++++++++++++++++++
+ apps/studio/lib/api/platform-mcp.ts      | 136 ++++++++++
  apps/studio/lib/hosted-api-allowlist.ts  |   1 +
  apps/studio/pages/api/mcp/index.ts       |   9 +
- 4 files changed, 446 insertions(+)
+ 4 files changed, 468 insertions(+)
  create mode 100644 apps/studio/lib/api/platform-mcp.test.ts
  create mode 100644 apps/studio/lib/api/platform-mcp.ts
 
 diff --git a/apps/studio/lib/api/platform-mcp.test.ts b/apps/studio/lib/api/platform-mcp.test.ts
 new file mode 100644
-index 0000000..55b1834
+index 0000000..50fe95c
 --- /dev/null
 +++ b/apps/studio/lib/api/platform-mcp.test.ts
-@@ -0,0 +1,299 @@
+@@ -0,0 +1,322 @@
 +import { EventEmitter } from 'node:events'
 +import { createSupabaseMcpServer } from '@supabase/mcp-server-supabase'
 +import { createSupabaseApiPlatform } from '@supabase/mcp-server-supabase/platform/api'
@@ -321,6 +321,29 @@ index 0000000..55b1834
 +      expect(server.close).toHaveBeenCalledTimes(1)
 +    })
 +
++    it('does not leave a rejection unhandled when closing the server or the transport fails', async () => {
++      // Plain functions: a vi.fn() handles the promise it returns, which hides the rejection.
++      const { close: closeTransport } = transport
++      const { close: closeServer } = server
++      let closed = 0
++      transport.close = (() => (closed++, Promise.reject(new Error('already closed')))) as never
++      server.close = (() => (closed++, Promise.reject(new Error('already closed')))) as never
++      const unhandled = vi.fn()
++      process.on('unhandledRejection', unhandled)
++      try {
++        const { res, done } = call()
++        await done
++        res.emit('close')
++        await new Promise((resolve) => setTimeout(resolve, 20))
++      } finally {
++        process.off('unhandledRejection', unhandled)
++        transport.close = closeTransport
++        server.close = closeServer
++      }
++      expect(closed).toBe(2)
++      expect(unhandled).not.toHaveBeenCalled()
++    })
++
 +    it('answers a setup failure with a fixed message that has nothing from the request', async () => {
 +      vi.mocked(createSupabaseMcpServer).mockImplementation(() => {
 +        throw new Error(`boom with ${TOKEN}`)
@@ -348,10 +371,10 @@ index 0000000..55b1834
 +})
 diff --git a/apps/studio/lib/api/platform-mcp.ts b/apps/studio/lib/api/platform-mcp.ts
 new file mode 100644
-index 0000000..cab9077
+index 0000000..db58db9
 --- /dev/null
 +++ b/apps/studio/lib/api/platform-mcp.ts
-@@ -0,0 +1,137 @@
+@@ -0,0 +1,136 @@
 +import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js'
 +import { createSupabaseMcpServer, CURRENT_FEATURE_GROUPS } from '@supabase/mcp-server-supabase'
 +import { createSupabaseApiPlatform } from '@supabase/mcp-server-supabase/platform/api'
@@ -475,8 +498,7 @@ index 0000000..cab9077
 +    })
 +    // One server per request, so nothing outlives the response.
 +    res.on('close', () => {
-+      void transport.close()
-+      void server.close()
++      void Promise.allSettled([transport.close(), server.close()])
 +    })
 +
 +    await server.connect(transport)
