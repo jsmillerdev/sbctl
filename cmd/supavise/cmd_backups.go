@@ -308,6 +308,12 @@ func init() {
 			if (restoreAs == "" || restoreAs == args[0]) && !restoreForce {
 				return backup.ErrForceRequired
 			}
+			// A standby cannot follow a restored primary: the project's replicas go first.
+			if restoresInPlace(args[0], restoreAs) {
+				if err := removeReplicasBeforeRestore(cmd.Context(), args[0]); err != nil {
+					return err
+				}
+			}
 			svc, closeFn, err := openBackupService(cmd.Context(), true, restoreRelayRefs(args[0], restoreAs))
 			if err != nil {
 				return err

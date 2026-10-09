@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/supavise/supavise/internal/config"
+	"github.com/supavise/supavise/internal/lifecycle"
 	"github.com/supavise/supavise/internal/registry"
 	"github.com/supavise/supavise/internal/replicas"
 	"github.com/supavise/supavise/internal/replicas/replicaid"
@@ -222,5 +223,71 @@ func TestReplicasAddNodeWithoutRegion(t *testing.T) {
 	}
 	if out, err := run(t, "replicas", "add", replicaTestRef, "--region", config.DefaultRegion, "--node", "bare"); err != nil || !strings.Contains(out, "on node n4") {
 		t.Fatalf("add --node: %q %v", out, err)
+	}
+}
+
+// A delete or an in-place restore removes the project's replicas first, as the Management API does. This
+// process cannot reach the other nodes: it marks the replicas GOING_DOWN, stops with their names, and
+// goes on once the controller has removed them.
+func TestRemoveReplicasFirstMarksTheReplicasAndStopsWhileTheyRemain(t *testing.T) {
+	reg, _ := replicaTestEnv(t)
+	ctx := context.Background()
+	cfg := config.Default()
+
+	// No replicas: nothing to wait for.
+	if err := removeReplicasFirst(ctx, reg, cfg, replicaTestRef); err != nil {
+		t.Fatalf("a project with no replicas: %v", err)
+	}
+
+	id := registry.ReplicaIdentifier(replicaTestRef, "eu-west-1", "abc123")
+	if err := reg.CreateReplica(ctx, &registry.Replica{Identifier: id, Ref: replicaTestRef, NodeID: "n2", Origin: registry.ReplicaManual,
+		Status: "ACTIVE_HEALTHY"}); err != nil {
+		t.Fatal(err)
+	}
+	err := removeReplicasFirst(ctx, reg, cfg, replicaTestRef)
+	if err == nil || !strings.Contains(err.Error(), id) || !strings.Contains(err.Error(), "still being removed") {
+		t.Fatalf("a replica that cannot be reached: %v", err)
+	}
+	var pe *replicas.PendingError
+	if errors.As(err, &pe) {
+		t.Fatal("the pending error leaks out of the command: it is explained")
+	}
+	r, err := reg.GetReplica(ctx, id)
+	if err != nil || r.Status != "GOING_DOWN" {
+		t.Fatalf("the replica after the refusal: %+v, %v", r, err)
+	}
+
+	// The controller removed it (its row is gone): the command goes on.
+	if err := reg.DeleteReplica(ctx, id); err != nil {
+		t.Fatal(err)
+	}
+	if err := removeReplicasFirst(ctx, reg, cfg, replicaTestRef); err != nil {
+		t.Fatalf("after the removal: %v", err)
+	}
+}
+
+// The delete never reaches the Engine while a replica remains (a nil Engine would stop the test).
+func TestDeleteProjectStopsWhileReplicasRemain(t *testing.T) {
+	reg, _ := replicaTestEnv(t)
+	ctx := context.Background()
+	id := registry.ReplicaIdentifier(replicaTestRef, "eu-west-1", "abc123")
+	if err := reg.CreateReplica(ctx, &registry.Replica{Identifier: id, Ref: replicaTestRef, NodeID: "n2", Origin: registry.ReplicaManual,
+		Status: "ACTIVE_HEALTHY"}); err != nil {
+		t.Fatal(err)
+	}
+	n := &lifecycle.Node{Registry: reg, Cfg: config.Default()}
+	if err := deleteProject(ctx, n, replicaTestRef, false); err == nil || !strings.Contains(err.Error(), id) {
+		t.Fatalf("delete with a replica: %v", err)
+	}
+}
+
+func TestOnlyAnInPlaceRestoreRemovesTheReplicas(t *testing.T) {
+	for _, c := range []struct {
+		as   string
+		want bool
+	}{{"", true}, {replicaTestRef, true}, {"bbbbbbbbbbbbbbbbbbbb", false}} {
+		if got := restoresInPlace(replicaTestRef, c.as); got != c.want {
+			t.Errorf("--as %q: in place = %v, want %v", c.as, got, c.want)
+		}
 	}
 }
