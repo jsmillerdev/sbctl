@@ -2,6 +2,7 @@ package fleet
 
 import (
 	"fmt"
+	"net"
 	"net/url"
 	"path/filepath"
 	"strconv"
@@ -293,6 +294,12 @@ func storageEnv(cfg *config.Config, c *creds, credToken string) (map[string]stri
 // disabled features (studio/placeholders.json) disables it, so with a provider the list is
 // given without it. The flag is read when Studio starts, which is why adding the first
 // provider restarts the unit (Manager.RefreshStudio).
+//
+// Unless [api] disable_oauth is set, Studio also gets the remote MCP endpoint. Connect > MCP
+// shows NEXT_PUBLIC_MCP_URL (a placeholder in the build). Patch 0004 serves the route
+// api.<domain>/mcp forwards to: it calls the Management API at SUPAVISE_MANAGEMENT_API_URL on
+// loopback with the caller's token, and answers get_project_url from
+// SUPAVISE_PROJECT_URL_TEMPLATE. Both are read per request, not substituted into the build.
 func studioEnv(cfg *config.Config, sso bool) map[string]string {
 	env := map[string]string{
 		"HOSTNAME":                "127.0.0.1",
@@ -308,7 +315,36 @@ func studioEnv(cfg *config.Config, sso bool) map[string]string {
 	if sso {
 		env["NEXT_PUBLIC_DISABLED_FEATURES"] = strings.Join(StudioDisabledFeatures(true), ",")
 	}
+	if !cfg.API.DisableOAuth {
+		env["NEXT_PUBLIC_MCP_URL"] = cfg.APIURL() + "/mcp"
+		env["SUPAVISE_MANAGEMENT_API_URL"] = adminURL(cfg)
+		env["SUPAVISE_PROJECT_URL_TEMPLATE"] = projectURLTemplate(cfg)
+	}
 	return env
+}
+
+// adminURL is the Management API as a process on this node reaches it: the daemon's loopback
+// admin listener. A listener on all addresses is reached on 127.0.0.1. On a follower the same
+// port is a forwarder to the leader's (mesh.KindAdmin).
+func adminURL(cfg *config.Config) string {
+	host, port, err := net.SplitHostPort(cfg.Listen.Admin)
+	if err != nil {
+		return "http://127.0.0.1:7000"
+	}
+	if ip := net.ParseIP(host); host == "" || (ip != nil && ip.IsUnspecified()) {
+		host = "127.0.0.1"
+	}
+	return "http://" + net.JoinHostPort(host, port)
+}
+
+// projectURLTemplate is the public API URL of a project with {ref} in place of its ref, in the
+// scheme of the public listeners (as the API's own project URLs).
+func projectURLTemplate(cfg *config.Config) string {
+	scheme := "https"
+	if cfg.TLS.Mode == "off" {
+		scheme = "http"
+	}
+	return scheme + "://" + cfg.ProjectHost("{ref}")
 }
 
 // studioDisabledByDefault is the list of features Studio's build disables before login
