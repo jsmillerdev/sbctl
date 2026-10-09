@@ -439,6 +439,24 @@ func startCluster(ctx context.Context, w *Wire, boot cluster.BootDecision, dir s
 			return k.ReplicationPassword, nil
 		},
 	}
+	// The replicas of a node that rejoined: its projects' primaries are gone from it (a failover replaced them), and
+	// the leader sets a replica of each up again once the node is active. The controller is the leader's and is
+	// wired after this hook, so it is looked up when the node confirms. The setup writes the row and returns, but
+	// it can wait for a base backup, so the confirmation does not.
+	auth.Rebuild = func(ctx context.Context, ref, node string) error {
+		svc := w.API.Replicas
+		if svc == nil {
+			return errors.New("the replica controller does not run on this node")
+		}
+		go func() {
+			sctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Minute)
+			defer cancel()
+			if err := svc.SetupOn(sctx, ref, node); err != nil {
+				log.Warn("a replica could not be set up again on the node that rejoined; run `supavise replicas add`", "project", ref, "node", node, "error", err)
+			}
+		}()
+		return nil
+	}
 	if bs, ok := Get[*backup.Service](w); ok {
 		auth.Ensure = bs
 	} else {

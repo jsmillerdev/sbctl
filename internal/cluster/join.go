@@ -82,8 +82,11 @@ type JoinOptions struct {
 	// Streaming, when set, replaces the look at DSNs: it returns the standby's replay position once it
 	// streams (tests).
 	Streaming func(ctx context.Context) (lsn string, err error)
-	Log       *slog.Logger
-	Now       func() time.Time
+	// Rebuild lists the projects a rejoin set aside, which the confirmation hands to the leader to set up replicas of
+	// (peerapi.JoinConfirm.Rebuild). Rejoin sets it; a join leaves it empty.
+	Rebuild []string
+	Log     *slog.Logger
+	Now     func() time.Time
 }
 
 // JoinState is the content of join.json.
@@ -439,7 +442,7 @@ func (o *JoinOptions) stream(ctx context.Context, dir string, st *JoinState) err
 	if err != nil {
 		return err
 	}
-	if err := c.Call(ctx, "POST", peerapi.PathJoinConfirm, peerapi.JoinConfirm{NodeID: st.NodeID, ReplayLSN: lsn}, nil); err != nil {
+	if err := c.Call(ctx, "POST", peerapi.PathJoinConfirm, peerapi.JoinConfirm{NodeID: st.NodeID, ReplayLSN: lsn, Rebuild: o.Rebuild}, nil); err != nil {
 		return fmt.Errorf("cluster: the leader did not confirm the join: %w", err)
 	}
 	return nil

@@ -134,7 +134,8 @@ func Rejoin(ctx context.Context, o RejoinOptions) (*RejoinResult, error) {
 	if err := writeJSON(filepath.Join(dir, JoinStateFile), st); err != nil {
 		return nil, err
 	}
-	jo := &JoinOptions{Cfg: o.Cfg, ConfigPath: o.ConfigPath, Seed: o.Seed, DSNs: o.DSNs, StreamTimeout: o.StreamTimeout, Streaming: o.Streaming, Log: log, Now: o.Now}
+	jo := &JoinOptions{Cfg: o.Cfg, ConfigPath: o.ConfigPath, Seed: o.Seed, DSNs: o.DSNs, StreamTimeout: o.StreamTimeout, Streaming: o.Streaming, Log: log, Now: o.Now,
+		Rebuild: refsOfDiverged(o.Cfg, moved)}
 	if err := jo.stream(ctx, dir, st); err != nil {
 		return nil, fmt.Errorf("%w; run `supavise node join --resume` to continue (the old data is kept under data.diverged-*)", err)
 	}
@@ -143,6 +144,20 @@ func Rejoin(ctx context.Context, o RejoinOptions) (*RejoinResult, error) {
 		return nil, err
 	}
 	return &RejoinResult{NodeID: creds.NodeID, System: resp.System, Diverged: moved}, nil
+}
+
+// refsOfDiverged names the projects (not the system project) that the directories MoveDiverged returned belonged
+// to: <state>/projects/<ref>/postgres/data.diverged-<epoch>.
+func refsOfDiverged(cfg *config.Config, moved []string) []string {
+	var refs []string
+	for _, d := range moved {
+		ref := filepath.Base(filepath.Dir(filepath.Dir(d)))
+		if ref == config.SystemRef || !strings.HasPrefix(d, cfg.Paths().PostgresData(ref)+divergedMark) {
+			continue
+		}
+		refs = append(refs, ref)
+	}
+	return refs
 }
 
 // divergedMark is the infix of the directories MoveDiverged creates.

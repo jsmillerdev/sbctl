@@ -453,4 +453,8 @@ type JoinConfirm struct {
 	NodeID string `json:"node_id"`
 	// ReplayLSN is the standby's replay position when it confirmed.
 	ReplayLSN string `json:"replay_lsn,omitempty"`
+	// Rebuild lists the projects whose data this node set aside because another node had replaced its primary
+	// (a rejoin): the leader sets a replica of each up here again, when the project lives elsewhere and this node
+	// has none. A fresh joiner sends none.
+	Rebuild []string `json:"rebuild,omitempty"`
 }
