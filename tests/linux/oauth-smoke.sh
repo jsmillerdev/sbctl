@@ -48,7 +48,7 @@ trap 'rc=$?; [[ -n $HTTP_PID ]] && kill "$HTTP_PID" 2>/dev/null; collect_logs; [
 P_SESSION=15432 P_TRANSACTION=16543 P_REALTIME=14000 P_STORAGE=15000 P_STORAGE_ADMIN=15001 P_PGMETA=18080 P_API=14001 P_STUDIO=13000
 ADMIN=http://127.0.0.1:7000
 ORG=default       # the claim keeps the organization the first project created
-ORG2=second       # made by `projects create --org` below; the Owner joins it after the claim
+ORG2=second       # inserted into the registry below, before `projects create --org`; the Owner joins it after the claim
 OWNER_EMAIL=owner@example.com
 # A password for this run only; it reaches the walk through a 0600 file, never a command line.
 PASSWORD=oauth-$(head -c 12 /dev/urandom | od -An -tx1 | tr -d ' \n')
@@ -109,11 +109,13 @@ supavise fleet start || fail "fleet start"
 REF=$(create_project oauth micro)
 [[ $REF =~ ^[a-z]{20}$ ]] || fail "bad ref '$REF'"
 supavise fleet ensure-tenant "$REF" || fail "ensure-tenant $REF"
+PSQL=$(ls -d "$SUPAVISE_STATE"/artifacts/postgres/*/bin/psql | head -1)
+reg() { sudo -u "$SUPAVISE_USER" "$PSQL" "host=$SUPAVISE_STATE/projects/system/postgres/sock port=5433 user=supabase_admin dbname=supavise" -Atc "$1" </dev/null; }
+# Only the "default" organization is made on first use; any other slug must exist before `projects create --org`.
+reg "insert into supavise.organizations (slug, name) values ('$ORG2', 'Second')" >/dev/null || fail "making organization $ORG2"
 REF2=$(supavise projects create --name oauth-second --class micro --org "$ORG2" --json | json_get 'd["ref"]')
 [[ $REF2 =~ ^[a-z]{20}$ && $REF2 != "$REF" ]] || fail "bad ref '$REF2'"
 supavise fleet ensure-tenant "$REF2" || fail "ensure-tenant $REF2"
-PSQL=$(ls -d "$SUPAVISE_STATE"/artifacts/postgres/*/bin/psql | head -1)
-reg() { sudo -u "$SUPAVISE_USER" "$PSQL" "host=$SUPAVISE_STATE/projects/system/postgres/sock port=5433 user=supabase_admin dbname=supavise" -Atc "$1" </dev/null; }
 
 log "daemon: supavise.service"
 systemctl start supavise.service
