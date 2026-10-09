@@ -12,6 +12,7 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 
 	"github.com/supavise/supavise/internal/config"
+	"github.com/supavise/supavise/internal/oauth"
 	"github.com/supavise/supavise/internal/registry"
 	"github.com/supavise/supavise/internal/secrets"
 )
@@ -69,6 +70,8 @@ type authenticator struct {
 	// ssoUser is the same check for a personal access token, which carries no session: it looks
 	// the owner up among the SSO users and admits them (DashboardSSO.AdmitUser). Nil: no check.
 	ssoUser func(ctx context.Context, userID string) error
+	// oauth resolves OAuth access tokens (oauth_authn.go). Nil: every OAuth token is refused.
+	oauth *oauthAuthn
 
 	mu        sync.Mutex
 	secret    string
@@ -117,6 +120,14 @@ func (a *authenticator) authenticate(r *http.Request, kind authKind) (*Principal
 		return nil, errUnauthorized
 	}
 	token = strings.TrimSpace(token)
+	// An OAuth access token is never looked up as a personal access token: it lives in its own tables,
+	// and one that is unknown there is a 401. Only authAny routes take it; /platform is the dashboard's.
+	if strings.HasPrefix(token, oauth.AccessTokenPrefix) {
+		if kind != authAny {
+			return nil, errUnauthorized
+		}
+		return a.authOAuth(r.Context(), token)
+	}
 	if strings.HasPrefix(token, secrets.PrefixPAT) {
 		if kind != authAny {
 			return nil, errUnauthorized
