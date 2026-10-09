@@ -172,7 +172,7 @@ func TestLazyPrune(t *testing.T) {
 	fx := newSvc(t)
 	fx.enableLazyPrune()
 	stale := func() string {
-		id := newUUID()
+		id := secrets.NewUUID()
 		app := fx.register()
 		a := Authorization{ID: id, AppID: app.App.ID, RedirectURI: testRedirect, Scopes: []string{ScopeProjectsRead},
 			CreatedAt: fx.clock.Now().Add(-48 * time.Hour), ExpiresAt: fx.clock.Now().Add(-47 * time.Hour), Status: StatusPending}

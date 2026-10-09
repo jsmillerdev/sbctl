@@ -95,7 +95,7 @@ func (s *Service) StartAuthorization(ctx context.Context, req AuthorizeRequest) 
 	}
 
 	a := Authorization{
-		ID: newUUID(), AppID: app.ID, RedirectURI: req.RedirectURI, Scopes: effective, State: req.State,
+		ID: secrets.NewUUID(), AppID: app.ID, RedirectURI: req.RedirectURI, Scopes: effective, State: req.State,
 		CodeChallenge: req.CodeChallenge, Resource: resource, OrgHint: req.OrganizationSlug,
 		CreatedAt: now, ExpiresAt: now.Add(AuthorizationTTL), Status: StatusPending,
 	}

@@ -88,7 +88,7 @@ func TestAuthorizeNoRedirectBeforeValidation(t *testing.T) {
 	}{
 		{"no client_id", func(r *AuthorizeRequest) { r.ClientID = "" }, ErrUnknownClient},
 		{"malformed client_id", func(r *AuthorizeRequest) { r.ClientID = "not-a-uuid" }, ErrUnknownClient},
-		{"unknown client_id", func(r *AuthorizeRequest) { r.ClientID = newUUID() }, ErrUnknownClient},
+		{"unknown client_id", func(r *AuthorizeRequest) { r.ClientID = secrets.NewUUID() }, ErrUnknownClient},
 		{"deleted client", func(r *AuthorizeRequest) { r.ClientID = manual.ID }, ErrUnknownClient},
 		{"no redirect_uri", func(r *AuthorizeRequest) { r.RedirectURI = "" }, ErrInvalidRedirectURI},
 		{"unregistered redirect_uri", func(r *AuthorizeRequest) { r.RedirectURI = "https://evil.example.test/cb" }, ErrInvalidRedirectURI},
@@ -263,7 +263,7 @@ func TestAuthorizeCaps(t *testing.T) {
 	a3 := fx.register()
 	total, _ := fx.store.CountPending(fx.ctx(), "", fx.clock.Now())
 	for i := total; i < MaxPendingTotal; i++ {
-		a := Authorization{ID: newUUID(), AppID: a3.App.ID, RedirectURI: testRedirect, Scopes: []string{ScopeProjectsRead},
+		a := Authorization{ID: secrets.NewUUID(), AppID: a3.App.ID, RedirectURI: testRedirect, Scopes: []string{ScopeProjectsRead},
 			CreatedAt: fx.clock.Now(), ExpiresAt: fx.clock.Now().Add(time.Hour), Status: StatusPending}
 		if err := fx.store.CreateAuthorization(fx.ctx(), a); err != nil {
 			t.Fatal(err)
@@ -321,7 +321,7 @@ func TestDescribe(t *testing.T) {
 	}
 
 	// Unknown, malformed.
-	for _, id := range []string{newUUID(), "", "nope"} {
+	for _, id := range []string{secrets.NewUUID(), "", "nope"} {
 		if _, err := fx.svc.Describe(fx.ctx(), id); !errors.Is(err, ErrNotFound) {
 			t.Errorf("Describe(%q) = %v", id, err)
 		}
@@ -424,7 +424,7 @@ func TestApproveStates(t *testing.T) {
 	}
 
 	// Unknown, malformed.
-	for _, id := range []string{newUUID(), "", "nope"} {
+	for _, id := range []string{secrets.NewUUID(), "", "nope"} {
 		if err := approve(id, testOrgAcme, "acme"); !errors.Is(err, ErrNotFound) {
 			t.Errorf("Approve(%q) = %v", id, err)
 		}

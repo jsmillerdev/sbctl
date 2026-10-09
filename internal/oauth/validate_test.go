@@ -4,12 +4,14 @@ import (
 	"errors"
 	"strings"
 	"testing"
+
+	"github.com/supavise/supavise/internal/secrets"
 )
 
 func TestNewUUID(t *testing.T) {
 	seen := map[string]bool{}
 	for i := 0; i < 200; i++ {
-		id := newUUID()
+		id := secrets.NewUUID()
 		if len(id) != 36 || id[14] != '4' || !strings.ContainsRune("89ab", rune(id[19])) {
 			t.Fatalf("%q is not a version 4 UUID", id)
 		}

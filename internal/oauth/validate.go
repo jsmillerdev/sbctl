@@ -1,11 +1,11 @@
 package oauth
 
 import (
-	"crypto/rand"
 	"errors"
 	"fmt"
 	"net/url"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"unicode"
@@ -27,18 +27,6 @@ func canonUUID(s string) (string, bool) {
 		return "", false
 	}
 	return strings.ToLower(s), true
-}
-
-// newUUID returns a random (version 4) UUID from crypto/rand: the form of every identifier the
-// protocol exposes (app ids, client secret ids, auth_ids).
-func newUUID() string {
-	var b [16]byte
-	if _, err := rand.Read(b[:]); err != nil {
-		panic(err) // crypto/rand does not fail on supported platforms
-	}
-	b[6] = b[6]&0x0f | 0x40
-	b[8] = b[8]&0x3f | 0x80
-	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:])
 }
 
 // orgSlugRE is the shape of the organization_slug parameter of an authorization request (\w and -).
@@ -173,20 +161,11 @@ func validateRedirectURIs(uris []string) ([]string, error) {
 		if _, err := parseRedirectURI(raw); err != nil {
 			return nil, fmt.Errorf("redirect_uris[%d] %w", i, err)
 		}
-		if !hasString(out, raw) {
+		if !slices.Contains(out, raw) {
 			out = append(out, raw)
 		}
 	}
 	return out, nil
-}
-
-func hasString(list []string, s string) bool {
-	for _, x := range list {
-		if x == s {
-			return true
-		}
-	}
-	return false
 }
 
 // ---- web URLs (client_uri, logo_uri, website, icon)

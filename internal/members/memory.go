@@ -3,6 +3,7 @@ package members
 import (
 	"bytes"
 	"context"
+	"slices"
 	"sort"
 	"sync"
 	"time"
@@ -83,7 +84,7 @@ func (m *Memory) DeleteOrganization(_ context.Context, org int64) ([]int64, erro
 			delete(d.invites, id)
 		}
 	}
-	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	slices.Sort(ids)
 	delete(d.mfa, org)
 	for dom, rule := range d.domains {
 		if rule.OrgID == org {

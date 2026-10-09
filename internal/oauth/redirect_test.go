@@ -2,6 +2,7 @@ package oauth
 
 import (
 	"net/url"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -116,7 +117,7 @@ func FuzzRedirectMatch(f *testing.F) {
 		if !matchRedirectURI(registered, requested) {
 			return
 		}
-		if hasString(registered, requested) {
+		if slices.Contains(registered, requested) {
 			return
 		}
 		// Not an exact match, so it must be the port-free loopback case.

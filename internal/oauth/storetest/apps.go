@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/supavise/supavise/internal/oauth"
+	"github.com/supavise/supavise/internal/secrets"
 )
 
 func testAppLifecycle(t *testing.T, e *env) {
@@ -16,12 +17,12 @@ func testAppLifecycle(t *testing.T, e *env) {
 	got, err := e.st.GetApp(e.ctx, app.ID)
 	e.must(err)
 	checkApp(t, got, app)
-	secrets, err := e.st.ListSecrets(e.ctx, app.ID)
+	stored, err := e.st.ListSecrets(e.ctx, app.ID)
 	e.must(err)
-	if len(secrets) != 1 {
-		t.Fatalf("ListSecrets = %d secrets, want the first one", len(secrets))
+	if len(stored) != 1 {
+		t.Fatalf("ListSecrets = %d secrets, want the first one", len(stored))
 	}
-	checkSecret(t, secrets[0], sec)
+	checkSecret(t, stored[0], sec)
 
 	// An app with an organization and no secret.
 	manual := e.manualApp(e.orgA)
@@ -29,8 +30,8 @@ func testAppLifecycle(t *testing.T, e *env) {
 	got, err = e.st.GetApp(e.ctx, manual.ID)
 	e.must(err)
 	checkApp(t, got, manual)
-	if secrets, err = e.st.ListSecrets(e.ctx, manual.ID); err != nil || len(secrets) != 0 {
-		t.Errorf("ListSecrets(app without secret) = %v, %v; want none", secrets, err)
+	if stored, err = e.st.ListSecrets(e.ctx, manual.ID); err != nil || len(stored) != 0 {
+		t.Errorf("ListSecrets(app without secret) = %v, %v; want none", stored, err)
 	}
 
 	// A taken id or a taken secret hash is ErrConflict, and the pair is written whole or not at all.
@@ -43,7 +44,7 @@ func testAppLifecycle(t *testing.T, e *env) {
 	e.wantErr(err, oauth.ErrNotFound)
 
 	// Unknown and malformed ids are "not found".
-	for _, id := range []string{uuid(), "not-a-uuid", ""} {
+	for _, id := range []string{secrets.NewUUID(), "not-a-uuid", ""} {
 		_, err = e.st.GetApp(e.ctx, id)
 		e.wantErr(err, oauth.ErrNotFound)
 	}
@@ -56,7 +57,7 @@ func testAppLifecycle(t *testing.T, e *env) {
 	upd.Scopes = []string{"projects:read"}
 	upd.UpdatedAt = later
 	upd.RegistrationType, upd.OrgID = oauth.RegistrationManual, e.orgB
-	upd.TokenEndpointAuthMethod, upd.CreatedBy, upd.CreatedAt = oauth.AuthMethodPost, uuid(), later
+	upd.TokenEndpointAuthMethod, upd.CreatedBy, upd.CreatedAt = oauth.AuthMethodPost, secrets.NewUUID(), later
 	e.must(e.st.UpdateApp(e.ctx, upd))
 	want := app
 	want.Name, want.Website, want.Icon = upd.Name, upd.Website, upd.Icon
@@ -66,7 +67,7 @@ func testAppLifecycle(t *testing.T, e *env) {
 	checkApp(t, got, want)
 
 	missing := app
-	missing.ID = uuid()
+	missing.ID = secrets.NewUUID()
 	e.wantErr(e.st.UpdateApp(e.ctx, missing), oauth.ErrNotFound)
 	missing.ID = "not-a-uuid"
 	e.wantErr(e.st.UpdateApp(e.ctx, missing), oauth.ErrNotFound)
@@ -167,7 +168,7 @@ func testDeleteApp(t *testing.T, e *env) {
 
 	_, err = e.st.DeleteApp(e.ctx, app.ID, at)
 	e.wantErr(err, oauth.ErrNotFound)
-	_, err = e.st.DeleteApp(e.ctx, uuid(), at)
+	_, err = e.st.DeleteApp(e.ctx, secrets.NewUUID(), at)
 	e.wantErr(err, oauth.ErrNotFound)
 	_, err = e.st.DeleteApp(e.ctx, "not-a-uuid", at)
 	e.wantErr(err, oauth.ErrNotFound)
@@ -193,7 +194,7 @@ func testSecrets(t *testing.T, e *env) {
 
 	at := e.t0.Add(time.Hour)
 	e.must(e.st.TouchSecret(e.ctx, s2.ID, at))
-	e.must(e.st.TouchSecret(e.ctx, uuid(), at)) // an unknown id is not an error
+	e.must(e.st.TouchSecret(e.ctx, secrets.NewUUID(), at)) // an unknown id is not an error
 	e.must(e.st.TouchSecret(e.ctx, "not-a-uuid", at))
 	list, err = e.st.ListSecrets(e.ctx, app.ID)
 	e.must(err)
@@ -205,14 +206,14 @@ func testSecrets(t *testing.T, e *env) {
 	clash := e.secret(app.ID)
 	clash.Hash = s1.Hash
 	e.wantErr(e.st.CreateSecret(e.ctx, clash), oauth.ErrConflict)
-	e.wantErr(e.st.CreateSecret(e.ctx, e.secret(uuid())), oauth.ErrNotFound)
+	e.wantErr(e.st.CreateSecret(e.ctx, e.secret(secrets.NewUUID())), oauth.ErrNotFound)
 	if list, _ = e.st.ListSecrets(e.ctx, app.ID); len(list) != 2 {
 		t.Errorf("ListSecrets after the failed inserts has %d secrets, want 2", len(list))
 	}
 
 	// DeleteSecret removes a secret of that app only.
 	e.wantErr(e.st.DeleteSecret(e.ctx, other.ID, s1.ID), oauth.ErrNotFound)
-	e.wantErr(e.st.DeleteSecret(e.ctx, app.ID, uuid()), oauth.ErrNotFound)
+	e.wantErr(e.st.DeleteSecret(e.ctx, app.ID, secrets.NewUUID()), oauth.ErrNotFound)
 	e.wantErr(e.st.DeleteSecret(e.ctx, app.ID, "not-a-uuid"), oauth.ErrNotFound)
 	e.must(e.st.DeleteSecret(e.ctx, app.ID, s1.ID))
 	e.wantErr(e.st.DeleteSecret(e.ctx, app.ID, s1.ID), oauth.ErrNotFound)
@@ -224,7 +225,7 @@ func testSecrets(t *testing.T, e *env) {
 	checkSecret(t, list[0], s2)
 
 	// No such app, or none that is a UUID: an empty list.
-	for _, id := range []string{uuid(), "not-a-uuid"} {
+	for _, id := range []string{secrets.NewUUID(), "not-a-uuid"} {
 		if list, err = e.st.ListSecrets(e.ctx, id); err != nil || len(list) != 0 {
 			t.Errorf("ListSecrets(%q) = %v, %v; want none", id, list, err)
 		}

@@ -16,11 +16,11 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"errors"
-	"fmt"
 	"testing"
 	"time"
 
 	"github.com/supavise/supavise/internal/oauth"
+	"github.com/supavise/supavise/internal/secrets"
 )
 
 // OrgSeeder is implemented by the Store a test builds when that store keeps organizations. SeedOrg
@@ -133,17 +133,6 @@ func (e *env) checkSlug(what, got string, org int64) {
 	}
 }
 
-// uuid returns a random version 4 UUID in the lower-case canonical form.
-func uuid() string {
-	var b [16]byte
-	if _, err := rand.Read(b[:]); err != nil {
-		panic(err)
-	}
-	b[6] = b[6]&0x0f | 0x40
-	b[8] = b[8]&0x3f | 0x80
-	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
-}
-
 // hash returns a new SHA-256 digest of random bytes: what the Service stores for a secret.
 func hash() []byte {
 	var b [32]byte
@@ -158,7 +147,7 @@ func hash() []byte {
 
 func (e *env) dynamicApp() oauth.App {
 	return oauth.App{
-		ID: uuid(), RegistrationType: oauth.RegistrationDynamic, Name: "Dynamic client", Website: "https://client.example",
+		ID: secrets.NewUUID(), RegistrationType: oauth.RegistrationDynamic, Name: "Dynamic client", Website: "https://client.example",
 		Icon:                    "https://client.example/logo.png",
 		RedirectURIs:            []string{"http://127.0.0.1/callback", "https://client.example/cb"},
 		Scopes:                  []string{"projects:read", "database:read", "organizations:read"},
@@ -169,12 +158,12 @@ func (e *env) dynamicApp() oauth.App {
 func (e *env) manualApp(org int64) oauth.App {
 	a := e.dynamicApp()
 	a.RegistrationType, a.OrgID, a.Name = oauth.RegistrationManual, org, "Published app"
-	a.TokenEndpointAuthMethod, a.CreatedBy = oauth.AuthMethodBasic, uuid()
+	a.TokenEndpointAuthMethod, a.CreatedBy = oauth.AuthMethodBasic, secrets.NewUUID()
 	return a
 }
 
 func (e *env) secret(appID string) oauth.AppSecret {
-	return oauth.AppSecret{ID: uuid(), AppID: appID, Alias: "sba_1a2b********", Hash: hash(), CreatedBy: uuid(), CreatedAt: e.t0}
+	return oauth.AppSecret{ID: secrets.NewUUID(), AppID: appID, Alias: "sba_1a2b********", Hash: hash(), CreatedBy: secrets.NewUUID(), CreatedAt: e.t0}
 }
 
 // createApp stores a new dynamic app and returns it.
@@ -216,7 +205,7 @@ func (e *env) grant(f flow) granted {
 		f.at = e.next()
 	}
 	if f.user == "" {
-		f.user = uuid()
+		f.user = secrets.NewUUID()
 	}
 	if f.org == 0 {
 		f.org = e.orgA
@@ -224,7 +213,7 @@ func (e *env) grant(f flow) granted {
 	if f.scopes == nil {
 		f.scopes = []string{"projects:read", "database:read"}
 	}
-	g := granted{authID: uuid(), code: hash(), at: f.at}
+	g := granted{authID: secrets.NewUUID(), code: hash(), at: f.at}
 	created := f.at.Add(-3 * time.Second)
 	e.must(e.st.CreateAuthorization(e.ctx, oauth.Authorization{
 		ID: g.authID, AppID: f.app.ID, RedirectURI: "http://127.0.0.1:5000/callback", Scopes: f.scopes, State: "st",
@@ -255,7 +244,7 @@ func (e *env) grant(f flow) granted {
 func (e *env) approve(app oauth.App, user string, org int64, at time.Time) (oauth.Authorization, []byte) {
 	e.t.Helper()
 	a := oauth.Authorization{
-		ID: uuid(), AppID: app.ID, RedirectURI: "http://127.0.0.1:5000/callback", Scopes: []string{"projects:read", "database:read"},
+		ID: secrets.NewUUID(), AppID: app.ID, RedirectURI: "http://127.0.0.1:5000/callback", Scopes: []string{"projects:read", "database:read"},
 		State: "st", CodeChallenge: "ch", Resource: "https://api.example.com/mcp", OrgHint: "acme",
 		CreatedAt: at.Add(-time.Second), ExpiresAt: at.Add(-time.Second + oauth.AuthorizationTTL), Status: oauth.StatusPending,
 	}

@@ -2,12 +2,12 @@ package api
 
 import (
 	"context"
-	"crypto/rand"
-	"fmt"
 	"sort"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/supavise/supavise/internal/secrets"
 )
 
 // MemoryStore is an in-memory Store for tests.
@@ -31,16 +31,6 @@ func NewMemoryStore() *MemoryStore {
 		files: map[string][]FunctionFile{}, secrets: map[string]map[string]FunctionSecret{},
 		content: map[string]*Content{}, folders: map[string]*ContentFolder{}, now: time.Now,
 	}
-}
-
-func newUUID() string {
-	var b [16]byte
-	if _, err := rand.Read(b[:]); err != nil {
-		panic(err)
-	}
-	b[6] = b[6]&0x0f | 0x40
-	b[8] = b[8]&0x3f | 0x80
-	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:])
 }
 
 func (m *MemoryStore) UpsertUser(_ context.Context, u User) (*User, error) {
@@ -171,7 +161,7 @@ func (m *MemoryStore) UpsertFunction(_ context.Context, f *Function, files []Fun
 	if cur, ok := m.functions[k]; ok {
 		f.ID, f.CreatedAt, f.Version = cur.ID, cur.CreatedAt, cur.Version+1
 	} else {
-		f.ID, f.CreatedAt, f.Version = newUUID(), now, 1
+		f.ID, f.CreatedAt, f.Version = secrets.NewUUID(), now, 1
 	}
 	f.UpdatedAt = now
 	cp := *f
@@ -305,7 +295,7 @@ func (m *MemoryStore) UpsertContent(_ context.Context, c *Content) error {
 	defer m.mu.Unlock()
 	now := m.now()
 	if c.ID == "" {
-		c.ID, c.InsertedAt = newUUID(), now
+		c.ID, c.InsertedAt = secrets.NewUUID(), now
 	} else if cur, ok := m.content[c.ID]; ok {
 		if cur.Ref != c.Ref { // the Postgres store's `where ref = excluded.ref` guard
 			return ErrNotFound
@@ -383,7 +373,7 @@ func (m *MemoryStore) GetFolder(_ context.Context, ref, id string) (*ContentFold
 func (m *MemoryStore) CreateFolder(_ context.Context, f *ContentFolder) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	f.ID, f.CreatedAt, f.UpdatedAt = newUUID(), m.now(), m.now()
+	f.ID, f.CreatedAt, f.UpdatedAt = secrets.NewUUID(), m.now(), m.now()
 	cp := *f
 	m.folders[f.ID] = &cp
 	return nil

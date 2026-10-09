@@ -10,6 +10,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/supavise/supavise/internal/secrets"
 )
 
 // ---- views into the memory store for other tests of this package
@@ -72,7 +74,7 @@ type memEnv struct {
 
 func newMemEnv(t *testing.T) *memEnv {
 	t.Helper()
-	e := &memEnv{t: t, m: NewMemoryStore(), ctx: context.Background(), app: memApp1(newUUID(), RegistrationDynamic, 0)}
+	e := &memEnv{t: t, m: NewMemoryStore(), ctx: context.Background(), app: memApp1(secrets.NewUUID(), RegistrationDynamic, 0)}
 	e.m.SetOrgSlugs(func(id int64) string { return map[int64]string{1: "acme", 2: "other"}[id] })
 	if err := e.m.CreateApp(e.ctx, e.app, nil); err != nil {
 		t.Fatal(err)
@@ -91,7 +93,7 @@ func (e *memEnv) hash() []byte {
 // approved stores a pending authorization and approves it with a code hash; it returns the id and the hash.
 func (e *memEnv) approved(user string, org int64) (string, []byte) {
 	e.t.Helper()
-	id := newUUID()
+	id := secrets.NewUUID()
 	a := Authorization{ID: id, AppID: e.app.ID, RedirectURI: "https://x.example.test/cb", Scopes: []string{ScopeProjectsRead},
 		CreatedAt: memT0, ExpiresAt: memT0.Add(time.Hour), Status: StatusPending}
 	if err := e.m.CreateAuthorization(e.ctx, a); err != nil {
@@ -137,7 +139,7 @@ func TestMemoryStoreZeroValueWorks(t *testing.T) {
 	if n, err := m.CountDynamicApps(ctx); err != nil || n != 0 {
 		t.Fatalf("%d, %v", n, err)
 	}
-	if err := m.CreateApp(ctx, memApp1(newUUID(), RegistrationDynamic, 0), nil); err != nil {
+	if err := m.CreateApp(ctx, memApp1(secrets.NewUUID(), RegistrationDynamic, 0), nil); err != nil {
 		t.Fatal(err)
 	}
 	if n, _ := m.CountDynamicApps(ctx); n != 1 {
@@ -191,7 +193,7 @@ func TestMemoryStoreCopies(t *testing.T) {
 		t.Error("GetApp hands out the stored row")
 	}
 	// What the caller passes in is copied too.
-	in := memApp1(newUUID(), RegistrationDynamic, 0)
+	in := memApp1(secrets.NewUUID(), RegistrationDynamic, 0)
 	if err := e.m.CreateApp(e.ctx, in, nil); err != nil {
 		t.Fatal(err)
 	}
@@ -206,12 +208,12 @@ func TestMemoryStoreConflicts(t *testing.T) {
 	if err := e.m.CreateApp(e.ctx, e.app, nil); !errors.Is(err, ErrConflict) {
 		t.Errorf("app id twice: %v", err)
 	}
-	sec := AppSecret{ID: newUUID(), AppID: e.app.ID, Alias: "sba_1234********", Hash: e.hash(), CreatedAt: memT0}
+	sec := AppSecret{ID: secrets.NewUUID(), AppID: e.app.ID, Alias: "sba_1234********", Hash: e.hash(), CreatedAt: memT0}
 	if err := e.m.CreateSecret(e.ctx, sec); err != nil {
 		t.Fatal(err)
 	}
 	dup := sec
-	dup.ID = newUUID()
+	dup.ID = secrets.NewUUID()
 	if err := e.m.CreateSecret(e.ctx, dup); !errors.Is(err, ErrConflict) {
 		t.Errorf("secret hash twice: %v", err)
 	}
@@ -219,12 +221,12 @@ func TestMemoryStoreConflicts(t *testing.T) {
 	if err := e.m.CreateSecret(e.ctx, dup); !errors.Is(err, ErrConflict) {
 		t.Errorf("secret id twice: %v", err)
 	}
-	if err := e.m.CreateSecret(e.ctx, AppSecret{ID: newUUID(), AppID: newUUID(), Hash: e.hash()}); !errors.Is(err, ErrNotFound) {
+	if err := e.m.CreateSecret(e.ctx, AppSecret{ID: secrets.NewUUID(), AppID: secrets.NewUUID(), Hash: e.hash()}); !errors.Is(err, ErrNotFound) {
 		t.Errorf("secret of an unknown app: %v", err)
 	}
 	// CreateApp with a first secret is atomic: a conflicting hash leaves no app behind.
-	second := memApp1(newUUID(), RegistrationDynamic, 0)
-	if err := e.m.CreateApp(e.ctx, second, &AppSecret{ID: newUUID(), Hash: sec.Hash}); !errors.Is(err, ErrConflict) {
+	second := memApp1(secrets.NewUUID(), RegistrationDynamic, 0)
+	if err := e.m.CreateApp(e.ctx, second, &AppSecret{ID: secrets.NewUUID(), Hash: sec.Hash}); !errors.Is(err, ErrConflict) {
 		t.Errorf("app with a conflicting secret: %v", err)
 	}
 	if _, err := e.m.GetApp(e.ctx, second.ID); !errors.Is(err, ErrNotFound) {
@@ -235,10 +237,10 @@ func TestMemoryStoreConflicts(t *testing.T) {
 	if err := e.m.CreateAuthorization(e.ctx, Authorization{ID: id, AppID: e.app.ID, ExpiresAt: memT0}); !errors.Is(err, ErrConflict) {
 		t.Errorf("authorization id twice: %v", err)
 	}
-	if err := e.m.CreateAuthorization(e.ctx, Authorization{ID: newUUID(), AppID: e.app.ID, ExpiresAt: memT0, CodeHash: h}); !errors.Is(err, ErrConflict) {
+	if err := e.m.CreateAuthorization(e.ctx, Authorization{ID: secrets.NewUUID(), AppID: e.app.ID, ExpiresAt: memT0, CodeHash: h}); !errors.Is(err, ErrConflict) {
 		t.Errorf("code hash twice at creation: %v", err)
 	}
-	pending := newUUID()
+	pending := secrets.NewUUID()
 	if err := e.m.CreateAuthorization(e.ctx, Authorization{ID: pending, AppID: e.app.ID, ExpiresAt: memT0.Add(time.Hour)}); err != nil {
 		t.Fatal(err)
 	}
@@ -249,7 +251,7 @@ func TestMemoryStoreConflicts(t *testing.T) {
 	if a, _ := e.m.GetAuthorization(e.ctx, pending); a.Status != StatusPending {
 		t.Errorf("a refused approval changed the row: %+v", a)
 	}
-	if err := e.m.CreateAuthorization(e.ctx, Authorization{ID: newUUID(), AppID: newUUID(), ExpiresAt: memT0}); !errors.Is(err, ErrNotFound) {
+	if err := e.m.CreateAuthorization(e.ctx, Authorization{ID: secrets.NewUUID(), AppID: secrets.NewUUID(), ExpiresAt: memT0}); !errors.Is(err, ErrNotFound) {
 		t.Errorf("authorization of an unknown app: %v", err)
 	}
 }
@@ -257,7 +259,7 @@ func TestMemoryStoreConflicts(t *testing.T) {
 func TestMemoryStoreDecide(t *testing.T) {
 	e := newMemEnv(t)
 	mk := func(expires time.Time) string {
-		id := newUUID()
+		id := secrets.NewUUID()
 		if err := e.m.CreateAuthorization(e.ctx, Authorization{ID: id, AppID: e.app.ID, ExpiresAt: expires}); err != nil {
 			t.Fatal(err)
 		}
@@ -282,7 +284,7 @@ func TestMemoryStoreDecide(t *testing.T) {
 	if _, err := approve(id, memT0.Add(2*time.Hour)); !errors.Is(err, ErrAlreadyDecided) {
 		t.Errorf("approval of a decided and expired row: %v", err)
 	}
-	if _, err := approve(newUUID(), memT0); !errors.Is(err, ErrNotFound) {
+	if _, err := approve(secrets.NewUUID(), memT0); !errors.Is(err, ErrNotFound) {
 		t.Errorf("unknown: %v", err)
 	}
 	// Expiry is expires_at <= at.
@@ -341,7 +343,7 @@ func TestMemoryStoreWithCode(t *testing.T) {
 	id, h := e.approved("user-1", 1)
 
 	// A code of another app is not found and fn does not run.
-	other := memApp1(newUUID(), RegistrationDynamic, 0)
+	other := memApp1(secrets.NewUUID(), RegistrationDynamic, 0)
 	if err := e.m.CreateApp(e.ctx, other, nil); err != nil {
 		t.Fatal(err)
 	}
@@ -494,7 +496,7 @@ func TestMemoryStoreComplete(t *testing.T) {
 	// MaxLive trims the oldest live grants of (user, organization): fresh apps would be needed to get
 	// more than one live grant of a user in an organization, so make them directly.
 	for i := 0; i < 4; i++ {
-		app := memApp1(newUUID(), RegistrationDynamic, 0)
+		app := memApp1(secrets.NewUUID(), RegistrationDynamic, 0)
 		if err := e.m.CreateApp(e.ctx, app, nil); err != nil {
 			t.Fatal(err)
 		}
@@ -576,7 +578,7 @@ func TestMemoryStoreRotateRefresh(t *testing.T) {
 	// Not found: wrong app, an access token, unknown hash, expired token, malformed app id.
 	noFn := func(context.Context, RotateTx) error { t.Error("fn ran"); return nil }
 	for name, bad := range map[string]RotateInput{
-		"another app":  {AppID: newUUID(), TokenHash: ng.Refresh.Hash, Now: at, Grace: grace},
+		"another app":  {AppID: secrets.NewUUID(), TokenHash: ng.Refresh.Hash, Now: at, Grace: grace},
 		"malformed":    {AppID: "x", TokenHash: ng.Refresh.Hash, Now: at, Grace: grace},
 		"access token": {AppID: e.app.ID, TokenHash: ng.Access.Hash, Now: at, Grace: grace},
 		"unknown":      {AppID: e.app.ID, TokenHash: e.hash(), Now: at, Grace: grace},
@@ -669,7 +671,7 @@ func TestMemoryStoreRotateRefresh(t *testing.T) {
 		t.Error("a replay wrote tokens")
 	}
 	// A replay of a token of another app is plain not found, and of a revoked grant too.
-	if err := e.m.RotateRefresh(e.ctx, RotateInput{AppID: newUUID(), TokenHash: ng.Refresh.Hash, Now: now.Add(time.Hour), Grace: grace}, noFn); !errors.Is(err, ErrNotFound) {
+	if err := e.m.RotateRefresh(e.ctx, RotateInput{AppID: secrets.NewUUID(), TokenHash: ng.Refresh.Hash, Now: now.Add(time.Hour), Grace: grace}, noFn); !errors.Is(err, ErrNotFound) {
 		t.Errorf("replay by another app: %v", err)
 	}
 	if _, err := e.m.RevokeGrants(e.ctx, GrantFilter{ID: res.Grant.ID}, ReasonRefreshReuse, now.Add(time.Hour)); err != nil {
@@ -830,7 +832,7 @@ func TestMemoryStoreTouch(t *testing.T) {
 	if tok.LastUsedAt == nil || !tok.LastUsedAt.Equal(at) || g.LastUsedAt == nil || !g.LastUsedAt.Equal(at) {
 		t.Errorf("token %v grant %v", tok.LastUsedAt, g.LastUsedAt)
 	}
-	sec := AppSecret{ID: newUUID(), AppID: e.app.ID, Hash: e.hash(), CreatedAt: memT0}
+	sec := AppSecret{ID: secrets.NewUUID(), AppID: e.app.ID, Hash: e.hash(), CreatedAt: memT0}
 	if err := e.m.CreateSecret(e.ctx, sec); err != nil {
 		t.Fatal(err)
 	}
@@ -848,9 +850,9 @@ func TestMemoryStoreTouch(t *testing.T) {
 func TestMemoryStoreManualApps(t *testing.T) {
 	e := newMemEnv(t)
 	mk := func(org int64, at time.Time) App {
-		a := memApp1(newUUID(), RegistrationManual, org)
+		a := memApp1(secrets.NewUUID(), RegistrationManual, org)
 		a.CreatedAt = at
-		if err := e.m.CreateApp(e.ctx, a, &AppSecret{ID: newUUID(), Hash: e.hash(), CreatedAt: at, Alias: "sba_0000********"}); err != nil {
+		if err := e.m.CreateApp(e.ctx, a, &AppSecret{ID: secrets.NewUUID(), Hash: e.hash(), CreatedAt: at, Alias: "sba_0000********"}); err != nil {
 			t.Fatal(err)
 		}
 		return a
@@ -903,7 +905,7 @@ func TestMemoryStorePruneCascades(t *testing.T) {
 	if _, err := e.m.RevokeGrants(e.ctx, GrantFilter{ID: res.Grant.ID}, ReasonUser, memT0); err != nil {
 		t.Fatal(err)
 	}
-	sec := AppSecret{ID: newUUID(), AppID: e.app.ID, Hash: e.hash(), CreatedAt: memT0}
+	sec := AppSecret{ID: secrets.NewUUID(), AppID: e.app.ID, Hash: e.hash(), CreatedAt: memT0}
 	if err := e.m.CreateSecret(e.ctx, sec); err != nil {
 		t.Fatal(err)
 	}

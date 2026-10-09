@@ -214,7 +214,7 @@ func TestRegisterNoOutboundFetch(t *testing.T) {
 func TestRegisterAppCap(t *testing.T) {
 	fx := newSvc(t)
 	for i := 0; i < MaxDynamicApps-1; i++ {
-		app := App{ID: newUUID(), RegistrationType: RegistrationDynamic, Name: "filler", RedirectURIs: []string{"http://localhost/cb"},
+		app := App{ID: secrets.NewUUID(), RegistrationType: RegistrationDynamic, Name: "filler", RedirectURIs: []string{"http://localhost/cb"},
 			Scopes: []string{ScopeProjectsRead}, TokenEndpointAuthMethod: AuthMethodBasic, CreatedAt: fx.clock.Now(), UpdatedAt: fx.clock.Now()}
 		if err := fx.store.CreateApp(fx.ctx(), app, nil); err != nil {
 			t.Fatal(err)

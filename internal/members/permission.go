@@ -3,6 +3,7 @@ package members
 import (
 	"reflect"
 	"regexp"
+	"slices"
 	"strings"
 	"sync"
 )
@@ -78,7 +79,7 @@ func Check(perms []Permission, action, resource string, data map[string]any, org
 		var scoped []*Permission
 		for i := range perms {
 			p := &perms[i]
-			if p.OrganizationSlug == orgSlug && p.matches(action, resource) && containsString(p.ProjectRefs, projectRef) {
+			if p.OrganizationSlug == orgSlug && p.matches(action, resource) && slices.Contains(p.ProjectRefs, projectRef) {
 				scoped = append(scoped, p)
 			}
 		}
@@ -104,15 +105,6 @@ func decide(perms []*Permission, data map[string]any) bool {
 	}
 	for _, p := range perms {
 		if !p.Restrictive && p.holds(data) {
-			return true
-		}
-	}
-	return false
-}
-
-func containsString(list []string, s string) bool {
-	for _, x := range list {
-		if x == s {
 			return true
 		}
 	}

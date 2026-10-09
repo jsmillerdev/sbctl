@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/supavise/supavise/internal/oauth"
+	"github.com/supavise/supavise/internal/secrets"
 )
 
 // The prune tests set one cutoff at a time: a cascade (an app takes its grants, a grant its tokens)
@@ -30,7 +31,7 @@ func (e *env) appExists(app oauth.App) bool {
 func testPruneNothing(t *testing.T, e *env) {
 	app := e.createApp()
 	g := e.grant(flow{app: app})
-	old := oauth.Authorization{ID: uuid(), AppID: app.ID, RedirectURI: "http://127.0.0.1/cb", CreatedAt: e.t0, ExpiresAt: e.t0.Add(time.Minute), Status: oauth.StatusPending}
+	old := oauth.Authorization{ID: secrets.NewUUID(), AppID: app.ID, RedirectURI: "http://127.0.0.1/cb", CreatedAt: e.t0, ExpiresAt: e.t0.Add(time.Minute), Status: oauth.StatusPending}
 	e.must(e.st.CreateAuthorization(e.ctx, old))
 
 	if res := e.prune(oauth.PruneParams{}); res != (oauth.PruneResult{}) {
@@ -48,7 +49,7 @@ func testPruneNothing(t *testing.T, e *env) {
 func testPruneAuthorizations(t *testing.T, e *env) {
 	app := e.createApp()
 	mk := func(expires time.Duration) string {
-		a := oauth.Authorization{ID: uuid(), AppID: app.ID, RedirectURI: "http://127.0.0.1/cb", CreatedAt: e.t0, ExpiresAt: e.t0.Add(expires), Status: oauth.StatusPending}
+		a := oauth.Authorization{ID: secrets.NewUUID(), AppID: app.ID, RedirectURI: "http://127.0.0.1/cb", CreatedAt: e.t0, ExpiresAt: e.t0.Add(expires), Status: oauth.StatusPending}
 		e.must(e.st.CreateAuthorization(e.ctx, a))
 		return a.ID
 	}

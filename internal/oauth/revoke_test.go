@@ -71,7 +71,7 @@ func TestRevoke(t *testing.T) {
 			"wrong secret":         {ClientID: f.App.App.ID, ClientSecret: other.ClientSecret, Token: tok},
 			"malformed secret":     {ClientID: f.App.App.ID, ClientSecret: "x", Token: tok},
 			"no secret (not none)": {ClientID: f.App.App.ID, Token: tok},
-			"unknown client":       {ClientID: newUUID(), ClientSecret: f.App.ClientSecret, Token: tok},
+			"unknown client":       {ClientID: secrets.NewUUID(), ClientSecret: f.App.ClientSecret, Token: tok},
 			"malformed client":     {ClientID: "x", ClientSecret: f.App.ClientSecret, Token: tok},
 		} {
 			err := fx.svc.Revoke(fx.ctx(), req)
@@ -205,7 +205,7 @@ func TestRevokeApp(t *testing.T) {
 	if _, err := fx.svc.RevokeApp(fx.ctx(), RevokeAppRequest{AppID: ra.App.ID, OrgID: testOrgAcme, Reason: "x"}); !errors.Is(err, ErrInvalid) {
 		t.Errorf("bad reason: %v", err)
 	}
-	for _, id := range []string{newUUID(), "nope", ""} {
+	for _, id := range []string{secrets.NewUUID(), "nope", ""} {
 		if _, err := fx.svc.RevokeApp(fx.ctx(), RevokeAppRequest{AppID: id, Reason: ReasonAdmin}); !errors.Is(err, ErrNotFound) {
 			t.Errorf("RevokeApp(%q): %v", id, err)
 		}
