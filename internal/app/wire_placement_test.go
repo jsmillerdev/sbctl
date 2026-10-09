@@ -334,3 +334,82 @@ func TestProjectHealthIsCheckedForTheReportOnAFollowerOnly(t *testing.T) {
 		t.Fatalf("a follower checked %d projects and reported %v", checked, got)
 	}
 }
+
+// healthPlane answers Health after a pause, counts how many probes run at once, and hangs on the
+// project named in stuck until its context ends.
+type healthPlane struct {
+	lifecycle.Plane
+	mu      sync.Mutex
+	running int
+	peak    int
+	stuck   string
+}
+
+func (h *healthPlane) Health(ctx context.Context, p *registry.Project, _ *secrets.ProjectKeys) []lifecycle.ServiceHealth {
+	h.mu.Lock()
+	h.running++
+	h.peak = max(h.peak, h.running)
+	h.mu.Unlock()
+	defer func() { h.mu.Lock(); h.running--; h.mu.Unlock() }()
+	if p.Ref == h.stuck {
+		<-ctx.Done()
+		return []lifecycle.ServiceHealth{{Name: "postgres", Error: ctx.Err().Error()}}
+	}
+	time.Sleep(20 * time.Millisecond)
+	return []lifecycle.ServiceHealth{{Name: "postgres", Healthy: true}}
+}
+
+// The report probes the projects homed here a few at a time, one that hangs does not hold up the rest,
+// and the report lists them in the registry's order whatever order the probes finish in.
+func TestProjectHealthProbesInParallelUnderATimeout(t *testing.T) {
+	ctx := context.Background()
+	reg := registry.NewMemory()
+	if err := reg.CreateNode(ctx, &registry.Node{Name: "second", State: registry.NodeActive}); err != nil {
+		t.Fatal(err)
+	}
+	refs := []string{"aaaaaaaaaaaaaaaaaaaa", "bbbbbbbbbbbbbbbbbbbb", "cccccccccccccccccccc", "dddddddddddddddddddd", "eeeeeeeeeeeeeeeeeeee", "ffffffffffffffffffff"}
+	for _, ref := range refs {
+		if err := reg.CreateProject(ctx, &registry.Project{Ref: ref, Name: ref, NodeID: "n1", Status: registry.StatusActiveHealthy}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Not reported: the system project, a project of another node and a paused one.
+	for _, p := range []registry.Project{
+		{Ref: config.SystemRef, Name: "system", NodeID: "n1", Status: registry.StatusActiveHealthy},
+		{Ref: "gggggggggggggggggggg", Name: "g", NodeID: "n2", Status: registry.StatusActiveHealthy},
+		{Ref: "hhhhhhhhhhhhhhhhhhhh", Name: "h", NodeID: "n1", Status: registry.StatusInactive},
+	} {
+		if err := reg.CreateProject(ctx, &p); err != nil {
+			t.Fatal(err)
+		}
+	}
+	all, err := reg.ListProjects(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var want []string
+	for _, p := range all {
+		if p.NodeID == "n1" && p.Ref != config.SystemRef && p.Status.Running() {
+			want = append(want, p.Ref)
+		}
+	}
+	defer func(old time.Duration) { projectProbeTimeout = old }(projectProbeTimeout)
+	projectProbeTimeout = 100 * time.Millisecond
+
+	plane := &healthPlane{stuck: want[1]}
+	got := projectHealth(reg, plane, func() string { return "n1" })(ctx)
+	if len(got) != len(want) {
+		t.Fatalf("reported %+v, want %v", got, want)
+	}
+	for i, h := range got {
+		if h.Ref != want[i] {
+			t.Fatalf("entry %d is %s, want %s", i, h.Ref, want[i])
+		}
+		if stuck := h.Ref == plane.stuck; h.Healthy == stuck || (stuck && !strings.Contains(h.Detail, "deadline")) {
+			t.Fatalf("%s: %+v", h.Ref, h)
+		}
+	}
+	if plane.peak < 2 || plane.peak > placement.DefaultConcurrency {
+		t.Fatalf("%d probes ran at once, want 2 to %d", plane.peak, placement.DefaultConcurrency)
+	}
+}
