@@ -189,3 +189,34 @@ func TestAPasswordChangeRefreshesThePoolerOnThePeersToo(t *testing.T) {
 		t.Fatalf("local %v, peers %v", rt.refreshed, peers.tenants)
 	}
 }
+
+// A project that is moving stays RESTARTING until the move ends, and the move registers it at its new home
+// meanwhile (EnsureTenant is its call). The sweep at start leaves any project that is not active to its own
+// operation, and so does a paused one when a move asks.
+func TestEnsureTenantRegistersAProjectThatIsRestartingBecauseOfAMove(t *testing.T) {
+	ctx := context.Background()
+	h, p, _, _ := replicaHarness(t)
+	rt := &replicaTenant{}
+	h.e.opts.Fleet = fleet.Fleet{rt}
+	if err := h.reg.SetProjectStatus(ctx, p.Ref, registry.StatusRestarting); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.e.EnsureTenant(ctx, p.Ref); err != nil {
+		t.Fatal(err)
+	}
+	if len(rt.ensured) != 1 || rt.ensured[0].Ref != p.Ref {
+		t.Fatalf("a project that is restarting for a move was not registered: %+v", rt.ensured)
+	}
+	rt.ensured = nil
+	if errs := h.e.EnsureTenants(ctx); len(errs) != 0 || len(rt.ensured) != 0 {
+		t.Fatalf("the sweep registered a project that is restarting: %v %+v", errs, rt.ensured)
+	}
+	for _, s := range []registry.Status{registry.StatusInactive, registry.StatusUpgrading, registry.StatusRestoring} {
+		if err := h.reg.SetProjectStatus(ctx, p.Ref, s); err != nil {
+			t.Fatal(err)
+		}
+		if err := h.e.EnsureTenant(ctx, p.Ref); err != nil || len(rt.ensured) != 0 {
+			t.Fatalf("a %s project was registered by a move: %v %+v", s, err, rt.ensured)
+		}
+	}
+}
