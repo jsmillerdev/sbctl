@@ -3,9 +3,9 @@ package replicas
 import (
 	"encoding/json"
 	"os"
-	"path/filepath"
 	"time"
 
+	"github.com/supavise/supavise/internal/fsutil"
 	"github.com/supavise/supavise/internal/registry"
 )
 
@@ -84,32 +84,9 @@ func (c *Controller) writeSnapshot(rows []registry.Replica) {
 	c.mu.Unlock()
 	b, err := json.Marshal(snap)
 	if err == nil {
-		err = writeFileAtomic(path, b)
+		err = fsutil.WriteFile(path, b, 0o600, fsutil.Options{})
 	}
 	if err != nil {
 		c.log.Debug("replicas: write the status snapshot", "path", path, "error", err)
 	}
-}
-
-// writeFileAtomic replaces path with b, mode 0600, so a reader never sees half a file.
-func writeFileAtomic(path string, b []byte) error {
-	f, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".*")
-	if err != nil {
-		return err
-	}
-	tmp := f.Name()
-	_, err = f.Write(b)
-	if cerr := f.Close(); err == nil {
-		err = cerr
-	}
-	if err == nil {
-		err = os.Chmod(tmp, 0o600)
-	}
-	if err == nil {
-		err = os.Rename(tmp, path)
-	}
-	if err != nil {
-		_ = os.Remove(tmp)
-	}
-	return err
 }

@@ -7,11 +7,11 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/supavise/supavise/internal/fsutil"
 	"github.com/supavise/supavise/internal/registry"
 )
 
@@ -214,42 +214,13 @@ func (j *journal) writeFileLocked() error {
 	if st.State == "" {
 		st.State = registry.MoveRunning
 	}
-	return writeStateFile(j.file, st)
+	return writeJSONFile(j.file, st)
 }
-
-func writeStateFile(path string, st stateFile) error { return writeJSONFile(path, st) }
 
 // writeJSONFile writes v to path, 0600, through a temporary file and a rename, so that a reader
 // sees the old file or the new one.
 func writeJSONFile(path string, v any) error {
-	b, err := json.MarshalIndent(v, "", "  ")
-	if err != nil {
-		return err
-	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
-		return err
-	}
-	tmp, err := os.CreateTemp(filepath.Dir(path), ".failover-*")
-	if err != nil {
-		return err
-	}
-	defer os.Remove(tmp.Name())
-	if err := tmp.Chmod(0o600); err != nil {
-		tmp.Close()
-		return err
-	}
-	if _, err := tmp.Write(append(b, '\n')); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Sync(); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	return os.Rename(tmp.Name(), path)
+	return fsutil.WriteJSON(path, v, 0o600, fsutil.Options{Sync: true, MkdirMode: 0o750})
 }
 
 // readStateFile returns nil, nil when there is no file.

@@ -18,6 +18,7 @@ import (
 	"github.com/supavise/supavise/internal/backup"
 	"github.com/supavise/supavise/internal/cluster"
 	"github.com/supavise/supavise/internal/config"
+	"github.com/supavise/supavise/internal/fsutil"
 	"github.com/supavise/supavise/internal/lifecycle"
 	"github.com/supavise/supavise/internal/mesh/peerapi"
 	"github.com/supavise/supavise/internal/registry"
@@ -199,34 +200,11 @@ func (a *NodeAgent) persist(in *instance) {
 	f := instanceFile{Spec: in.spec, Step: in.step, Error: in.errc, Detail: in.detail}
 	b, err := json.Marshal(f)
 	if err == nil {
-		err = os.MkdirAll(filepath.Dir(a.filePath(in.spec.Ref)), 0o750)
-	}
-	if err == nil {
-		err = writeAtomic(a.filePath(in.spec.Ref), b)
+		err = fsutil.WriteFile(a.filePath(in.spec.Ref), b, 0o600, fsutil.Options{MkdirMode: 0o750})
 	}
 	if err != nil {
 		a.o.Log.Warn("replica: could not record the setup state", "replica", in.spec.Identifier, "error", err)
 	}
-}
-
-func writeAtomic(path string, b []byte) error {
-	tmp, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".")
-	if err != nil {
-		return err
-	}
-	defer os.Remove(tmp.Name())
-	if err := tmp.Chmod(0o600); err != nil {
-		tmp.Close()
-		return err
-	}
-	if _, err := tmp.Write(b); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	return os.Rename(tmp.Name(), path)
 }
 
 // get returns the replica this process knows, or reads it from replica.json; nil when there is none.
