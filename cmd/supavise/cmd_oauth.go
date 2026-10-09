@@ -409,6 +409,9 @@ project's sign-in service), or a user id, which reaches the grants of an account
 --org takes an organization's slug and --app an app's id, the column APP ID.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
+			if err := lsSel.validate(false); err != nil { // before the node is opened
+				return err
+			}
 			e, closeFn, err := openOAuthEnv(cmd)
 			if err != nil {
 				return err

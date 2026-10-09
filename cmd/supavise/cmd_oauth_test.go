@@ -511,25 +511,27 @@ func resetOAuthFlags(t *testing.T) {
 	}
 }
 
-// Through the command tree: a revoke that names nothing, or something that makes no sense, is refused
+// Through the command tree: a command that names nothing, or something that makes no sense, is refused
 // before the node is opened (these runs have no config and no registry).
-func TestOAuthGrantsRevokeRefusesBeforeOpeningTheNode(t *testing.T) {
+func TestOAuthGrantsRefuseBeforeOpeningTheNode(t *testing.T) {
 	for _, tc := range []struct {
 		args []string
 		want string
 	}{
-		{nil, "name what to revoke"},
-		{[]string{"abc"}, "is not a grant id"},
-		{[]string{"7", "--all"}, "on its own"},
-		{[]string{"--all", "--user", "a@b.test"}, "--all cannot be combined"},
-		{[]string{"--app", "claude"}, "--app wants"},
-		{[]string{"7", "8"}, "accepts at most 1 arg"},
+		{[]string{"revoke"}, "name what to revoke"},
+		{[]string{"revoke", "abc"}, "is not a grant id"},
+		{[]string{"revoke", "7", "--all"}, "on its own"},
+		{[]string{"revoke", "--all", "--user", "a@b.test"}, "--all cannot be combined"},
+		{[]string{"revoke", "--app", "claude"}, "--app wants"},
+		{[]string{"revoke", "7", "8"}, "accepts at most 1 arg"},
+		{[]string{"list", "--app", "claude"}, "--app wants"},
+		{[]string{"list", "extra"}, "unknown command"},
 	} {
 		resetOAuthFlags(t)
-		out, err := runRoot(t, append([]string{"--config", "/nonexistent/config.toml", "oauth", "grants", "revoke"}, tc.args...)...)
+		out, err := runRoot(t, append([]string{"--config", "/nonexistent/config.toml", "oauth", "grants"}, tc.args...)...)
 		resetOAuthFlags(t)
 		if err == nil || !strings.Contains(err.Error(), tc.want) {
-			t.Errorf("revoke %v: error %v (output %q), want one with %q", tc.args, err, out, tc.want)
+			t.Errorf("%v: error %v (output %q), want one with %q", tc.args, err, out, tc.want)
 		}
 	}
 }
