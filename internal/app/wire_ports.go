@@ -83,7 +83,6 @@ var apiPorts = []struct {
 	Set  func(w *Wire) bool
 }{
 	{"api.Deps.Replicas", func(w *Wire) bool { return w.API.Replicas != nil }},
-	{"api.Deps.Placement", func(w *Wire) bool { return w.API.Placement != nil }},
 	{"api.Deps.LoadBalancers", func(w *Wire) bool { return w.API.LoadBalancers }},
 	{"api.Deps.Failover", func(w *Wire) bool { return w.API.Failover != nil }},
 }

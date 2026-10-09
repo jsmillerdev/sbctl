@@ -69,9 +69,6 @@ func wireReplicas(ctx context.Context, w *Wire) error {
 		} else {
 			w.API.Replicas = replicasOff{Controller: c, why: why}
 		}
-		if r, ok := Get[placement.Resolver](w); ok {
-			w.API.Placement = r
-		}
 		// What the leader hears from the other nodes: the intake keeps the latest report of each node
 		// and hands it over off the intake goroutine, which must not block on a registry read. Node is
 		// the authenticated peer (cluster.Reports.Put sets it from the mTLS identity, never from the body).

@@ -19,7 +19,6 @@ import (
 	"github.com/supavise/supavise/internal/lifecycle"
 	"github.com/supavise/supavise/internal/members"
 	"github.com/supavise/supavise/internal/oauth"
-	"github.com/supavise/supavise/internal/placement"
 	"github.com/supavise/supavise/internal/projectconfig"
 	"github.com/supavise/supavise/internal/registry"
 	"github.com/supavise/supavise/internal/replicas"
@@ -99,9 +98,6 @@ type Deps struct {
 	// code that deletes or restores a project asks first so that no replica row is dropped with its
 	// instance still on another node.
 	Replicas replicas.Service
-	// Placement says where a project's replicas are (replicas.go, pgmeta.go). Empty derives it
-	// from Registry.
-	Placement placement.Resolver
 	// LoadBalancers is whether the proxy serves each project's API load balancer
 	// (<ref>-lb.api.<domain>) once the project has a replica. False: GET load-balancers
 	// answers an empty list, because Studio would show an endpoint nothing serves.
@@ -169,10 +165,9 @@ type Server struct {
 
 	ops opTracker
 
-	// replicas and placement serve the read-replica routes (replicas.go); lbOn is Deps.LoadBalancers.
-	replicas  replicas.Service
-	placement placement.Resolver
-	lbOn      bool
+	// replicas serves the read-replica routes (replicas.go); lbOn is Deps.LoadBalancers.
+	replicas replicas.Service
+	lbOn     bool
 	// failover is Deps.Failover (failover.go).
 	failover FailoverSource
 
@@ -308,10 +303,7 @@ func NewServer(d Deps) (*Server, error) {
 			s.store = NewMemoryStore()
 		}
 	}
-	s.replicas, s.placement, s.lbOn, s.failover = d.Replicas, d.Placement, d.LoadBalancers, d.Failover
-	if s.placement == nil {
-		s.placement = placement.RegistryResolver{Reg: d.Registry}
-	}
+	s.replicas, s.lbOn, s.failover = d.Replicas, d.LoadBalancers, d.Failover
 	s.disk = d.Disk
 	if s.disk == nil {
 		s.disk = diskquota.New(d.Config, nil)

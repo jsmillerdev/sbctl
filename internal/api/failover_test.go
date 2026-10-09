@@ -85,8 +85,8 @@ func TestNewServerTakesTheClusterDeps(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if s.replicas == nil || !s.lbOn || s.failover == nil || s.placement == nil {
-		t.Fatalf("deps not taken: replicas %v, load balancers %v, failover %v, placement %v", s.replicas, s.lbOn, s.failover, s.placement)
+	if s.replicas == nil || !s.lbOn || s.failover == nil {
+		t.Fatalf("deps not taken: replicas %v, load balancers %v, failover %v", s.replicas, s.lbOn, s.failover)
 	}
 	bare, err := NewServer(Deps{Registry: f.reg, Secrets: f.srv.sec, Manager: f.mgr, Config: f.cfg, Store: NewMemoryStore()})
 	if err != nil {

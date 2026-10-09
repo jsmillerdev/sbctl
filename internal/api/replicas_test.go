@@ -690,8 +690,8 @@ func TestNewServerTakesTheReplicaDeps(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if srv.replicas == nil || !srv.lbOn || srv.placement == nil {
-		t.Fatalf("replicas %v, load balancers %v, placement %v", srv.replicas, srv.lbOn, srv.placement)
+	if srv.replicas == nil || !srv.lbOn {
+		t.Fatalf("replicas %v, load balancers %v", srv.replicas, srv.lbOn)
 	}
 	srv, err = NewServer(Deps{Registry: f.reg, Secrets: f.mgr.sec, Manager: f.mgr, Config: f.cfg})
 	if err != nil {

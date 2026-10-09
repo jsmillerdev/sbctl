@@ -205,7 +205,7 @@ func TestWireReplicasGivesTheManagementAPIItsControllerOnAClusterNodeThatRunsIt(
 	if err := wireReplicas(context.Background(), w); err != nil {
 		t.Fatal(err)
 	}
-	if w.API.Replicas != nil || w.API.Placement != nil {
+	if w.API.Replicas != nil {
 		t.Fatal("a single server's Management API got the controller")
 	}
 	if len(w.off) != 0 {
@@ -222,7 +222,7 @@ func TestWireReplicasGivesTheManagementAPIItsControllerOnAClusterNodeThatRunsIt(
 	}
 
 	// A cluster node that cannot reach the replica nodes or take base backups runs no controller. The
-	// Management API still lists replicas (Placement) and has the Remover; a setup request is refused with
+	// Management API still lists replicas and has the Remover; a setup request is refused with
 	// the reason.
 	w2 := testWire(t)
 	Provide[mesh.Mesh](w2, stubMesh{})
@@ -231,8 +231,8 @@ func TestWireReplicasGivesTheManagementAPIItsControllerOnAClusterNodeThatRunsIt(
 	if err := wireReplicas(context.Background(), w2); err != nil {
 		t.Fatal(err)
 	}
-	if w2.API.Replicas == nil || w2.API.Placement == nil {
-		t.Fatalf("replicas %v, placement %v: a cluster node gives the API both", w2.API.Replicas, w2.API.Placement)
+	if w2.API.Replicas == nil {
+		t.Fatalf("replicas %v: a cluster node gives the API its replica service", w2.API.Replicas)
 	}
 	var names []string
 	for _, r := range w2.runners {
@@ -270,7 +270,7 @@ func TestWireReplicasGivesTheManagementAPIItsControllerOnAClusterNodeThatRunsIt(
 	if err := wireReplicas(context.Background(), w3); err != nil {
 		t.Fatal(err)
 	}
-	if _, isController := w3.API.Replicas.(*replicas.Controller); !isController || w3.API.Placement == nil {
+	if _, isController := w3.API.Replicas.(*replicas.Controller); !isController {
 		t.Fatalf("a cluster node that runs the controller gave the Management API %T", w3.API.Replicas)
 	}
 	_, controllerOff := w3.offReason("replica controller")

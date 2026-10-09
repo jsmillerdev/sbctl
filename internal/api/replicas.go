@@ -17,8 +17,8 @@ import (
 // of it. Studio's Infrastructure page adds and removes a replica through the two v1 routes below,
 // lists them through GET databases (databases.go) and follows a new one through databases-statuses.
 //
-// The routes ask the controller through replicas.Service, and the placement Resolver for which
-// replicas a project has. A node without a controller (Deps.Replicas nil) lists the primary alone
+// The routes ask the controller through replicas.Service, and the registry for which replicas a
+// project has. A node without a controller (Deps.Replicas nil) lists the primary alone
 // and refuses to add a replica.
 
 func (s *Server) routesReplicas(add func(string, handlerFunc)) {
@@ -101,7 +101,7 @@ func (s *Server) replicaRoom(ctx context.Context, p *registry.Project) error {
 	if limit == 0 {
 		return errf(http.StatusBadRequest, "Read replicas need a compute size of small or larger.")
 	}
-	have, err := s.placement.ReplicasOf(ctx, p.Ref)
+	have, err := s.reg.ListReplicas(ctx, p.Ref)
 	if err != nil {
 		return mapErr(err)
 	}
@@ -246,7 +246,7 @@ func (s *Server) replicasOf(ctx context.Context, ref string) ([]replicas.Replica
 		return rs, nil
 	}
 	s.log.Warn("the replica controller could not list a project's replicas; listing the registry's rows", "ref", ref, "err", err)
-	rows, rerr := s.placement.ReplicasOf(ctx, ref)
+	rows, rerr := s.reg.ListReplicas(ctx, ref)
 	if rerr != nil {
 		return nil, mapErr(rerr)
 	}
@@ -266,10 +266,10 @@ func (s *Server) replicasOf(ctx context.Context, ref string) ([]replicas.Replica
 	return out, nil
 }
 
-// replicaOf finds identifier among the project's replicas by the placement Resolver, which reads
-// the registry and so answers from the same rows on a follower. ok is false when it is not one.
+// replicaOf finds identifier among the project's replicas in the registry, which on a follower is the
+// replicated copy and so answers from the same rows as the leader. ok is false when it is not one.
 func (s *Server) replicaOf(ctx context.Context, ref, identifier string) (rep registry.Replica, ok bool, err error) {
-	rs, err := s.placement.ReplicasOf(ctx, ref)
+	rs, err := s.reg.ListReplicas(ctx, ref)
 	if err != nil {
 		return rep, false, mapErr(err)
 	}
@@ -281,7 +281,7 @@ func (s *Server) replicaOf(ctx context.Context, ref, identifier string) (rep reg
 }
 
 // replicasByRef reads the replicas of a page of projects in one query, for the listings that show
-// many projects at once; the Resolver answers one project at a time. Both read the registry's
+// many projects at once; replicaOf and replicaRoom read one project's. Both read the registry's
 // replicas, so a project has the same replicas by either. A node without a controller lists the
 // primary alone, as replicasOf does, and reads nothing.
 func (s *Server) replicasByRef(ctx context.Context, ps []registry.Project) (map[string][]registry.Replica, error) {
