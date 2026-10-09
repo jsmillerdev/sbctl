@@ -171,44 +171,38 @@ type fleetRefreshServer struct {
 // registerFleetRefresh serves the refresh endpoint on the process-wide peer mux. wireMesh resets the mux
 // when a daemon starts, so a process that starts the daemon twice (tests) registers it once each time.
 func registerFleetRefresh(s *fleetRefreshServer) {
-	mesh.Handle("POST "+peerapi.PathFleetRefresh, s.ServeHTTP)
+	mesh.Handle("POST "+peerapi.PathFleetRefresh, s.handler())
 }
 
-// ServeHTTP answers POST /peer/v1/fleet/refresh/{tenant}: only the leader asks.
-func (s *fleetRefreshServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+// handler is the refresh endpoint: only the leader asks.
+func (s *fleetRefreshServer) handler() mesh.HandlerFunc {
+	return mesh.RequireLeader(s.mem, s.serve)
+}
+
+// serve answers POST /peer/v1/fleet/refresh/{tenant} for the leader.
+func (s *fleetRefreshServer) serve(w http.ResponseWriter, r *http.Request) {
 	peer, _ := mesh.PeerFrom(r.Context())
-	if leader, ok := s.mem.Leader(); !ok || peer.Node == "" || peer.Node != leader.ID {
-		peerError(w, http.StatusForbidden, "not_leader", "only the leader refreshes a tenant")
-		return
-	}
 	var req peerapi.RefreshRequest
 	if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&req); err != nil && !errors.Is(err, io.EOF) {
-		peerError(w, http.StatusBadRequest, "bad_request", "the body is not a refresh request")
+		mesh.RespondError(w, http.StatusBadRequest, "bad_request", "the body is not a refresh request")
 		return
 	}
 	if s.pr.Replay == nil && req.LSN != "" {
-		peerError(w, http.StatusServiceUnavailable, "unavailable", "this node cannot tell how far its standby has replayed")
+		mesh.RespondError(w, http.StatusServiceUnavailable, "unavailable", "this node cannot tell how far its standby has replayed")
 		return
 	}
 	done, err := s.pr.Do(r.Context(), r.PathValue("tenant"), req.LSN)
 	switch {
 	case errors.Is(err, fleet.ErrInvalid):
-		peerError(w, http.StatusBadRequest, "bad_request", err.Error())
+		mesh.RespondError(w, http.StatusBadRequest, "bad_request", err.Error())
 	case errors.Is(err, fleet.ErrReplayBehind):
-		peerError(w, http.StatusServiceUnavailable, "replay_behind", err.Error())
+		mesh.RespondError(w, http.StatusServiceUnavailable, "replay_behind", err.Error())
 	case err != nil:
 		s.log.Warn("tenant refresh failed", "tenant", r.PathValue("tenant"), "from", peer.Node, "error", err)
-		peerError(w, http.StatusBadGateway, "refresh_failed", err.Error())
+		mesh.RespondError(w, http.StatusBadGateway, "refresh_failed", err.Error())
 	default:
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(peerapi.RefreshResult{Refreshed: done})
+		mesh.RespondJSON(w, http.StatusOK, peerapi.RefreshResult{Refreshed: done})
 	}
-}
-
-func peerError(w http.ResponseWriter, status int, code, msg string) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(peerapi.Error{Code: code, Message: msg})
 }
 
 // peerRefresher is the leader's fleet.PeerRefresher: it sends the refresh to every other active node.

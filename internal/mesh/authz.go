@@ -176,10 +176,9 @@ func hasReplicaOn(rs []registry.Replica, node string) bool {
 // rpcAllowed is the request policy of the peer server: which endpoints a caller may reach given
 // its state. A caller with no certificate reaches the join endpoint; a joining node confirms its
 // join (and asks again to rejoin, when an earlier rejoin stopped); a fenced node hears the ping, the
-// fence and the rejoin; an active node reaches every
-// endpoint, and the handler of an endpoint that only the leader may call checks the caller itself
-// (RequireLeader). The endpoints other workstreams register are not listed because they are for
-// active nodes.
+// fence and the rejoin; an active node reaches every endpoint. An endpoint that only the leader may
+// call is registered with its handler wrapped in RequireLeader, which checks the caller. The
+// endpoints other workstreams register are not listed because they are for active nodes.
 func rpcAllowed(p Peer, path string) (ok bool, why string) {
 	switch {
 	case p.Node == "":

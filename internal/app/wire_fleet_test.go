@@ -175,7 +175,7 @@ func refreshServer(t *testing.T, leader string, rp *scriptedReplay, rf *counting
 		s.pr.Replay = nil
 	}
 	mux := http.NewServeMux()
-	mux.HandleFunc("POST "+peerapi.PathFleetRefresh, s.ServeHTTP)
+	mux.HandleFunc("POST "+peerapi.PathFleetRefresh, s.handler())
 	return mux
 }
 

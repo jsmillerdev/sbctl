@@ -182,17 +182,17 @@ func CertsHandler(dir string, leader func() bool, log *slog.Logger) mesh.Handler
 	}
 	return func(w http.ResponseWriter, r *http.Request) {
 		if p, ok := mesh.PeerFrom(r.Context()); !ok || p.Node == "" {
-			writePeerError(w, http.StatusForbidden, "forbidden", "the certificate store is for the nodes of the cluster")
+			mesh.RespondError(w, http.StatusForbidden, "forbidden", "the certificate store is for the nodes of the cluster")
 			return
 		}
 		if !leader() {
-			writePeerError(w, http.StatusConflict, "not_leader", "this node is not the leader")
+			mesh.RespondError(w, http.StatusConflict, "not_leader", "this node is not the leader")
 			return
 		}
 		files, err := readCertStore(dir, log)
 		if err != nil {
 			log.Error("proxy: reading the certificate store for a peer", "err", err)
-			writePeerError(w, http.StatusInternalServerError, "", "the certificate store cannot be read")
+			mesh.RespondError(w, http.StatusInternalServerError, "", "the certificate store cannot be read")
 			return
 		}
 		snap := peerapi.CertSnapshot{Files: files}
@@ -205,12 +205,6 @@ func CertsHandler(dir string, leader func() bool, log *slog.Logger) mesh.Handler
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(snap)
 	}
-}
-
-func writePeerError(w http.ResponseWriter, status int, code, msg string) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(peerapi.Error{Message: msg, Code: code})
 }
 
 // readCertStore lists the mirrored files under dir. A site (certificates/<issuer>/<site>/) whose
