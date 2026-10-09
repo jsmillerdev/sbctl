@@ -10,9 +10,16 @@ import (
 
 	"github.com/supavise/supavise/internal/api"
 	"github.com/supavise/supavise/internal/config"
+	"github.com/supavise/supavise/internal/lifecycle"
 	"github.com/supavise/supavise/internal/members"
 	"github.com/supavise/supavise/internal/registry"
 )
+
+// newAccounts is the account service over an open node whose registry is Postgres, before a command
+// adds the parts it needs (members, SSO users, OAuth).
+func newAccounts(n *lifecycle.Node, pg *registry.Postgres) *api.Accounts {
+	return &api.Accounts{Reg: n.Registry, Store: api.NewPGClaimStore(pg.Pool()), Keys: n.Engine.Keys, Config: n.Cfg, Log: newLogger(n.Cfg)}
+}
 
 // openAccounts connects to the registry and returns the account service the claim page
 // uses, for the CLI. The system project must be initialized and running (the registry
@@ -27,7 +34,7 @@ func openAccounts(ctx context.Context) (*api.Accounts, *config.Config, func(), e
 		n.Close()
 		return nil, nil, nil, fmt.Errorf("the registry is %T, want Postgres", n.Registry)
 	}
-	acc := &api.Accounts{Reg: n.Registry, Store: api.NewPGClaimStore(pg.Pool()), Keys: n.Engine.Keys, Config: n.Cfg, Log: newLogger(n.Cfg)}
+	acc := newAccounts(n, pg)
 	acc.EnableMembers(n.Registry, api.NewPGStore(pg.Pool()))
 	// `users remove` forgets an SSO account's record and remembers its removal by address, as the
 	// daemon's does (the daemon gets this from NewDashboardSSO).

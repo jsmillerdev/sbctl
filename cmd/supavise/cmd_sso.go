@@ -42,7 +42,7 @@ func openSSOOn(cmd *cobra.Command, n *lifecycle.Node) (*api.DashboardSSO, *api.A
 	if !ok {
 		return nil, nil, fmt.Errorf("the registry is %T, want Postgres", n.Registry)
 	}
-	acc := &api.Accounts{Reg: n.Registry, Store: api.NewPGClaimStore(pg.Pool()), Keys: n.Engine.Keys, Config: n.Cfg, Log: newLogger(n.Cfg)}
+	acc := newAccounts(n, pg)
 	acc.EnableMembers(n.Registry, api.NewPGStore(pg.Pool()))
 	// `sso remove` and `orgs delete` revoke the OAuth grants of the SSO users they remove.
 	acc.OAuth = newOAuthService(n, pg)

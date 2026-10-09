@@ -358,7 +358,7 @@ func openOAuthEnv(cmd *cobra.Command) (*oauthEnv, func(), error) {
 		n.Close()
 		return nil, nil, fmt.Errorf("the registry is %T, want Postgres", n.Registry)
 	}
-	acc := &api.Accounts{Reg: n.Registry, Store: api.NewPGClaimStore(pg.Pool()), Keys: n.Engine.Keys, Config: n.Cfg, Log: newLogger(n.Cfg)}
+	acc := newAccounts(n, pg)
 	e := &oauthEnv{
 		svc: newOAuthService(n, pg),
 		org: func(ctx context.Context, slug string) (int64, error) {

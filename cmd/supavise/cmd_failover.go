@@ -72,16 +72,10 @@ when its own system cluster becomes a standby.`,
 
 // runServerFailover plans the move, prints the plan, asks, and follows the run.
 func runServerFailover(cmd *cobra.Command, o failover.ServerOptions) error {
-	cfg, err := loadConfig()
+	ctx, c, out, err := openFailover(cmd)
 	if err != nil {
 		return err
 	}
-	ctx := cmd.Context()
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	c := newFailoverClient(cfg)
-	out := cmd.OutOrStdout()
 	if o.Abort {
 		return abortServerFailover(ctx, out, c, o)
 	}
@@ -89,17 +83,8 @@ func runServerFailover(cmd *cobra.Command, o failover.ServerOptions) error {
 	if err != nil {
 		return planError(err)
 	}
-	printMovePlan(out, plan, o.Force || o.Resume)
-	refused := plan.Refused(o.Force || o.Resume)
-	if o.DryRun {
-		if len(refused) > 0 {
-			return fmt.Errorf("the move would be refused: %d precondition(s) fail", len(refused))
-		}
-		fmt.Fprintln(out, "\nDry run: nothing was changed.")
-		return nil
-	}
-	if len(refused) > 0 {
-		return &failover.RefusedError{Checks: refused, Force: o.Force}
+	if run, err := reviewMovePlan(out, plan, o.Force, o.Resume, o.DryRun); !run {
+		return err
 	}
 	if !o.Yes {
 		if err := confirmTyped(cmd, serverQuestion(plan), "the name of the new leader", plan.To, orID(plan.ToName, plan.To)); err != nil {
@@ -151,6 +136,39 @@ func abortServerFailover(ctx context.Context, out io.Writer, c failoverClient, o
 }
 
 // planError words an error of the plan request.
+// openFailover loads the config and reaches the daemon of this node for a failover command. It
+// returns the command's context and its output.
+func openFailover(cmd *cobra.Command) (context.Context, failoverClient, io.Writer, error) {
+	cfg, err := loadConfig()
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	ctx := cmd.Context()
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return ctx, newFailoverClient(cfg), cmd.OutOrStdout(), nil
+}
+
+// reviewMovePlan prints the plan, then ends the command where a plan ends before any step runs: a
+// dry run is done (an error when the plan would be refused), and a refused plan is an error. run
+// reports whether the move should go on.
+func reviewMovePlan(out io.Writer, plan *failover.Plan, force, resume, dryRun bool) (run bool, err error) {
+	printMovePlan(out, plan, force || resume)
+	refused := plan.Refused(force || resume)
+	if dryRun {
+		if len(refused) > 0 {
+			return false, fmt.Errorf("the move would be refused: %d precondition(s) fail", len(refused))
+		}
+		fmt.Fprintln(out, "\nDry run: nothing was changed.")
+		return false, nil
+	}
+	if len(refused) > 0 {
+		return false, &failover.RefusedError{Checks: refused, Force: force}
+	}
+	return true, nil
+}
+
 func planError(err error) error {
 	if errors.Is(err, failover.ErrNoCluster) {
 		return errors.New("this server is not part of a cluster: there is nothing to fail over to")
