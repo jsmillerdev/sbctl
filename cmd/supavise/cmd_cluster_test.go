@@ -11,6 +11,7 @@ import (
 	"github.com/supavise/supavise/internal/config"
 	"github.com/supavise/supavise/internal/failover"
 	"github.com/supavise/supavise/internal/health"
+	"github.com/supavise/supavise/internal/hostsetup"
 	"github.com/supavise/supavise/internal/infra"
 	"github.com/supavise/supavise/internal/notimpl"
 )
@@ -81,9 +82,10 @@ func TestReplicasAddNeedsARegion(t *testing.T) {
 // A node that is not in a cluster and not behind on its stack prints exactly the node report, in
 // text and in JSON.
 func TestStatusSectionsAreAbsentOnASingleNode(t *testing.T) {
+	noHostBlock(t)
 	cfg := config.Default()
 	sections := collectStatusSections(context.Background(), cfg)
-	if sections.Cluster != nil || sections.Failover != nil || sections.Infrastructure != nil || len(sections.Errors) != 0 {
+	if sections.Host != nil || sections.Cluster != nil || sections.Failover != nil || sections.Infrastructure != nil || len(sections.Errors) != 0 {
 		t.Fatalf("sections on a single node: %+v", sections)
 	}
 	var b bytes.Buffer
@@ -130,5 +132,51 @@ func TestStatusSectionsRenderAndMarshal(t *testing.T) {
 		if !strings.Contains(j.String(), key) {
 			t.Errorf("JSON lacks %s:\n%s", key, j.String())
 		}
+	}
+}
+
+// noHostBlock keeps a test from checking the host layer of the machine it runs on.
+func noHostBlock(t *testing.T) {
+	t.Helper()
+	old := hostBlockOf
+	hostBlockOf = func(context.Context, *config.Config) (*hostBlock, error) { return nil, nil }
+	t.Cleanup(func() { hostBlockOf = old })
+}
+
+// The status report shows the host layer: the steps with work, the command that does it, and the ones
+// that could not be checked, in text and in JSON, and a host that cannot be read is named like any
+// other block that fails.
+func TestStatusShowsTheHostBlock(t *testing.T) {
+	old := hostBlockOf
+	t.Cleanup(func() { hostBlockOf = old })
+	hostBlockOf = func(context.Context, *config.Config) (*hostBlock, error) {
+		return &hostBlock{
+			Pending:   []hostsetup.Result{{ID: "ufw", Title: "Open the mesh port in ufw when ufw is active", Pending: true}},
+			Unchecked: []hostsetup.Result{{ID: "config-d", Title: "Refresh the cluster settings", Unknown: true, Detail: "the leader did not answer"}},
+		}, nil
+	}
+	s := collectStatusSections(context.Background(), config.Default())
+	var b bytes.Buffer
+	s.render(&b)
+	for _, want := range []string{"Host  1 step(s) of the host layer are pending", "pending  Open the mesh port", "Fix: sudo supavise system converge", "not checked  Refresh the cluster settings (the leader did not answer)"} {
+		if !strings.Contains(b.String(), want) {
+			t.Errorf("missing %q in:\n%s", want, b.String())
+		}
+	}
+	rep := &health.Report{}
+	rep.Finish()
+	var j bytes.Buffer
+	if err := printJSON(&j, statusJSON{Report: rep, statusSections: s}); err != nil || !strings.Contains(j.String(), `"host"`) || !strings.Contains(j.String(), `"unchecked"`) {
+		t.Fatalf("JSON: %v\n%s", err, j.String())
+	}
+
+	hostBlockOf = func(context.Context, *config.Config) (*hostBlock, error) {
+		return nil, errors.New("converge cannot be built")
+	}
+	s = collectStatusSections(context.Background(), config.Default())
+	b.Reset()
+	s.render(&b)
+	if !strings.Contains(b.String(), "host  could not be read: converge cannot be built") {
+		t.Errorf("a host block that fails: %q", b.String())
 	}
 }

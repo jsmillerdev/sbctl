@@ -17,7 +17,7 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	if err := rootCmd.ExecuteContext(ctx); err != nil {
-		fmt.Fprintln(os.Stderr, "supavise:", err)
+		fmt.Fprintln(os.Stderr, "supavise:", followerHint(err))
 		// `supavise upgrade` and `supavise rollback` have their own exit statuses (2, 3 and 4).
 		var f *nodeupgrade.Failure
 		if errors.As(err, &f) {

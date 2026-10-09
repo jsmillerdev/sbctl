@@ -58,6 +58,9 @@ type nodeHost struct {
 	// restart restarts supavise.service and waits until it answers; nil is restartAndWait. A test
 	// sets it, so that it never touches the machine's units.
 	restart func(ctx context.Context) error
+	// openRegistry opens the registry the maintenance announcement is written to; nil opens the node's
+	// own. A test sets it.
+	openRegistry func(ctx context.Context) (registry.Registry, error)
 
 	rel      nodeupgrade.Releases
 	selfOpts selfupdate.Options
@@ -69,6 +72,8 @@ type nodeHost struct {
 	knowsReason bool
 	// halted is the project the last rollout stopped at (HaltedProject).
 	halted string
+	// maint is the maintenance announcement of this run on a leader (AnnounceMaintenance).
+	maint *maintenanceHold
 	// follower is set by Inspect for a server of a cluster that does not lead: its registry is the
 	// leader's copy, which the commands the run starts as workers cannot open for writing.
 	follower  bool
@@ -146,7 +151,10 @@ func (h *nodeHost) asSupaviseTo(ctx context.Context, stdout, stderr io.Writer, e
 }
 
 // superviseCredential is the uid, gid and groups of the supavise user.
-func (h *nodeHost) superviseCredential() (*syscall.Credential, error) {
+func (h *nodeHost) superviseCredential() (*syscall.Credential, error) { return supaviseCredential() }
+
+// supaviseCredential is the uid, gid and groups of the supavise user.
+func supaviseCredential() (*syscall.Credential, error) {
 	u, err := user.Lookup(installUser)
 	if err != nil {
 		return nil, fmt.Errorf("the %s user: %w", installUser, err)

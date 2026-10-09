@@ -250,3 +250,27 @@ func TestScheduledBackupsNeedTheirSeams(t *testing.T) {
 		t.Fatalf("errors = %v", errs)
 	}
 }
+
+// A seam the wiring left nil is reported by the round, not found by the first backup of a project
+// homed elsewhere as a nil dereference.
+func TestScheduledBackupsReportEachSeamTheWiringLeftNil(t *testing.T) {
+	for name, unset := range map[string]func(*ScheduledBackups){
+		"registry":     func(s *ScheduledBackups) { s.Registry = nil },
+		"self":         func(s *ScheduledBackups) { s.Self = nil },
+		"routed":       func(s *ScheduledBackups) { s.Routed = nil },
+		"routed.local": func(s *ScheduledBackups) { s.Routed.Local = nil },
+		"routed.self":  func(s *ScheduledBackups) { s.Routed.Self = nil },
+		"routed.ops":   func(s *ScheduledBackups) { s.Routed.Ops = nil },
+	} {
+		t.Run(name, func(t *testing.T) {
+			e := newScheduledEnv(t)
+			unset(e.s)
+			if errs := e.s.Once(context.Background()); errs[""] == nil {
+				t.Fatalf("errors = %v", errs)
+			}
+			if len(e.backups.reasons) != 0 || len(e.local.files) != 0 {
+				t.Fatalf("a round that is not set up took backups: %v %v", e.backups.reasons, e.local.files)
+			}
+		})
+	}
+}

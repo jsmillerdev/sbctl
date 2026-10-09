@@ -65,29 +65,62 @@ func decideBoot(ctx context.Context, cfg *config.Config, o Options, log *slog.Lo
 }
 
 // lazyMarker reads the leader marker from the backup store, opening the store on first use: the
-// decision for a server with no cluster never gets as far as asking.
+// decision for a server with no cluster never gets as far as asking. It serves the boot decision and the
+// running leader's look at the marker (cluster.LiveOptions.Marker), which lasts as long as the daemon, so
+// a store that did not open once (the bucket was unreachable at boot) is tried again at the next read;
+// only a store that opened is kept.
 type lazyMarker struct {
-	cfg  *config.Config
-	once sync.Once
-	m    backup.EpochMarkerStore
-	err  error
+	cfg *config.Config
+	mu  sync.Mutex
+	m   backup.EpochMarkerStore
 }
 
 func (l *lazyMarker) store(ctx context.Context) (backup.EpochMarkerStore, error) {
-	l.once.Do(func() {
-		st, err := backup.OpenStore(ctx, l.cfg.Backup)
-		if err != nil {
-			l.err = err
-			return
-		}
-		svc, err := backup.New(backup.Options{Config: l.cfg, Store: st})
-		if err != nil {
-			l.err = err
-			return
-		}
-		l.m = svc
-	})
-	return l.m, l.err
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.m != nil {
+		return l.m, nil
+	}
+	st, err := backup.OpenStore(ctx, l.cfg.Backup)
+	if err != nil {
+		return nil, err
+	}
+	svc, err := backup.New(backup.Options{Config: l.cfg, Store: st})
+	if err != nil {
+		return nil, err
+	}
+	l.m = svc
+	return l.m, nil
+}
+
+// lateFencer is cluster.LiveOptions.Fence for an orchestrator that does not exist yet: the mesh hook
+// builds the membership, and the failover hook, which runs later, builds the orchestrator whose
+// FenceOnHigherEpoch is the verdict. A running leader that learns it was replaced asks it; until the
+// failover hook has set it, or when that hook left the orchestrator off, the membership fences the node
+// by itself (it records the fence and stops the clusters through OnFenced), as it did before.
+type lateFencer struct {
+	mu sync.Mutex
+	f  interface {
+		FenceOnHigherEpoch(ctx context.Context, source string, epoch int64, leader string) (bool, error)
+	}
+}
+
+func (l *lateFencer) set(f interface {
+	FenceOnHigherEpoch(ctx context.Context, source string, epoch int64, leader string) (bool, error)
+}) {
+	l.mu.Lock()
+	l.f = f
+	l.mu.Unlock()
+}
+
+func (l *lateFencer) fence(ctx context.Context, source string, epoch int64, leader string) (bool, error) {
+	l.mu.Lock()
+	f := l.f
+	l.mu.Unlock()
+	if f == nil {
+		return true, nil
+	}
+	return f.FenceOnHigherEpoch(ctx, source, epoch, leader)
 }
 
 func (l *lazyMarker) ReadLeaderMarker(ctx context.Context) (*backup.LeaderMarker, error) {
@@ -308,8 +341,14 @@ func startCluster(ctx context.Context, w *Wire, boot cluster.BootDecision, dir s
 	if boot.DSN != "" {
 		dsns = append([]string{boot.DSN}, dsns...)
 	}
+	// The orchestrator's verdict on a higher epoch (the failover hook sets it) and the backup store's leader
+	// marker, which a leader that no peer reaches still learns of a promotion from. The marker is opened
+	// when it is first read, and again after a failure.
+	fencer := &lateFencer{}
+	Provide(w, fencer)
 	live := cluster.NewLive(cluster.LiveOptions{
 		Cfg: cfg, Reg: reg, SelfID: selfID, Boot: boot, Log: log,
+		Fence: fencer.fence, Marker: &lazyMarker{cfg: cfg},
 		InRecovery: func(ctx context.Context) (bool, error) {
 			var last error
 			for _, dsn := range dsns {

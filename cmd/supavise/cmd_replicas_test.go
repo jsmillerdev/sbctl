@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -10,7 +11,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/supavise/supavise/internal/api"
 	"github.com/supavise/supavise/internal/config"
+	"github.com/supavise/supavise/internal/lifecycle"
 	"github.com/supavise/supavise/internal/registry"
 	"github.com/supavise/supavise/internal/replicas"
 	"github.com/supavise/supavise/internal/replicas/replicaid"
@@ -222,5 +225,240 @@ func TestReplicasAddNodeWithoutRegion(t *testing.T) {
 	}
 	if out, err := run(t, "replicas", "add", replicaTestRef, "--region", config.DefaultRegion, "--node", "bare"); err != nil || !strings.Contains(out, "on node n4") {
 		t.Fatalf("add --node: %q %v", out, err)
+	}
+}
+
+// A delete or an in-place restore removes the project's replicas first, as the Management API does. This
+// process cannot reach the other nodes: it marks the replicas GOING_DOWN, stops with their names, and
+// goes on once the controller has removed them.
+func TestRemoveReplicasFirstMarksTheReplicasAndStopsWhileTheyRemain(t *testing.T) {
+	reg, _ := replicaTestEnv(t)
+	ctx := context.Background()
+	cfg := config.Default()
+
+	// No replicas: nothing to wait for.
+	if err := removeReplicasFirst(ctx, reg, cfg, replicaTestRef); err != nil {
+		t.Fatalf("a project with no replicas: %v", err)
+	}
+
+	id := registry.ReplicaIdentifier(replicaTestRef, "eu-west-1", "abc123")
+	if err := reg.CreateReplica(ctx, &registry.Replica{Identifier: id, Ref: replicaTestRef, NodeID: "n2", Origin: registry.ReplicaManual,
+		Status: "ACTIVE_HEALTHY"}); err != nil {
+		t.Fatal(err)
+	}
+	err := removeReplicasFirst(ctx, reg, cfg, replicaTestRef)
+	if err == nil || !strings.Contains(err.Error(), id) || !strings.Contains(err.Error(), "still being removed") {
+		t.Fatalf("a replica that cannot be reached: %v", err)
+	}
+	var pe *replicas.PendingError
+	if errors.As(err, &pe) {
+		t.Fatal("the pending error leaks out of the command: it is explained")
+	}
+	r, err := reg.GetReplica(ctx, id)
+	if err != nil || r.Status != "GOING_DOWN" {
+		t.Fatalf("the replica after the refusal: %+v, %v", r, err)
+	}
+
+	// The controller removed it (its row is gone): the command goes on.
+	if err := reg.DeleteReplica(ctx, id); err != nil {
+		t.Fatal(err)
+	}
+	if err := removeReplicasFirst(ctx, reg, cfg, replicaTestRef); err != nil {
+		t.Fatalf("after the removal: %v", err)
+	}
+}
+
+// readOnlyReplicas is a registry that refuses the writes of a replica's status, as the copy on a follower does.
+type readOnlyReplicas struct{ registry.Registry }
+
+func (readOnlyReplicas) SetReplicaStatus(context.Context, string, string, string, string) error {
+	return registry.ErrReadOnly
+}
+
+func (readOnlyReplicas) SetReplicaStatusUnlessGoingDown(context.Context, string, string, string, string) (bool, error) {
+	return false, registry.ErrReadOnly
+}
+
+// On a follower nothing can mark a replica GOING_DOWN, and no daemon here will finish the removal: the
+// command sends the operator to the leader and does not promise that running it again will help.
+func TestRemoveReplicasFirstOnAFollowerSendsYouToTheLeader(t *testing.T) {
+	reg, _ := replicaTestEnv(t)
+	ctx := context.Background()
+	id := registry.ReplicaIdentifier(replicaTestRef, "eu-west-1", "abc123")
+	if err := reg.CreateReplica(ctx, &registry.Replica{Identifier: id, Ref: replicaTestRef, NodeID: "n2", Origin: registry.ReplicaManual,
+		Status: "ACTIVE_HEALTHY"}); err != nil {
+		t.Fatal(err)
+	}
+	err := removeReplicasFirst(ctx, readOnlyReplicas{reg}, config.Default(), replicaTestRef)
+	if !errors.Is(err, registry.ErrReadOnly) {
+		t.Fatalf("removal on a follower: %v", err)
+	}
+	if strings.Contains(err.Error(), "run this command again") {
+		t.Errorf("a follower is told to wait for a removal that will not happen: %v", err)
+	}
+	if got := followerHint(err); got == nil || !strings.Contains(got.Error(), "run it on the leader") {
+		t.Errorf("main's explanation: %v", got)
+	}
+	if r, err := reg.GetReplica(ctx, id); err != nil || r.Status != "ACTIVE_HEALTHY" {
+		t.Errorf("the replica was changed: %+v, %v", r, err)
+	}
+}
+
+// An in-place restore checks the project before it touches its replicas: one that is not running is
+// refused with them untouched, as the API refuses it, and a project whose last restore failed may be
+// restored again.
+func TestPrepareInPlaceRestoreChecksTheProjectBeforeItsReplicas(t *testing.T) {
+	reg, _ := replicaTestEnv(t)
+	ctx := context.Background()
+	cfg := config.Default()
+	id := registry.ReplicaIdentifier(replicaTestRef, "eu-west-1", "abc123")
+	if err := reg.CreateReplica(ctx, &registry.Replica{Identifier: id, Ref: replicaTestRef, NodeID: "n2", Origin: registry.ReplicaManual,
+		Status: "ACTIVE_HEALTHY"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := prepareInPlaceRestore(ctx, reg, cfg, "zzzzzzzzzzzzzzzzzzzz"); !errors.Is(err, registry.ErrNotFound) {
+		t.Fatalf("an unknown project: %v", err)
+	}
+	for _, st := range []registry.Status{registry.StatusInactive, registry.StatusRestoring} {
+		if err := reg.SetProjectStatus(ctx, replicaTestRef, st); err != nil {
+			t.Fatal(err)
+		}
+		err := prepareInPlaceRestore(ctx, reg, cfg, replicaTestRef)
+		if err == nil || !strings.Contains(err.Error(), "while it is "+string(st)) {
+			t.Fatalf("a project that is %s: %v", st, err)
+		}
+		if r, err := reg.GetReplica(ctx, id); err != nil || r.Status != "ACTIVE_HEALTHY" {
+			t.Fatalf("a refused restore touched the replica (%s): %+v, %v", st, r, err)
+		}
+	}
+	if err := reg.SetProjectStatus(ctx, replicaTestRef, registry.StatusRestoreFailed); err != nil {
+		t.Fatal(err)
+	}
+	// Restorable: the replica is marked and the restore waits for the controller to remove it.
+	if err := prepareInPlaceRestore(ctx, reg, cfg, replicaTestRef); err == nil || !strings.Contains(err.Error(), "still being removed") {
+		t.Fatalf("a project whose restore failed: %v", err)
+	}
+	if r, err := reg.GetReplica(ctx, id); err != nil || r.Status != "GOING_DOWN" {
+		t.Fatalf("the replica after the restore started: %+v, %v", r, err)
+	}
+}
+
+// `backups create` takes the base backup of a project homed on this server. For one homed elsewhere it
+// stops before it snapshots any files and says where the project lives, instead of failing on a data
+// directory this server does not have.
+func TestBaseBackupOfAProjectHomedElsewhereIsRefused(t *testing.T) {
+	reg, _ := replicaTestEnv(t)
+	ctx := context.Background()
+	const here, away = "hhhhhhhhhhhhhhhhhhhh", "dddddddddddddddddddd"
+	for ref, node := range map[string]string{here: "n1", away: "n2"} {
+		if err := reg.CreateProject(ctx, &registry.Project{Ref: ref, Name: ref, Status: registry.StatusActiveHealthy, NodeID: node}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	asNode := func(name string) *config.Config {
+		cfg := config.Default()
+		cfg.Node.Name = name
+		return cfg
+	}
+
+	leader := asNode("primary") // n1
+	// Homed here, no home recorded, not a project at all: the backup service goes on and reports what it finds.
+	for _, ref := range []string{here, replicaTestRef, "zzzzzzzzzzzzzzzzzzzz"} {
+		if err := baseBackupHome(ctx, reg, leader, ref); err != nil {
+			t.Errorf("%s on its home: %v", ref, err)
+		}
+	}
+	err := baseBackupHome(ctx, reg, leader, away)
+	if err == nil || !strings.Contains(err.Error(), "homed on node eu") || !strings.Contains(err.Error(), "--files-only") {
+		t.Fatalf("a project homed on another node: %v", err)
+	}
+
+	follower := asNode("eu") // n2
+	if err := baseBackupHome(ctx, reg, follower, away); err != nil {
+		t.Errorf("on its own home: %v", err)
+	}
+	if err := baseBackupHome(ctx, reg, follower, here); err == nil || !strings.Contains(err.Error(), "homed on node primary") {
+		t.Errorf("a leader's project, seen from a follower: %v", err)
+	}
+
+	// A server that never joined a cluster has no node row of its own and is the founder (n1).
+	alone := asNode("not-in-the-registry")
+	if err := baseBackupHome(ctx, reg, alone, here); err != nil {
+		t.Errorf("a single server: %v", err)
+	}
+}
+
+// The delete never reaches the Engine while a replica remains (a nil Engine would stop the test).
+func TestDeleteProjectStopsWhileReplicasRemain(t *testing.T) {
+	reg, _ := replicaTestEnv(t)
+	ctx := context.Background()
+	id := registry.ReplicaIdentifier(replicaTestRef, "eu-west-1", "abc123")
+	if err := reg.CreateReplica(ctx, &registry.Replica{Identifier: id, Ref: replicaTestRef, NodeID: "n2", Origin: registry.ReplicaManual,
+		Status: "ACTIVE_HEALTHY"}); err != nil {
+		t.Fatal(err)
+	}
+	n := &lifecycle.Node{Registry: reg, Cfg: config.Default()}
+	if err := deleteProject(ctx, n, replicaTestRef, false); err == nil || !strings.Contains(err.Error(), id) {
+		t.Fatalf("delete with a replica: %v", err)
+	}
+}
+
+// `orgs delete` removes each project's replicas before the project, as the API's organization delete does:
+// the organization and the project stay, the replica is marked GOING_DOWN, and the Engine is never
+// reached (a nil Engine would stop the test). Deleting the project row would take the replica rows with
+// it and leave their instances on the other nodes.
+func TestOrgDeleteStopsAtAProjectWhoseReplicasRemain(t *testing.T) {
+	reg, _ := replicaTestEnv(t)
+	ctx := context.Background()
+	if _, err := reg.CreateOrganization(ctx, "keep", "Keep"); err != nil {
+		t.Fatal(err)
+	}
+	scrap, err := reg.CreateOrganization(ctx, "scrap", "Scrap")
+	if err != nil {
+		t.Fatal(err)
+	}
+	const ref = "bbbbbbbbbbbbbbbbbbbb"
+	if err := reg.CreateProject(ctx, &registry.Project{Ref: ref, OrgID: scrap.ID, Name: "scrap app", Status: registry.StatusActiveHealthy}); err != nil {
+		t.Fatal(err)
+	}
+	id := registry.ReplicaIdentifier(ref, "eu-west-1", "abc123")
+	if err := reg.CreateReplica(ctx, &registry.Replica{Identifier: id, Ref: ref, NodeID: "n2", Origin: registry.ReplicaManual,
+		Status: "ACTIVE_HEALTHY"}); err != nil {
+		t.Fatal(err)
+	}
+
+	var out, errw bytes.Buffer
+	n := &lifecycle.Node{Registry: reg, Cfg: config.Default()}
+	d := &api.OrgDeleter{Reg: reg, DeleteProject: orgProjectDeleter(n, func(context.Context, string) error {
+		t.Error("a branch is not what this organization holds")
+		return nil
+	}, &out, &errw)}
+	_, err = d.Delete(ctx, nil, scrap)
+	var oe *api.OrgDeleteError
+	if !errors.As(err, &oe) || oe.Ref != ref || !strings.Contains(err.Error(), id) || !strings.Contains(err.Error(), "still being removed") {
+		t.Fatalf("org delete with a replica that cannot be reached: %v", err)
+	}
+	if out.Len() != 0 {
+		t.Errorf("the project is reported deleted: %q", out.String())
+	}
+	if _, err := reg.GetOrganization(ctx, "scrap"); err != nil {
+		t.Errorf("the organization went with a project that was not deleted: %v", err)
+	}
+	if _, err := reg.GetProject(ctx, ref); err != nil {
+		t.Errorf("the project: %v", err)
+	}
+	if r, err := reg.GetReplica(ctx, id); err != nil || r.Status != "GOING_DOWN" {
+		t.Errorf("the replica after the refusal: %+v, %v", r, err)
+	}
+}
+
+func TestOnlyAnInPlaceRestoreRemovesTheReplicas(t *testing.T) {
+	for _, c := range []struct {
+		as   string
+		want bool
+	}{{"", true}, {replicaTestRef, true}, {"bbbbbbbbbbbbbbbbbbbb", false}} {
+		if got := restoresInPlace(replicaTestRef, c.as); got != c.want {
+			t.Errorf("--as %q: in place = %v, want %v", c.as, got, c.want)
+		}
 	}
 }

@@ -93,6 +93,14 @@ func Rollback(ctx context.Context, h Host, o Options) error {
 	o.log().Info("rollback_started", "from", node.Version, "to", prev.Version, "projects", len(moves))
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 45*time.Minute)
 	defer cancel()
+	end, err := announce(ctx, h, &o, node, RollbackMaintenanceReason(prev.Version))
+	if err != nil {
+		r.mark(PhaseRefused, err.Error())
+		return refused("%v; nothing was stopped or changed", err)
+	}
+	if end != nil {
+		defer end()
+	}
 	o.notify(ctx, Event{Kind: EventStarted, Rollback: true, From: node.Version, To: prev.Version, Projects: len(moves)})
 	if err := rollBackTo(ctx, h, o, rollbackArgs{From: node.Version, FromPins: node.Pins, To: prev, Moves: moves, Verdict: node.Verdict, Mark: r.mark}); err != nil {
 		r.mark(PhaseFailed, err.Error())

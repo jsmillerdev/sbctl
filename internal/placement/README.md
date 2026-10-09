@@ -181,6 +181,8 @@ Five more pieces are the wiring's to attach:
   the registry.
 - `SystemStandby` (`systemstandby.go`) adapts `lifecycle.PostgresPlane.SeedSystemStandby` to the join's
   `cluster.SeedFunc` and `Preflight`, for a server that joins before its daemon and its registry exist.
+  `Joining` leaves the backend out of the preflight (the leader's settings replace it with the join).
+  `cmd/supavise/cmd_node_seed.go` builds it for `node join` and `node rejoin`.
 - `Router.ReconfigureService` sends the settings of GoTrue and PostgREST of a project homed elsewhere to
   its home as a `Reconfigure` (both services restart).
 
@@ -212,7 +214,9 @@ the ports is covered by the unit tests of `internal/lifecycle`.
   node, whose registry is read-only on a follower, and is refused for a project homed elsewhere.
 - A project homed on a follower is backed up once a day by the leader (`ScheduledBackups`), not at the
   calendar of `[backup] base_backup_on_calendar`; `supavise backups create` on a follower is refused by
-  its read-only registry, and on the leader it takes the local data directory, which a project homed
-  elsewhere does not have there.
+  its read-only registry, and on any server it refuses the base backup of a project homed on another node
+  (`baseBackupHome` in `cmd/supavise`) with a message that names the home, before it snapshots any files:
+  the command has no session with that node, and the local data directory is not the project's. `--files-only`
+  still works on the leader, where the shared services keep those files.
 - Create with a seed, and the optional capabilities of the Engine's plane (Postgres settings, role
   passwords, extensions, render checks), are not carried to another node.

@@ -7,9 +7,12 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/supavise/supavise/internal/config"
+	"github.com/supavise/supavise/internal/failover/fenced"
 	"github.com/supavise/supavise/internal/registry"
+	"github.com/supavise/supavise/internal/units"
 )
 
 func systemStandbyPlan() SystemStandbyPlan {
@@ -142,5 +145,114 @@ func TestSystemStandbyPreflight(t *testing.T) {
 	f.cfg.Backup.Backend = "file:///var/lib/supavise/backups"
 	if err := f.pl.SystemStandbyPreflight(ctx); err == nil || !strings.Contains(err.Error(), "file://") {
 		t.Fatalf("a file:// backend = %v", err)
+	}
+}
+
+// A server that has not joined yet holds its own [backup], the file:// default for one that passed no
+// --s3 flags, and the leader's settings replace it with the join: its preflight leaves the backend
+// alone. A rejoin holds the leader's settings already and is refused a file:// backend.
+func TestSystemStandbyJoinPreflightLeavesTheBackendToTheLeader(t *testing.T) {
+	ctx := context.Background()
+	f := newReplicaFixture(t)
+	f.cfg.Backup.Backend = "file:///var/lib/supavise/backups"
+	if err := f.pl.SystemStandbyJoinPreflight(ctx); err != nil {
+		t.Fatalf("a join with the default backend: %v", err)
+	}
+	if err := f.pl.SystemStandbyPreflight(ctx); err == nil || !strings.Contains(err.Error(), "file://") {
+		t.Fatalf("a rejoin with a file:// backend = %v", err)
+	}
+}
+
+// Both preflights want the Postgres release on disk, which the commands download before they ask.
+func TestSystemStandbyPreflightsWantThePostgresRelease(t *testing.T) {
+	ctx := context.Background()
+	f := newReplicaFixture(t)
+	f.cfg.Backup.Backend = "s3://bucket/prefix"
+	f.pl.arts = noPostgres{}
+	for name, check := range map[string]func(context.Context) error{"join": f.pl.SystemStandbyJoinPreflight, "rejoin": f.pl.SystemStandbyPreflight} {
+		if err := check(ctx); err == nil || !strings.Contains(err.Error(), "not installed") {
+			t.Errorf("%s without the release = %v", name, err)
+		}
+	}
+}
+
+type noPostgres struct{ fakeArts }
+
+func (noPostgres) Dir(string) (string, error) { return "", errors.New("not fetched") }
+
+// OpenStandbyPlane builds a plane over the supervisor and the artifacts it is given, which seeds a
+// standby without a registry, and its closer lets go of the supervisor.
+func TestOpenStandbyPlaneSeedsOverTheGivenSupervisor(t *testing.T) {
+	ctx := context.Background()
+	f := newReplicaFixture(t)
+	sup := &closingSup{replicaSup: f.sup}
+	pl, closeUnits, err := OpenStandbyPlane(f.cfg, OpenOptions{Supervisor: sup, Artifacts: fakeArts{}, RestoreCommandFor: func(string) string { return "fetch" }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pl.opts.ClusterSQL = f.sql // the cluster itself is not there
+	plan := systemStandbyPlan()
+	var plans []ReplicaSeedPlan
+	if err := pl.SeedSystemStandby(ctx, plan, systemSeeder(&plans, plan.Identifier)); err != nil {
+		t.Fatal(err)
+	}
+	if len(plans) != 1 || plans[0].Ref != config.SystemRef {
+		t.Fatalf("plans = %+v", plans)
+	}
+	if !strings.Contains(sup.ops(), "start supavise-postgres@system.service") {
+		t.Fatalf("the standby was not started on the given supervisor:\n%s", sup.ops())
+	}
+	if sup.closed != 0 {
+		t.Fatal("the supervisor was closed before the caller asked")
+	}
+	closeUnits()
+	if sup.closed != 1 {
+		t.Fatalf("closer ran %d times", sup.closed)
+	}
+}
+
+type closingSup struct {
+	*replicaSup
+	closed int
+}
+
+func (c *closingSup) Close() { c.closed++ }
+
+// The system cluster starts from the files it was rendered with, with an empty registry and no key: the
+// registry is this cluster, and a planned move that stopped it starts it again this way. A cluster that was
+// never rendered, and one this node is fenced for, do not start.
+func TestStartSystemDatabaseNeedsNoRegistryAndNoCredentials(t *testing.T) {
+	ctx := context.Background()
+	f := newReplicaFixture(t)
+	pl := NewPostgresPlane(f.cfg, f.sup, fakeArts{}, registry.NewMemory(), PlaneOptions{PostgresReadyTimeout: 200 * time.Millisecond})
+
+	if err := pl.StartSystemDatabase(ctx); err == nil || !strings.Contains(err.Error(), "never rendered") {
+		t.Fatalf("a system cluster that was never rendered: %v", err)
+	}
+	if strings.Contains(f.sup.ops(), "start") {
+		t.Fatalf("a unit was started:\n%s", f.sup.ops())
+	}
+
+	run := units.FilesFor(f.cfg, units.Spec{Service: config.SvcPostgres, Ref: config.SystemRef}).Run
+	if err := os.MkdirAll(filepath.Dir(run), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(run, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// The unit is started; nothing answers on the socket of a test, so the wait ends in its own error.
+	err := pl.StartSystemDatabase(ctx)
+	if err == nil || !strings.Contains(err.Error(), "not ready") {
+		t.Fatalf("StartSystemDatabase = %v", err)
+	}
+	if !strings.Contains(f.sup.ops(), "start supavise-postgres@system.service") {
+		t.Fatalf("the system unit was not started:\n%s", f.sup.ops())
+	}
+
+	if err := fenced.WriteNode(f.cfg.Paths(), fenced.Record{Epoch: 4, Leader: "n2", Reason: "replaced by n2"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := pl.StartSystemDatabase(ctx); !errors.Is(err, ErrFenced) {
+		t.Fatalf("a fenced node started its system cluster: %v", err)
 	}
 }

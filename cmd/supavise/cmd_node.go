@@ -19,31 +19,11 @@ import (
 	"github.com/supavise/supavise/internal/cluster"
 	"github.com/supavise/supavise/internal/config"
 	"github.com/supavise/supavise/internal/hostsetup"
-	"github.com/supavise/supavise/internal/mesh/peerapi"
-	"github.com/supavise/supavise/internal/notimpl"
 	"github.com/supavise/supavise/internal/registry"
 	"github.com/supavise/supavise/internal/secrets"
 	"github.com/supavise/supavise/internal/units"
 	"github.com/supavise/supavise/internal/versions"
 )
-
-// seedSystemStandby builds this server's standby of the system cluster from the base backup the
-// leader names and starts it (backup.SeedReplica, then the replica unit of lifecycle). The install
-// command that joins a server (`supavise install --join-token-file`) and the join below both call the
-// same function; the join itself (cluster.Join) does everything around it. It refuses to overwrite
-// data that is not a seeding of its own that stopped: a join with --reset and a rejoin set the old
-// data aside before they call it, and a resumed join or a repeated rejoin finds the partial copy.
-var seedSystemStandby cluster.SeedFunc = func(context.Context, peerapi.SystemBootstrap) error {
-	return notimpl.For("seeding the system standby")
-}
-
-// seedPreflight checks what seedSystemStandby needs (room on the disk, the backup store) before a join
-// or a rejoin spends the token or moves data aside. The join and the rejoin call it first, so a seeding
-// that cannot work refuses before anything has changed. It does not look at the data directories (see
-// seedSystemStandby), and a resumed join does not call it.
-var seedPreflight = func(context.Context) error {
-	return notimpl.For("seeding the system standby")
-}
 
 // stopLocalFn and leadsHere are what the join and the rejoin use to stop the units of this server and to
 // ask whether it leads its cluster; the tests of the commands replace them.
@@ -124,7 +104,10 @@ master key derives); the daemon restarts once to listen on the peer port.`,
 		Long: `Connects to the leader named in the token, checks that it presents the cluster CA the token
 pins, proves it holds the token's secret, and receives a node certificate, the master key, the cluster's
 settings and the first copy of the system cluster. The node is "joining" until its copy streams, then
-"active".
+"active". The copy is built by the supavise user (a command started with sudo becomes that user once it has
+read its inputs); the Postgres release is downloaded before the token is spent, the other services'
+artifacts after, and the copy replays the leader's archive through a WAL relay this command serves until it
+returns.
 
 A join that stopped after the certificate was issued continues with --resume, which needs no token.
 A server that holds the identity of a join that was given up on (the leader removes a node that is still
@@ -147,8 +130,11 @@ the node. The token may be read from a file (--token-file) so that it never appe
 			if err := hostReady(cfg); err != nil {
 				return err
 			}
+			log := newLogger(cfg)
+			standby := openStandby(log, true)
+			defer standby.Close()
 			o := cluster.JoinOptions{Cfg: cfg, ConfigPath: config.ResolvePath(configPath), Resume: joinResume, Reset: joinReset, Region: joinRegion, Address: joinAddress,
-				Version: version, Log: newLogger(cfg), Seed: seedSystemStandby, Preflight: seedPreflight, DSNs: app.RegistryDSNs(cfg)}
+				Version: version, Log: log, Seed: standby.Seed, Preflight: standby.Preflight, DSNs: app.RegistryDSNs(cfg)}
 			if !joinResume {
 				raw, err := tokenInput(args, joinTokenFile, cmd.InOrStdin())
 				if err != nil {
@@ -167,6 +153,11 @@ the node. The token may be read from a file (--token-file) so that it never appe
 				if id := app.AWSIdentity(cmd.Context(), cfg); id != nil {
 					o.Provider = registry.NodeProvider{AWS: id}
 				}
+			}
+			// The inputs that only root could read are read. The seeding builds data that the supavise
+			// user's units run on, so a command that sudo started becomes that user from here on.
+			if err := runAsSupavise(); err != nil {
+				return err
 			}
 			// A reset throws away the identity this server holds, so it is asked before anything is
 			// stopped or moved: after the inputs are checked, with the data listed, and refused on a
@@ -266,14 +257,21 @@ replicas from the current leader's archive, and keeps its identity.`,
 			if err := hostReady(cfg); err != nil {
 				return err
 			}
+			// The seeding builds data that the supavise user's units run on: a command that sudo started
+			// becomes that user before it stops anything.
+			if err := runAsSupavise(); err != nil {
+				return err
+			}
 			log := newLogger(cfg)
 			stop, closeUnits, err := stopLocalFn(cfg, log)
 			if err != nil {
 				return err
 			}
 			defer closeUnits()
+			standby := openStandby(log, false)
+			defer standby.Close()
 			o := cluster.RejoinOptions{Cfg: cfg, ConfigPath: config.ResolvePath(configPath), Leader: rejoinLeader, Version: version, Log: log,
-				Seed: seedSystemStandby, Preflight: seedPreflight, DSNs: app.RegistryDSNs(cfg), StopLocal: stop}
+				Seed: standby.Seed, Preflight: standby.Preflight, DSNs: app.RegistryDSNs(cfg), StopLocal: stop}
 			if v, err := artifacts.ParseVersions(versions.VersionsYAML); err == nil {
 				o.Pins = v.Pins()
 			}

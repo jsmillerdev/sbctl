@@ -214,6 +214,11 @@ func TestRejoin(t *testing.T) {
 	if !IsFollower(dir) {
 		t.Fatal("a node that rejoined is not marked as a follower")
 	}
+	// The cluster settings carry the backup and DNS credentials: a rejoin writes them for their owner only.
+	cl := filepath.Join(config.ConfigDDir(j.confPath), config.ClusterConfigFile)
+	if fi, err := os.Stat(cl); err != nil || fi.Mode().Perm()&0o077 != 0 {
+		t.Fatalf("%s after a rejoin: %v, %v", cl, fi, err)
+	}
 	if rs, _ := l.reg.ListReplicasOn(ctx, "n2"); len(rs) != 1 || rs[0].Ref != "system" || boot[0].Identifier != rs[0].Identifier {
 		t.Fatalf("system replica rows %+v for bootstrap %+v", rs, boot)
 	}

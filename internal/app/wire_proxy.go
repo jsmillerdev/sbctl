@@ -45,10 +45,18 @@ func wireProxy(ctx context.Context, w *Wire) error {
 	mesh.Handle("GET "+peerapi.PathCerts, proxy.CertsHandler(w.Cfg.Paths().Certs(), ms.IsLeader, w.Log))
 
 	certs := proxy.MeshCerts{RPC: m, Leader: leader}
+	self := func() string { return ms.Self().ID }
 	c := &proxy.Cluster{
-		Self:  func() string { return ms.Self().ID },
-		RTT:   m.RTT,
-		Certs: &proxy.CertSync{Role: role, Source: certs},
+		Self: self,
+		RTT:  m.RTT,
+		// The mesh has no session to this node itself, and the proxy counts a replica on a node that has none as
+		// unreachable.
+		Connected: func(node string) bool { return node == self() || m.Connected(node) },
+		// Only the leader serves api.<domain> itself; every other node forwards it to the leader. A
+		// fenced node answers 503 on every host.
+		Leader: ms.IsLeader,
+		Fenced: func() bool { return ms.Role() == cluster.RoleFenced },
+		Certs:  &proxy.CertSync{Role: role, Source: certs},
 	}
 	w.AddServerCheck(certificatesCheck(certs, w.Cfg.Paths().Certs(), role, func() string { return ms.Self().ID }))
 	// The replica controller (wire_replicas.go) knows the lag; without it the load balancer's lag

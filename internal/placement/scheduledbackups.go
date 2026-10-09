@@ -111,8 +111,8 @@ func (s *ScheduledBackups) Once(ctx context.Context) map[string]error {
 	if s.Leader != nil && !s.Leader() {
 		return errs
 	}
-	if s.Registry == nil || s.Self == nil || s.Routed == nil || s.Routed.Local == nil {
-		err := errors.New("placement: ScheduledBackups needs the registry, the node's id and the routed backups")
+	if s.Registry == nil || s.Self == nil || s.Routed == nil || s.Routed.Local == nil || s.Routed.Self == nil || s.Routed.Ops == nil {
+		err := errors.New("placement: ScheduledBackups needs the registry, the node's id and the routed backups with their node id, ops and local service")
 		s.log().Warn("scheduled backups: not set up", "error", err)
 		errs[""] = err
 		return errs

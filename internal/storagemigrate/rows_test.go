@@ -93,14 +93,17 @@ func TestRowsReadStorageObjects(t *testing.T) {
 	want := []Row{
 		{Bucket: "docs", Name: "nometa.bin", Version: "v4"},
 		{Bucket: "docs", Name: "nosize.bin", Version: "v3"},
+		// A row without a version comes back with an empty one (rowsQuery): the migration counts it and
+		// copies its file by path, and does not know the key Storage gives the object.
+		{Bucket: "docs", Name: "old.bin", Version: "", Size: 9, HasSize: true},
 		{Bucket: "docs", Name: "sp ace/ü-é.txt", Version: "v2", Size: 3, HasSize: true},
 		{Bucket: "docs", Name: "top.txt", Version: "v1", Size: 17, HasSize: true},
 	}
 	if !reflect.DeepEqual(got, want) {
-		t.Errorf("rows (a row without a version has no key and is left out)\n got: %+v\nwant: %+v", got, want)
+		t.Errorf("rows (a row without a version is read with an empty one)\n got: %+v\nwant: %+v", got, want)
 	}
 	// The row's path is the key below <ref>/.
-	if p := rowPath(want[2]); p != "docs/sp ace/ü-é.txt/v2" {
+	if p := rowPath(want[3]); p != "docs/sp ace/ü-é.txt/v2" {
 		t.Errorf("rowPath = %q", p)
 	}
 }

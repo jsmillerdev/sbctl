@@ -102,6 +102,10 @@ func (l *Live) Why() string {
 	return l.reason
 }
 
+// Wired reports whether the membership was given the fencer and the leader marker (LiveOptions.Fence and
+// Marker); the daemon's wiring test asks, because a node without them fences late or not at all.
+func (l *Live) Wired() (fence, marker bool) { return l.o.Fence != nil, l.o.Marker != nil }
+
 // Fenced returns the record of being fenced, or nil.
 func (l *Live) Fenced() *FencedRecord {
 	l.mu.Lock()

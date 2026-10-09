@@ -19,6 +19,34 @@ import (
 // rendered from the replica's spec on the replica port. The join builds it before the daemon runs,
 // when this node has no registry to read a project row or a credential from.
 
+// OpenStandbyPlane returns the plane that builds a joining server's standby of the system cluster, over the
+// supervisor and the artifact store of o. The server has no registry yet, so the plane is given a private
+// in-memory one that SeedSystemStandby never reads. closeUnits lets go of the supervisor.
+func OpenStandbyPlane(cfg *config.Config, o OpenOptions) (pl *PostgresPlane, closeUnits func(), err error) {
+	arts, err := o.artifactStore(cfg)
+	if err != nil {
+		return nil, nil, err
+	}
+	sup, err := o.supervisor(cfg)
+	if err != nil {
+		return nil, nil, err
+	}
+	closeUnits = func() {
+		if c, ok := sup.(interface{ Close() }); ok {
+			c.Close()
+		}
+	}
+	return NewPostgresPlane(cfg, sup, arts, registry.NewMemory(), o.planeOptions()), closeUnits, nil
+}
+
+// StartSystemDatabase starts the system cluster from the files it was rendered with and waits until it
+// answers. It reads neither the registry nor a credential: the registry is this cluster, and its
+// credentials are in it. A move that stopped the system cluster starts it again this way (the old leader of
+// `supavise failover --abort` and of a resume), when nothing can be read yet.
+func (pl *PostgresPlane) StartSystemDatabase(ctx context.Context) error {
+	return pl.startRendered(ctx, systemProject(pl.cfg, nil))
+}
+
 // SystemStandbyPlan describes the standby of the system cluster to build (peerapi.SystemBootstrap).
 type SystemStandbyPlan struct {
 	// Identifier is the replica row of the system cluster on this node ("system-rr-<region>-<id6>").
@@ -94,14 +122,22 @@ func (pl *PostgresPlane) systemTarget(plan SystemStandbyPlan) (ReplicaTarget, er
 	return ReplicaTarget{Identifier: plan.Identifier, Project: systemProject(pl.cfg, versions), Keys: keys}, nil
 }
 
-// SystemStandbyPreflight checks what SeedSystemStandby needs before a join spends its token or moves
-// data aside: a backup backend a second server can read, room on the disk, and a Postgres release to
-// run. It does not look at the data directory (the seeding refuses what it must), and it does not read
-// the backup store, which the join's own preflight and the seed do.
+// SystemStandbyPreflight checks what SeedSystemStandby needs before a rejoin moves data aside: a backup
+// backend a second server can read, room on the disk, and a Postgres release to run. It does not look at
+// the data directory (the seeding refuses what it must), and it does not read the backup store, which the
+// seed does.
 func (pl *PostgresPlane) SystemStandbyPreflight(ctx context.Context) error {
 	if pl.cfg.FileBackup() {
 		return fmt.Errorf("lifecycle: [backup] names %s, a file:// backend a second server cannot read; point it at S3-compatible storage on the leader first", pl.cfg.Backup.Backend)
 	}
+	return pl.SystemStandbyJoinPreflight(ctx)
+}
+
+// SystemStandbyJoinPreflight is SystemStandbyPreflight for a server that has not joined yet: the backend
+// is not looked at. The cluster's settings, [backup] among them, come from the leader with the join and
+// replace the ones this server holds, and the leader hands out no token while its own backend is a
+// file:// one (`supavise node token`).
+func (pl *PostgresPlane) SystemStandbyJoinPreflight(ctx context.Context) error {
 	if _, err := pl.artifactDir(systemProject(pl.cfg, nil), config.SvcPostgres); err != nil {
 		return fmt.Errorf("lifecycle: the Postgres release this server runs is not installed: %w", err)
 	}

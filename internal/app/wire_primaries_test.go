@@ -28,11 +28,24 @@ type fakePlane struct {
 	info    lifecycle.ControlInfo
 	infoErr error
 	health  []lifecycle.ServiceHealth
+	// systemErr fails StartSystemDatabase; onSystemStart runs when it succeeds (the registry comes back).
+	systemErr     error
+	onSystemStart func()
 }
 
 func (f *fakePlane) rec(c string) { f.mu.Lock(); f.calls = append(f.calls, c); f.mu.Unlock() }
 func (f *fakePlane) Start(_ context.Context, p *registry.Project, k *secrets.ProjectKeys) error {
 	f.rec("start " + p.Ref + " " + k.AdminPassword)
+	return nil
+}
+func (f *fakePlane) StartSystemDatabase(context.Context) error {
+	f.rec("start-system-database")
+	if f.systemErr != nil {
+		return f.systemErr
+	}
+	if f.onSystemStart != nil {
+		f.onSystemStart()
+	}
 	return nil
 }
 func (f *fakePlane) Stop(_ context.Context, ref string) error { f.rec("stop " + ref); return f.stopErr }
@@ -161,5 +174,93 @@ func TestLocalPrimariesSetAsideRefusesARunningCluster(t *testing.T) {
 	// A project with no data directory is not an error.
 	if err := l.SetAside(context.Background(), "bcdefghijklmnopqrstu", 5); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// downRegistry is the registry of a node whose system cluster is stopped: it refuses every read until up
+// is set, and counts the reads it refused.
+type downRegistry struct {
+	registry.Registry
+	mu    sync.Mutex
+	up    bool
+	tried int
+}
+
+func (d *downRegistry) GetProject(ctx context.Context, ref string) (*registry.Project, error) {
+	d.mu.Lock()
+	up := d.up
+	if !up {
+		d.tried++
+	}
+	d.mu.Unlock()
+	if !up {
+		return nil, errors.New("registry: connection refused")
+	}
+	return d.Registry.GetProject(ctx, ref)
+}
+
+func (d *downRegistry) come() { d.mu.Lock(); d.up = true; d.mu.Unlock() }
+
+// The registry is the system cluster, which a planned move stops. Starting the old leader again (a resume,
+// `supavise failover --abort`) cannot read the system project's row or credentials first: the database
+// starts from its rendered files, and the rest follows when the registry answers.
+func TestLocalPrimariesStartsTheSystemClusterBeforeItReadsTheRegistry(t *testing.T) {
+	l, pl, tm, reg := primariesFixture(t)
+	if err := reg.CreateProject(context.Background(), &registry.Project{Ref: config.SystemRef, Name: "system", Status: registry.StatusActiveHealthy}); err != nil {
+		t.Fatal(err)
+	}
+	down := &downRegistry{Registry: reg}
+	l.reg = func() registry.Registry { return down }
+	l.keys = func(ctx context.Context, ref string) (*secrets.ProjectKeys, error) {
+		if _, err := down.GetProject(ctx, ref); err != nil {
+			return nil, err
+		}
+		return &secrets.ProjectKeys{AdminPassword: "pw"}, nil
+	}
+	l.registryWait, l.registryTries = time.Millisecond, 5
+	pl.onSystemStart = down.come
+	if err := l.Start(context.Background(), config.SystemRef); err != nil {
+		t.Fatal(err)
+	}
+	if down.tried != 0 {
+		t.Fatalf("the registry was read %d times while the system cluster was down", down.tried)
+	}
+	if got, want := strings.Join(pl.calls, ","), "start-system-database,start system pw"; got != want {
+		t.Fatalf("plane calls = %s, want %s", got, want)
+	}
+	if strings.Join(tm.calls, ",") != "start system" {
+		t.Fatalf("timers %v", tm.calls)
+	}
+
+	// The registry that takes a few tries to answer is waited for; one that never does is named.
+	pl.calls = nil
+	down = &downRegistry{Registry: reg}
+	l.reg = func() registry.Registry { return down }
+	pl.onSystemStart = nil
+	err := l.Start(context.Background(), config.SystemRef)
+	if err == nil || !strings.Contains(err.Error(), "registry in it does not answer") || down.tried != 5 {
+		t.Fatalf("a registry that stays down: %v after %d tries", err, down.tried)
+	}
+
+	// A cluster that does not start is the error, and the registry is not asked.
+	down = &downRegistry{Registry: reg}
+	l.reg = func() registry.Registry { return down }
+	pl.systemErr = errors.New("unit did not start")
+	if err := l.Start(context.Background(), config.SystemRef); !errors.Is(err, pl.systemErr) || down.tried != 0 {
+		t.Fatalf("a system cluster that does not start: %v, registry tried %d times", err, down.tried)
+	}
+}
+
+// A project other than the system project is read at once: no retry hides a project the registry does not know.
+func TestLocalPrimariesStartDoesNotRetryAProject(t *testing.T) {
+	l, pl, _, reg := primariesFixture(t)
+	down := &downRegistry{Registry: reg}
+	l.reg = func() registry.Registry { return down }
+	l.registryWait, l.registryTries = time.Millisecond, 5
+	if err := l.Start(context.Background(), primaryRef); err == nil || down.tried != 1 {
+		t.Fatalf("err = %v after %d tries", err, down.tried)
+	}
+	if strings.Contains(strings.Join(pl.calls, ","), "start-system-database") {
+		t.Fatalf("a project started the system cluster: %v", pl.calls)
 	}
 }

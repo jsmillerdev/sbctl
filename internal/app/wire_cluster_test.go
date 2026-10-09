@@ -7,18 +7,23 @@ import (
 	"maps"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/supavise/supavise/internal/backup"
 	"github.com/supavise/supavise/internal/cluster"
 	"github.com/supavise/supavise/internal/config"
 	"github.com/supavise/supavise/internal/failover"
+	ffenced "github.com/supavise/supavise/internal/failover/fenced"
 	"github.com/supavise/supavise/internal/hostsetup"
 	"github.com/supavise/supavise/internal/lifecycle"
 	"github.com/supavise/supavise/internal/mesh"
 	"github.com/supavise/supavise/internal/mesh/peerapi"
+	"github.com/supavise/supavise/internal/placement"
 	"github.com/supavise/supavise/internal/registry"
 	"github.com/supavise/supavise/internal/replicas"
 )
@@ -106,7 +111,7 @@ func withBackups(t *testing.T, w *Wire) {
 func TestEveryClusterPortIsProvidedOrOff(t *testing.T) {
 	w := clusterNodeWire(t)
 	runClusterWire(t, w)
-	wantOff(t, w, "cluster.BaseBackup", "failover.Marker", "replica controller")
+	wantOff(t, w, "cluster.BaseBackup", "failover.Marker", "placement.RoutedBackups", "replica controller")
 	// What the Management API needs to answer for a cluster. The controller does not run, so the API has it
 	// behind replicasOff: replicas are listed and removed (a project delete asks the Remover), and a setup
 	// is refused, because a controller that does not run would take a request and leave its row for nobody.
@@ -286,5 +291,90 @@ func TestOffIsLoggedWithItsReason(t *testing.T) {
 	}
 	if r, ok := w.offReason("failover.LocalServices"); !ok || r == "" {
 		t.Fatal("the reason was not recorded")
+	}
+}
+
+// A cluster node's membership has the orchestrator's verdict and the backup store's leader marker, which
+// a running leader needs to learn that it was replaced. The verdict is the orchestrator's, built after
+// the membership: a higher epoch makes it write the node's record and stop every cluster of the
+// supervisor, the ones no project row names too (FenceNode), and say so.
+func TestAClusterNodeFencesWhenARunningLeaderLearnsOfAHigherEpoch(t *testing.T) {
+	w := clusterNodeWire(t)
+	withBackups(t, w)
+	runClusterWire(t, w)
+	live, ok := Get[*cluster.Live](w)
+	if !ok {
+		t.Fatal("no membership")
+	}
+	if fence, marker := live.Wired(); !fence || !marker {
+		t.Fatalf("the membership was given a fencer: %v, the leader marker: %v", fence, marker)
+	}
+	lf, ok := Get[*lateFencer](w)
+	if !ok || lf.f == nil {
+		t.Fatal("the failover hook did not give the membership its orchestrator")
+	}
+
+	// A cluster directory that no registry row names: only a fence of the whole node reaches it.
+	stray := filepath.Join(w.Cfg.Paths().Project("stray"), "postgres.run")
+	if err := os.MkdirAll(filepath.Dir(stray), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(stray, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	fenced, err := lf.fence(context.Background(), "node n2", 5, "n2")
+	if err != nil || !fenced {
+		t.Fatalf("fence = %v, %v", fenced, err)
+	}
+	if _, err := os.Stat(stray); !os.IsNotExist(err) {
+		t.Fatalf("the launcher of a cluster no project names is still there (%v): the fence stopped the primaries one by one", err)
+	}
+	rec, err := ffenced.Node(w.Cfg.Paths())
+	if err != nil || rec == nil || rec.Epoch != 5 || rec.Leader != "n2" {
+		t.Fatalf("the node's fence record = %+v, %v", rec, err)
+	}
+}
+
+// With the backup service the leader backs up the projects homed on other nodes: the base backup of a
+// replica's seed goes to the project's home (TakeBase), the home's backup is recorded here (Ops.Recorder),
+// and the nightly round runs. Without the wiring EnsureBase asks this node's own data directory, which
+// a project homed elsewhere does not have.
+func TestAClusterLeaderRoutesTheBaseBackupsOfProjectsHomedOnOtherNodes(t *testing.T) {
+	w := clusterNodeWire(t)
+	withBackups(t, w)
+	ctx := context.Background()
+	nodes, err := w.Node.Registry.ListNodes(ctx)
+	if err != nil || len(nodes) != 2 {
+		t.Fatalf("nodes = %v, %v", nodes, err)
+	}
+	other := nodes[1].ID
+	if nodes[0].ID != "n1" {
+		other = nodes[0].ID
+	}
+	const ref = "abcdefghijklmnopqrst"
+	if err := w.Node.Registry.CreateProject(ctx, &registry.Project{Ref: ref, Name: "demo", Region: "local"}); err != nil {
+		t.Fatal(err)
+	}
+	cl, err := w.Node.Registry.GetCluster(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Node.Registry.SetProjectNode(ctx, ref, other, cl.Epoch); err != nil {
+		t.Fatal(err)
+	}
+	runClusterWire(t, w)
+	if !hasRunner(w, "scheduled backups") {
+		t.Fatal("the leader takes no nightly backup of the projects homed elsewhere")
+	}
+	ops, _ := Get[placement.BackupOps](w)
+	if o, ok := ops.(*placement.Ops); !ok || o.Recorder == nil {
+		t.Fatalf("the ops record nothing a node took for them: %T", ops)
+	}
+	bs, _ := Get[*backup.Service](w)
+	cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	_, err = bs.EnsureBase(cctx, ref, 0)
+	if err == nil || !strings.Contains(err.Error(), "on node "+other) {
+		t.Fatalf("EnsureBase of a project homed on %s = %v; it must ask that node for the backup", other, err)
 	}
 }

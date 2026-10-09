@@ -82,8 +82,10 @@ type Options struct {
 // Service implements Backup over a Store and the registry.
 type Service struct {
 	opt Options
-	// ensure serializes EnsureBase per ref; copies of the service (WithManager) share it.
-	ensure *refLocks
+	// ensure serializes EnsureBase per ref; copies of the service (WithManager) share it. record does
+	// the same for RecordBase: a lock of its own, because EnsureBase holds ensure while TakeBase
+	// reports the backup it took.
+	ensure, record *refLocks
 	// probe and alter are the database calls of the post-restore wait; tests replace them.
 	probe func(ctx context.Context, ref string) (inRecovery bool, err error)
 	alter func(ctx context.Context, ref string, gucs []string) error
@@ -121,7 +123,7 @@ func New(o Options) (*Service, error) {
 	if o.ArchiveFlushTimeout <= 0 {
 		o.ArchiveFlushTimeout = time.Minute
 	}
-	s := &Service{opt: o, ensure: &refLocks{}}
+	s := &Service{opt: o, ensure: &refLocks{}, record: &refLocks{}}
 	s.probe, s.alter = s.pgInRecovery, s.pgResetSettings
 	return s, nil
 }
@@ -130,6 +132,14 @@ func New(o Options) (*Service, error) {
 // needs this service as its base backuper, so one of the two is built first and the
 // other handed in afterwards; call it before the first Restore.
 func (s *Service) SetManager(m lifecycle.Manager) { s.opt.Manager = m }
+
+// SetTakeBase sets Options.TakeBase on a service that was built without it: the daemon of a cluster
+// routes the base backups of replicas to the node that homes the project once it has wired the cluster
+// features (placement.RoutedBackups), after the service was built for the Engine. Call it before the
+// first EnsureBase.
+func (s *Service) SetTakeBase(f func(ctx context.Context, ref string) (*registry.Backup, error)) {
+	s.opt.TakeBase = f
+}
 
 // Store returns the backend the service writes to.
 func (s *Service) Store() Store { return s.opt.Store }

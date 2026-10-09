@@ -31,11 +31,21 @@ const envRegistryDSN = "SUPAVISE_REGISTRY_DSN"
 // openRegistry connects to the registry for commands that do not need the lifecycle engine.
 func openRegistry(ctx context.Context, cfg *config.Config) (registry.Registry, error) {
 	warnEnvFileMode(os.Stderr, backup.EnvFile)
+	var reg registry.Registry
+	var err error
 	dsn := os.Getenv(envRegistryDSN)
+	standby := false
 	if dsn == "" {
-		dsn = lifecycle.RegistryDSN(cfg)
+		if dsn, standby = localRegistry(ctx, cfg); dsn == "" {
+			dsn = lifecycle.RegistryDSN(cfg)
+		}
 	}
-	reg, err := registry.Open(ctx, dsn)
+	// A server that follows a leader reads a copy of the registry it cannot write, nor migrate.
+	if standby {
+		reg, err = registry.OpenReadOnly(ctx, dsn)
+	} else {
+		reg, err = registry.Open(ctx, dsn)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("cannot reach the registry (is supavise-postgres@system running? run `supavise system init`; set %s to use another one): %w", envRegistryDSN, err)
 	}
@@ -109,6 +119,9 @@ func init() {
 			"uploaded, and the snapshot it writes lists every object, so a restore matches the source.\n" +
 			"The nightly timer runs this command. A node whose Storage uses its S3 backend keeps its\n" +
 			"objects in your own bucket, which is not copied.\n\n" +
+			"In a cluster a base backup reads the data directory of the project's home, so this command\n" +
+			"takes the database of a project homed on this server only; for one homed on another server\n" +
+			"the leader's daemon takes it in its nightly round, and --files-only works on the leader.\n\n" +
 			"  --skip-files   the database only\n" +
 			"  --files-only   Storage objects and Edge Functions only",
 		Args: cobra.ExactArgs(1),
@@ -118,6 +131,11 @@ func init() {
 			}
 			if createSkipFiles && createFilesOnly {
 				return errors.New("--skip-files and --files-only exclude each other")
+			}
+			if !createFilesOnly {
+				if err := requireHomeForBase(cmd.Context(), args[0]); err != nil {
+					return err
+				}
 			}
 			svc, closeFn, err := openBackupService(cmd.Context(), false, []string{args[0]})
 			if err != nil {
@@ -273,7 +291,10 @@ func init() {
 			"  --to backup          the exact state of a base backup (--backup-id, default newest).\n\n" +
 			"With --as <newref> the result is a new project (the source is untouched; <newref> must\n" +
 			"have no archive of its own). Without --as the project itself is replaced, which needs\n" +
-			"--force; its old data directory is kept next to it as <dir>.pre-restore-<time>.\n\n" +
+			"--force; its old data directory is kept next to it as <dir>.pre-restore-<time>. The project's\n" +
+			"read replicas cannot follow the restored cluster: once the restore has checked its target and\n" +
+			"backup it removes them, and while one is still being removed (the leader's daemon finishes\n" +
+			"it) the command stops and runs again later.\n\n" +
 			"The project's Storage objects and Edge Functions come back too, from the newest nightly\n" +
 			"backup at or before the target: objects return to that copy, not to the exact second (unlike\n" +
 			"the database they have no log to replay), and a Storage object newer than the copy is\n" +
@@ -297,6 +318,11 @@ func init() {
 			}
 			if (restoreAs == "" || restoreAs == args[0]) && !restoreForce {
 				return backup.ErrForceRequired
+			}
+			// A standby cannot follow a restored primary: the project's replicas go, once the restore
+			// has checked what it needs and before it stops the project.
+			if restoresInPlace(args[0], restoreAs) {
+				opts.BeforeReplace = beforeInPlaceRestore
 			}
 			svc, closeFn, err := openBackupService(cmd.Context(), true, restoreRelayRefs(args[0], restoreAs))
 			if err != nil {
@@ -425,6 +451,45 @@ func restoreRelayRefs(source, as string) []string {
 	return []string{source, as}
 }
 
+// requireHomeForBase opens the registry for baseBackupHome.
+func requireHomeForBase(ctx context.Context, ref string) error {
+	cfg, err := loadConfig()
+	if err != nil {
+		return err
+	}
+	reg, err := openRegistry(ctx, cfg)
+	if err != nil {
+		return err
+	}
+	defer reg.Close()
+	return baseBackupHome(ctx, reg, cfg, ref)
+}
+
+// baseBackupHome refuses a base backup of a project that is homed on another node. A base backup reads
+// the data directory of the project's home, which this server does not have, and this command has no
+// session with that node; the daemon of the cluster's leader takes those backups (placement.RoutedBackups)
+// in its nightly round. Without it the command would fail on a missing data directory, or, worse, take
+// the Storage objects and then fail.
+func baseBackupHome(ctx context.Context, reg registry.Registry, cfg *config.Config, ref string) error {
+	p, err := reg.GetProject(ctx, ref)
+	if err != nil || p.NodeID == "" {
+		return nil // a project that is not there is the backup service's to report
+	}
+	self, err := lifecycle.SelfNode(ctx, reg, cfg, false)
+	if err != nil {
+		return err
+	}
+	if p.NodeID == self {
+		return nil
+	}
+	home := p.NodeID
+	if n, err := reg.GetNode(ctx, p.NodeID); err == nil && n.Name != "" {
+		home = n.Name
+	}
+	return fmt.Errorf("project %s is homed on node %s, and a base backup reads the data directory of its home: this command cannot take it from here. "+
+		"The leader's daemon backs the project up in its nightly round; on the leader, --files-only backs up its Storage objects and Edge Functions", ref, home)
+}
+
 // openBackupService wires a Service from config, the registry and the master key.
 // withManager also builds the lifecycle engine for restore: it opens the whole node
 // (supervisor, artifacts, registry) as the daemon does.
@@ -451,7 +516,7 @@ func openBackupService(ctx context.Context, withManager bool, relayRefs []string
 	}
 	if withManager {
 		// A restore creates a project, so the Engine registers it with the shared services.
-		node, err := lifecycle.Open(ctx, cfg, app.LifecycleOptions(cfg, opts))
+		node, err := openLifecycle(ctx, cfg, app.LifecycleOptions(cfg, opts))
 		if err != nil {
 			stopRelay()
 			return nil, nil, err

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"strings"
 
 	"github.com/spf13/cobra"
@@ -15,6 +16,30 @@ import (
 	"github.com/supavise/supavise/internal/lifecycle"
 	"github.com/supavise/supavise/internal/registry"
 )
+
+// orgProjectDeleter is the step of `orgs delete` that deletes one project. A branch goes through the
+// branching service (deleteBranch); any other project loses its read replicas first and then takes its
+// final backup (deleteProject), as the API's organization delete does: the Engine never touches replicas,
+// and deleting the project row takes the replica rows with it, which would leave their instances running
+// on the other nodes with nothing in the registry to find them by.
+func orgProjectDeleter(n *lifecycle.Node, deleteBranch func(ctx context.Context, ref string) error, out, errw io.Writer) func(context.Context, registry.Project) error {
+	return func(ctx context.Context, p registry.Project) error {
+		if p.Branch != nil {
+			if err := deleteBranch(ctx, p.Ref); err != nil {
+				return err
+			}
+		} else if err := deleteProject(ctx, n, p.Ref, false); err != nil {
+			return err
+		}
+		// The Edge Functions tree lives in the runtime's state directory, not in the
+		// project's: remove it now rather than at the next reconcile of a running daemon.
+		if err := functions.RemoveFiles(n.Cfg, p.Ref); err != nil {
+			fmt.Fprintf(errw, "warning: removing the Edge Functions files of %s: %v\n", p.Ref, err)
+		}
+		fmt.Fprintf(out, "%s deleted\n", p.Ref)
+		return nil
+	}
+}
 
 type orgView struct {
 	Slug     string   `json:"slug"`
@@ -85,8 +110,10 @@ its members, project roles, invitations, invite tokens, MFA setting and default-
 Without --yes the command lists what it would delete and stops.
 
 The last organization of a node is never deleted: the dashboard would give the next person who opens
-it a new "Default" organization to own. A run that stopped on a project (its final backup failed)
-leaves the organization in place with the projects not yet reached; run it again.`,
+it a new "Default" organization to own. A project's read replicas are removed before the project:
+while one is still being removed (the leader's daemon finishes it) the command stops at that
+project. A run that stopped on a project (its final backup failed, or a replica was still going
+away) leaves the organization in place with the projects not yet reached; run it again.`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, a []string) error {
 			ctx := cmd.Context()
@@ -140,29 +167,17 @@ leaves the organization in place with the projects not yet reached; run it again
 				fmt.Fprintf(out, ", and %d single sign-on provider(s).\n", nProviders)
 				return fmt.Errorf("nothing deleted; run it again with --yes to delete")
 			}
-			d.DeleteProject = func(ctx context.Context, p registry.Project) error {
-				if p.Branch != nil {
-					if bsvc == nil {
-						b, err := newBranching(ctx, n.Cfg, n)
-						if err != nil {
-							return err
-						}
-						bsvc = b
-					}
-					if _, err := bsvc.Delete(ctx, p.Ref, branching.DeleteOptions{}); err != nil {
+			d.DeleteProject = orgProjectDeleter(n, func(ctx context.Context, ref string) error {
+				if bsvc == nil {
+					b, err := newBranching(ctx, n.Cfg, n)
+					if err != nil {
 						return err
 					}
-				} else if err := n.Engine.DeleteWith(ctx, p.Ref, lifecycle.DeleteOptions{}); err != nil {
-					return err
+					bsvc = b
 				}
-				// The Edge Functions tree lives in the runtime's state directory, not in the
-				// project's: remove it now rather than at the next reconcile of a running daemon.
-				if err := functions.RemoveFiles(n.Cfg, p.Ref); err != nil {
-					fmt.Fprintf(cmd.ErrOrStderr(), "warning: removing the Edge Functions files of %s: %v\n", p.Ref, err)
-				}
-				fmt.Fprintf(out, "%s deleted\n", p.Ref)
-				return nil
-			}
+				_, err := bsvc.Delete(ctx, ref, branching.DeleteOptions{})
+				return err
+			}, out, cmd.ErrOrStderr())
 			// The final base backups wait for their WAL to be archived through the daemon's
 			// relay; serve the sockets nobody answers while the daemon is down.
 			if len(refs) > 0 {

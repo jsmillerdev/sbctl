@@ -44,6 +44,10 @@ F_STATE=/var/lib/supavise-follower   # the follower node's state directory
 FF_ROOT=/var/lib/supavise-ff         # standbys, the follower's configuration, scratch files
 STS_LOG=$LOG_DIR/sts.log
 
+# stamp prints the time to the microsecond, for `journalctl --since`. Whole seconds would take in what the
+# journal logged earlier in the same second, such as a standby's normal "ready to accept read-only connections".
+stamp() { date '+%Y-%m-%d %H:%M:%S.%6N'; }
+
 cleanup() {
   local rc=$?
   set +e
@@ -304,8 +308,7 @@ chown "$SUPAVISE_USER:$SUPAVISE_USER" "$FF_ROOT/follower.toml"
 chmod 0640 "$FF_ROOT/follower.toml"
 
 log "the follower node's shared services on its standby (Go test, as the supavise user)"
-T0=$(date '+%Y-%m-%d %H:%M:%S')
-sleep 1
+T0=$(stamp)
 export FLEET_FOLLOWER_CONFIG=$FF_ROOT/follower.toml FLEET_LEADER_CONFIG=$SUPAVISE_CONF FLEET_REF=$REF FLEET_DB_PASSWORD=$DBPW FLEET_REPLICA_PORT=$REPLICA_PORT
 (cd / && sudo -u "$SUPAVISE_USER" -H --preserve-env=FLEET_FOLLOWER_CONFIG,FLEET_LEADER_CONFIG,FLEET_REF,FLEET_DB_PASSWORD,FLEET_REPLICA_PORT \
   "$FOLLOWER_TEST" -test.v -test.run '^TestLinuxFollower$' -test.timeout 20m) 2>&1 | tee "$LOG_DIR/follower-test.log" || fail "the follower test failed"
@@ -316,8 +319,7 @@ errs=$(journalctl --no-pager -o cat -u ff-pg-ff-system --since "$T0" | grep -E '
 rerrs=$(journalctl --no-pager -o cat -u ff-pg-ff-replica --since "$T0" | grep -E 'ERROR|FATAL|PANIC|read-only|cannot execute' || true)
 [[ -z $rerrs ]] || { echo "$rerrs" | head -20 >&2; fail "the project's replica logged errors"; }
 # The detector sees what it looks for: a write to the standby is refused and logged.
-T1=$(date '+%Y-%m-%d %H:%M:%S')
-sleep 1
+T1=$(stamp)
 psql_at "$F_STATE/projects/system/postgres/sock" "$F_SYS" "$SUP_DB" 'create table _supavisor.ff_control (x int)' >/dev/null 2>&1 || true
 has "$(journalctl --no-pager -o cat -u ff-pg-ff-system --since "$T1")" 'read-only|cannot execute' || fail "a deliberate write on the standby left no line the detector matches"
 
