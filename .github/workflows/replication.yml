@@ -24,9 +24,10 @@ on:
 permissions:
   contents: read
 
-# A newer push to a branch ends the run that is still going on it: a run is up to 150 minutes on two runners.
+# A newer push to a branch ends the run that is still going on it: a run is up to 150 minutes on two runners. A run
+# started by hand is its own group, so that a push does not end the run of both architectures that someone asked for.
 concurrency:
-  group: replication-${{ github.ref }}
+  group: replication-${{ github.ref }}-${{ github.event_name }}
   cancel-in-progress: true
 
 # bash with -eo pipefail, so a failing command piped into tee fails the step.
