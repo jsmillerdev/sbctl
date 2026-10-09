@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"path/filepath"
-	"strings"
 
 	"github.com/jackc/pgx/v5"
 
@@ -98,12 +97,7 @@ end $$`)
 // needs no password and cannot be reached from outside the node.
 func (s *Service) adminSocketDSN(ref string, seq int) string {
 	sock := filepath.Join(s.cfg.Paths().ProjectService(ref, config.SvcPostgres), "sock")
-	return fmt.Sprintf("host=%s port=%d user=%s dbname=postgres sslmode=disable connect_timeout=5 application_name=supavise-branching",
-		kvQuote(sock), s.cfg.PortsFor(ref, seq).Postgres, lifecycle.RoleAdmin)
-}
-
-func kvQuote(v string) string {
-	return "'" + strings.NewReplacer(`\`, `\\`, `'`, `\'`).Replace(v) + "'"
+	return lifecycle.AdminSocketDSN(sock, s.cfg.PortsFor(ref, seq).Postgres, "postgres", "supavise-branching")
 }
 
 // setRolePasswords sets login passwords as SCRAM-SHA-256 verifiers, never plaintext, with

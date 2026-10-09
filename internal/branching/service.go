@@ -17,12 +17,12 @@ import (
 	"sort"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/supavise/supavise/internal/backup"
 	"github.com/supavise/supavise/internal/config"
 	"github.com/supavise/supavise/internal/lifecycle"
+	"github.com/supavise/supavise/internal/procutil"
 	"github.com/supavise/supavise/internal/registry"
 	"github.com/supavise/supavise/internal/secrets"
 )
@@ -156,7 +156,7 @@ func New(d Deps) (*Service, error) {
 	s.detect = func(srcData, dstParent string) (string, string, string) {
 		return detectClone(srcData, dstParent)
 	}
-	s.instance, s.pid = newUUID(), os.Getpid()
+	s.instance, s.pid = secrets.NewUUID(), os.Getpid()
 	s.host, _ = os.Hostname()
 	s.rotate = s.rotateCredentials
 	s.isolate = s.isolateBranch
@@ -333,7 +333,7 @@ func (s *Service) begin(ref, op string) (*run, error) {
 	if r, ok := s.runs[ref]; ok {
 		return nil, conflict("branch %s is busy with %s", ref, r.op)
 	}
-	r := &run{id: newUUID(), op: op, done: make(chan struct{})}
+	r := &run{id: secrets.NewUUID(), op: op, done: make(chan struct{})}
 	s.runs[ref] = r
 	return r, nil
 }
@@ -417,19 +417,9 @@ func (s *Service) ownerGone(ctx context.Context, ref string) bool {
 		if o.PID == s.pid {
 			return o.Instance != s.instance // an earlier service of this process cannot still be working
 		}
-		return !pidAlive(o.PID)
+		return !procutil.Alive(o.PID)
 	}
 	return false
-}
-
-// pidAlive reports whether a process with the pid exists (signal 0 tests without sending).
-func pidAlive(pid int) bool {
-	p, err := os.FindProcess(pid)
-	if err != nil {
-		return false
-	}
-	err = p.Signal(syscall.Signal(0))
-	return err == nil || errors.Is(err, syscall.EPERM)
 }
 
 // WaitIdle blocks until no operation runs on ref (here, or by registry state elsewhere).

@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 
 	"github.com/supavise/supavise/internal/config"
+	"github.com/supavise/supavise/internal/lifecycle"
 )
 
 // ErrInsufficientDisk is returned by Create and Reset when the state disk cannot hold a
@@ -70,5 +71,5 @@ func (s *Service) checkDisk(parentRef string, credit int64) error {
 	return fmt.Errorf("%w: the disk of the state directory has %s free and cloning project %s needs about %s "+
 		"(its data is %s, times 1.2, plus a reserve of %s, [branching] disk_reserve_mb). "+
 		"Free some disk space, delete branches you do not need, or lower the reserve, then try again",
-		ErrInsufficientDisk, humanBytes(free+credit), parentRef, humanBytes(need), humanBytes(size), humanBytes(s.cfg.Branching.DiskReserve()))
+		ErrInsufficientDisk, lifecycle.HumanBytes(free+credit), parentRef, lifecycle.HumanBytes(need), lifecycle.HumanBytes(size), lifecycle.HumanBytes(s.cfg.Branching.DiskReserve()))
 }

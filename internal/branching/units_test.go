@@ -17,6 +17,7 @@ import (
 	"github.com/supavise/supavise/internal/backup"
 	"github.com/supavise/supavise/internal/config"
 	"github.com/supavise/supavise/internal/registry"
+	"github.com/supavise/supavise/internal/secrets"
 )
 
 func TestCompare(t *testing.T) {
@@ -97,7 +98,7 @@ func TestNamesAndIDs(t *testing.T) {
 			t.Errorf("%q: %v", ok, err)
 		}
 	}
-	id := newUUID()
+	id := secrets.NewUUID()
 	if !IsUUID(id) || id[14] != '4' || !strings.ContainsRune("89ab", rune(id[19])) {
 		t.Errorf("uuid = %s", id)
 	}

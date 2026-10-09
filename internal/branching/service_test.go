@@ -14,6 +14,7 @@ import (
 	"github.com/supavise/supavise/internal/config"
 	"github.com/supavise/supavise/internal/lifecycle"
 	"github.com/supavise/supavise/internal/registry"
+	"github.com/supavise/supavise/internal/secrets"
 )
 
 func TestCreateSchemaOnlyReplaysMigrationsAndSeed(t *testing.T) {
@@ -902,7 +903,7 @@ func TestStampManagerRecreatesAndQuarantinesTheRestoredCluster(t *testing.T) {
 		return os.WriteFile(filepath.Join(dir, "postgresql.auto.conf"), []byte("restore_command = 'x'\n"), 0o600)
 	}
 	dir := t.TempDir()
-	m := stampManager{Manager: h.eng, info: &registry.BranchInfo{ID: newUUID(), ParentRef: parentRef, Name: "r"}, class: "micro", recreate: true}
+	m := stampManager{Manager: h.eng, info: &registry.BranchInfo{ID: secrets.NewUUID(), ParentRef: parentRef, Name: "r"}, class: "micro", recreate: true}
 	if _, err := h.eng.reg.GetProject(context.Background(), parentRef); err != nil {
 		t.Fatal(err)
 	}
