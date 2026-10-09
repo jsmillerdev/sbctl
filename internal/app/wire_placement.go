@@ -199,10 +199,11 @@ func unlessLeader(m cluster.Membership, f func(context.Context) []peerapi.Projec
 	}
 }
 
-// projectProbeTimeout bounds the health probe of one project. The report is refreshed every ten
-// seconds, and a probe that hangs must not hold up the report of the other projects. (A variable so
-// that a test can shorten it.)
-var projectProbeTimeout = 10 * time.Second
+// projectProbeTimeout bounds the health probe of one project, which has no bound of its own as a whole:
+// it asks the unit manager and then probes the database and the APIs, each for up to four seconds, so
+// a healthy project can take more than ten. The limit is there for a probe that hangs, which would
+// otherwise stop the report from ever refreshing. (A variable so that a test can shorten it.)
+var projectProbeTimeout = 30 * time.Second
 
 // projectHealth reports the health of the projects homed on this node, for the report to the leader.
 // It probes a few at a time (placement.DefaultConcurrency), each under projectProbeTimeout, and lists
