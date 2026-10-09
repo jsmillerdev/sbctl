@@ -515,7 +515,7 @@ func (s *Server) implemented() map[string]route {
 	s.routesInfraMonitoring(add)
 	s.routesFailover(add)
 	// The OAuth authorization server and the organization's OAuth Apps. Both are registered whether
-	// or not [api] disable_oauth is set; their handlers answer 404 when it is (oauthDisabled).
+	// or not [api] disable_oauth is set; their handlers answer 404 when it is (oauthRoutes).
 	s.routesOAuth(add)
 	s.routesOAuthApps(add)
 	// The device-login poll carries no credentials: the CLI has none yet.

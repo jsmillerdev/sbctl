@@ -40,8 +40,9 @@ const oauthAppsNilUUID = "00000000-0000-0000-0000-000000000000"
 
 // routesOAuthApps registers the eight operations OAuthApps* and OAuthAppClientSecrets* of the
 // platform spec. It is called whether or not [api] disable_oauth is set; the handlers answer 404
-// while it is (oauthDisabled).
+// while it is (oauthRoutes).
 func (s *Server) routesOAuthApps(add func(string, handlerFunc)) {
+	add = s.oauthRoutes(add)
 	const apps = "/platform/organizations/{slug}/oauth/apps"
 	add("GET "+apps, s.listOAuthApps)
 	add("POST "+apps, s.createOAuthApp)
@@ -55,12 +56,10 @@ func (s *Server) routesOAuthApps(add func(string, handlerFunc)) {
 
 // ---- shared pieces ------------------------------------------------------------------------------
 
-// oauthAppsCaller is the start of every handler: OAuth is on, the organization of the path exists,
-// a dashboard user is signed in and that user may manage the organization's OAuth apps.
+// oauthAppsCaller is the start of every handler (OAuth is on by then, see oauthRoutes): the
+// organization of the path exists, a dashboard user is signed in and that user may manage the
+// organization's OAuth apps.
 func (s *Server) oauthAppsCaller(r *http.Request) (*registry.Organization, *Principal, error) {
-	if s.oauthDisabled() {
-		return nil, nil, errf(http.StatusNotFound, "Not Found")
-	}
 	org, err := s.orgBySlug(r.Context(), r.PathValue("slug"))
 	if err != nil {
 		return nil, nil, err
