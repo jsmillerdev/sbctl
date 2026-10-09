@@ -40,6 +40,14 @@ The cluster kinds are raised by the code that owns the event, not by the checker
 | `host_not_converged` | `supavise system converge` has not run for this release | the daemon |
 | `standby_behind` | the registry is newer than this binary, which leaves running instances alone | a standby's daemon |
 
+The OAuth service raises one more kind. It is a warning about the node and has no `Ref`.
+
+| Kind | When | Raised by |
+|---|---|---|
+| `oauth_token_reuse` | a refresh token that was exchanged already, or an authorization code that was redeemed already, is presented again; the service has revoked the grant it belongs to | the OAuth service (`internal/oauth`) through the hook `internal/app` wires; delivery runs on a goroutine, so a slow webhook does not hold up the token endpoint |
+
+Its key is `oauth_token_reuse/<grant id>`, so one grant alerts once within `[alerts] repeat_hours` however often its dead tokens are presented. The text carries ids and names, never a token, code, secret or `state`. Nothing resolves the alert, so it stays in `supavise alerts list` after the service has revoked the grant. `supavise oauth grants list` shows what a user still holds.
+
 Three places raise the `upgrade_*` events, each about its own scope:
 
 | Raised by | About | Process |
