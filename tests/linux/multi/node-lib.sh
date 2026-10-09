@@ -621,6 +621,7 @@ node_dump() {
   echo "-- data directories"; ls -d /var/lib/supavise/projects/*/postgres/data* 2>&1
   echo "-- status"; supavise status 2>&1 | head -n 80
   echo "-- node ls"; supavise node ls 2>&1
+  echo "-- host layer"; supavise system converge --check --json 2>&1 | head -c 4000; echo
   echo "-- registry"
   reg "select id, name, state, region, version, peer_addr from supavise.nodes order by id" 2>&1
   reg "select leader, epoch, maintenance from supavise.cluster" 2>&1
