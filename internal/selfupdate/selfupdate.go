@@ -193,11 +193,11 @@ func Latest(ctx context.Context, o Options) (*Release, error) {
 // Newer reports whether tag is a later version than current. A current version that is
 // not a release ("dev", a commit-describe string) is older than every release.
 func Newer(tag, current string) bool {
-	a, ok := parseVersion(tag)
+	a, ok := ParseVersion(tag)
 	if !ok {
 		return false
 	}
-	b, ok := parseVersion(current)
+	b, ok := ParseVersion(current)
 	if !ok {
 		return true
 	}
@@ -209,9 +209,9 @@ func Newer(tag, current string) bool {
 	return false
 }
 
-// parseVersion reads "v1.2.3"; a suffix ("-rc1", "-4-gabcdef", "-dirty") is dropped, so a
+// ParseVersion reads "v1.2.3"; a suffix ("-rc1", "-4-gabcdef", "-dirty") is dropped, so a
 // build made after a tag counts as that tag.
-func parseVersion(s string) ([3]int, bool) {
+func ParseVersion(s string) ([3]int, bool) {
 	var v [3]int
 	s = strings.TrimPrefix(strings.TrimSpace(s), "v")
 	if i := strings.IndexAny(s, "-+"); i >= 0 {
@@ -408,8 +408,8 @@ func (ver *Verified) Studio(platform string) (name, url, sha string, ok bool) {
 // Compare orders two release tags: negative when a is older than b, positive when it is newer. ok
 // is false when either is not a release version. A suffix ("-rc1", "-4-gabcdef") is dropped.
 func Compare(a, b string) (c int, ok bool) {
-	x, ok1 := parseVersion(a)
-	y, ok2 := parseVersion(b)
+	x, ok1 := ParseVersion(a)
+	y, ok2 := ParseVersion(b)
 	if !ok1 || !ok2 {
 		return 0, false
 	}

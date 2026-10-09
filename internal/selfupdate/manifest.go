@@ -91,8 +91,8 @@ func (m *Manifest) Validate() error {
 	if !versionRe.MatchString(m.MinUpgradeFrom) {
 		return fmt.Errorf("release manifest min_upgrade_from %q is not vMAJOR.MINOR.PATCH[-suffix]", m.MinUpgradeFrom)
 	}
-	v, _ := parseVersion(m.Version)
-	min, _ := parseVersion(m.MinUpgradeFrom)
+	v, _ := ParseVersion(m.Version)
+	min, _ := ParseVersion(m.MinUpgradeFrom)
 	for i := range v {
 		if min[i] != v[i] {
 			if min[i] > v[i] {
@@ -105,7 +105,7 @@ func (m *Manifest) Validate() error {
 		if !versionRe.MatchString(m.MinPeerFrom) {
 			return fmt.Errorf("release manifest min_peer_from %q is not vMAJOR.MINOR.PATCH[-suffix]", m.MinPeerFrom)
 		}
-		if peer, _ := parseVersion(m.MinPeerFrom); newerParts(peer, v) {
+		if peer, _ := ParseVersion(m.MinPeerFrom); newerParts(peer, v) {
 			return fmt.Errorf("release manifest min_peer_from %s is newer than its version %s", m.MinPeerFrom, m.Version)
 		}
 	}
@@ -154,11 +154,11 @@ func (m *Manifest) Marshal() ([]byte, error) {
 // passes: the tag it descends from is what counts, and a suffix is dropped before the comparison,
 // as Newer does.
 func (m *Manifest) CheckUpgradeFrom(current string) error {
-	cur, ok := parseVersion(current)
+	cur, ok := ParseVersion(current)
 	if !ok {
 		return nil
 	}
-	min, _ := parseVersion(m.MinUpgradeFrom)
+	min, _ := ParseVersion(m.MinUpgradeFrom)
 	for i := range cur {
 		if cur[i] != min[i] {
 			if cur[i] > min[i] {

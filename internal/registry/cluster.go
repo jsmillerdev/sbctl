@@ -8,6 +8,8 @@ import (
 	"regexp"
 	"strings"
 	"time"
+
+	"github.com/supavise/supavise/internal/config"
 )
 
 // ErrReadOnly is returned by a write on a registry that cannot write: one opened with
@@ -173,6 +175,13 @@ type Replica struct {
 	InitError string
 	CreatedAt time.Time
 	UpdatedAt time.Time
+}
+
+// IsSystemStandby reports whether r is the system cluster's standby on a follower rather than a
+// replica of a user project. ListReplicas returns both; capacity, routing and the replica screens
+// count only the second.
+func (r Replica) IsSystemStandby() bool {
+	return r.Ref == config.SystemRef || r.Origin == ReplicaSystem
 }
 
 // ReplicaOptout records that the default reconciler must not create a replica of Ref on NodeID.

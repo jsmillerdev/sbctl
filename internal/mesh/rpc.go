@@ -238,6 +238,12 @@ func DecodeBody(w http.ResponseWriter, r *http.Request, v any) bool {
 	return true
 }
 
+// DecodeBodyMax is DecodeBody with the body capped at max bytes; a longer body is answered with 400.
+func DecodeBodyMax(w http.ResponseWriter, r *http.Request, max int64, v any) bool {
+	r.Body = http.MaxBytesReader(w, r.Body, max)
+	return DecodeBody(w, r, v)
+}
+
 // RequireLeader wraps fn so that it runs only for a request from the leader. The endpoints that the
 // peer API marks "leader to node" use it, so that a follower cannot drive another follower.
 func RequireLeader(t Topology, fn HandlerFunc) HandlerFunc {

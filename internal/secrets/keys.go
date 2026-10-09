@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
+
+	"github.com/supavise/supavise/internal/config"
 )
 
 // Names of the per-project secrets stored (sealed) in supavise.project_secrets.
@@ -81,6 +83,19 @@ func ValidRef(s string) bool {
 		}
 	}
 	return true
+}
+
+// ValidProjectRef reports whether s names a project on disk and in the registry: the system
+// cluster or a well-formed user project ref. Code that builds a path from a ref it was handed checks
+// it with this.
+func ValidProjectRef(s string) bool { return s == config.SystemRef || ValidRef(s) }
+
+// NewUUID returns a random (version 4) UUID from crypto/rand in its canonical text form.
+func NewUUID() string {
+	b := RandomBytes(16)
+	b[6] = b[6]&0x0f | 0x40
+	b[8] = b[8]&0x3f | 0x80
+	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:])
 }
 
 // NewJWTSecret returns a 40-character secret usable verbatim as an env value by every service.

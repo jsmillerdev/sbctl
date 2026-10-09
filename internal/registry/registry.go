@@ -47,6 +47,10 @@ const (
 	StatusUnknown         Status = "UNKNOWN"
 )
 
+// Running reports whether a project in this status is up and serving: ACTIVE_HEALTHY or
+// ACTIVE_UNHEALTHY.
+func (s Status) Running() bool { return s == StatusActiveHealthy || s == StatusActiveUnhealthy }
+
 type Organization struct {
 	ID        int64
 	Slug      string
