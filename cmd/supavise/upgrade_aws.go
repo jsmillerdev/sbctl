@@ -245,6 +245,9 @@ func (h *nodeHost) UpdateStack(ctx context.Context, c *nodeupgrade.Candidate, so
 	// for tests. `sudo -E` passes on whatever the caller exported, and the stack is changed with this
 	// script: the variables do not reach it.
 	cmd.Env = withoutEnv(os.Environ(), scriptTestHookVars...)
+	// The script exits 0 (updated, or nothing to change), 2 (refused: nothing was changed) or 3
+	// (failed, also a guarded update that CloudFormation rolled back after the temporary stack policy
+	// denied a replacement). Its review's own statuses (10 refused, 11 blocked, 12 guarded) stay inside it.
 	if err := cmd.Run(); err != nil {
 		var ee *exec.ExitError
 		if errors.As(err, &ee) {

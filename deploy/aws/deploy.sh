@@ -85,15 +85,17 @@ Options:
   -h, --help
 
 update: brings the stack of a node forward to the template of this release. It shows a change
-set, refuses any that would replace or remove a resource, and never changes SupaviseVersion. It
+set, refuses any that would replace or remove a resource, and never changes SupaviseVersion. A
+change that CloudFormation decides only while the change set runs (guarded) runs under a temporary
+stack policy that denies any replacement or removal; the stack's own policy is put back after. It
 uses your credentials, never the instance role of the node it runs on.
   --stack NAME             the stack (default: the one the node's instance tags name)
   --params-from-stack      keep the stack's parameters (this is what update always does)
   --set NAME=VALUE         set a parameter, for example Failover=on or PeerCidr1=203.0.113.4/32;
                            repeat for more (SupaviseVersion cannot be set)
   --allow-risky            allow changes that replace or remove a resource, after you type the
-                           stack name (a change that would move the service address back from
-                           a failover is never allowed)
+                           stack name; no guard is set (a change that would move the service
+                           address back from a failover is never allowed)
 
 status: shows the stack, its infrastructure revision, whether the service address is on its
 instance and the repair rule for replacing an instance.
@@ -138,8 +140,16 @@ CLEANUP=""
 EARLY_SECRET=""
 # What replica made and leaves in place when it stops: said once, as the script ends with a failure.
 LEFTOVER=""
+# The guard of an update (see "the guard" below): on_exit takes it off.
+GUARD=0          # 1 while the guard is (or may be) on the stack
+GUARD_RUNNING=0  # 1 once the guarded change set may be running
+GIVE_UP=0        # 1 when the person interrupts the wait for the end of the update
+GUARD_STACK="" GUARD_FILE="" GUARD_HAD=""
+GUARD_AWS=()
 on_exit() {
   local rc=$?
+  # The guard comes off before the work directory, which holds the policy to put back, goes.
+  if [[ $GUARD -eq 1 ]]; then guard_off_at_exit; fi
   [[ -z $CLEANUP ]] || rm -rf "$CLEANUP"
   if [[ -n $EARLY_SECRET ]]; then
     "${AWS[@]}" secretsmanager delete-secret --secret-id "$EARLY_SECRET" --force-delete-without-recovery >/dev/null 2>&1 || true
@@ -222,18 +232,22 @@ done
 # Standard library only. It reads what `aws ... --output json` printed, so that no jq is needed.
 #   facts  STACK.json                     the stack as KEY<TAB>value lines
 #   params STACK.json TEMPLATE [K=V...]   the --parameters JSON of an update
-#   classify CHANGESET.json [--failed-over]   the review of a change set; exit 0 allowed, 10 refused, 11 blocked
+#   classify CHANGESET.json [--failed-over]   the review of a change set; exit 0 allowed, 10 refused,
+#                                         11 blocked, 12 guarded (allowed only under the guard)
+#   guard  OWN.json TEMPLATE CHANGESET.json RESTORE   prints the guard policy; writes the policy to put back
+#   failures EVENTS.json STACK             what failed in the last update of the stack
 #   same   TEMPLATE STAGED.json           is the template CloudFormation holds the verified file? exit 0 yes, 1 no
 IFS= read -r -d '' PYHELPER <<'PY' || true
 import io, json, re, sys
 
 # Resource types whose replacement does not interrupt the node: a rule and two policies. A change
-# set that replaces any other type is refused.
+# set that replaces any other type is refused, and the guard denies it while a change set runs.
 REPLACE_OK = set([
     "AWS::EC2::SecurityGroupIngress", "AWS::IAM::Policy", "AWS::S3::BucketPolicy",
 ])
 # Resource types whose removal is allowed: turning Failover off or clearing a PeerCidr takes a
-# permission or a firewall rule away, which interrupts nothing. Any other removal is refused.
+# permission or a firewall rule away, which interrupts nothing. Any other removal is refused, and
+# the guard denies it.
 REMOVE_OK = set([
     "AWS::EC2::SecurityGroupIngress", "AWS::IAM::Policy",
 ])
@@ -248,6 +262,14 @@ SAFE = {
     "AWS::EC2::SecurityGroup": set(["SecurityGroupIngress", "Tags"]),
 }
 IMMUTABLE_PARAMS = ("SupaviseVersion",)
+# The change sources of a Ref (ResourceReference) and of an Fn::GetAtt (ResourceAttribute).
+REFERENCES = ("ResourceReference", "ResourceAttribute")
+AMI = re.compile(r"^ami-[0-9a-f]{8,17}$")
+# The statement of a stack policy that allows every update: what a stack without a policy gets back
+# after the guard, because a stack policy cannot be deleted.
+ALLOW_ALL = {"Effect": "Allow", "Action": "Update:*", "Principal": "*", "Resource": "*"}
+# The most SetStackPolicy takes in StackPolicyBody.
+POLICY_MAX = 16384
 
 
 def die(msg, code=1):
@@ -319,25 +341,75 @@ def cmd_params(stack_json, template, *sets):
     sys.stdout.write("\n")
 
 
-def judge(rc, failed_over):
-    """One resource change: (verdict, words). Verdict is ok, refused or blocked."""
+def cause_of(d):
+    """The resource that a Ref or Fn::GetAtt detail follows: Instance of Instance.AvailabilityZone."""
+    return (d.get("CausingEntity") or "").split(".", 1)[0]
+
+
+def source_of(d, plan):
+    """Where the new value of one detail of a change comes from:
+    static   CloudFormation knows it while it makes the change set (Evaluation Static), or the value
+             is a Ref or Fn::GetAtt of a resource that is added, replaced for certain, or not in the
+             change set at all: it changes, or nothing explains why it would not;
+    cascade  a Ref or Fn::GetAtt (Evaluation Dynamic) of a resource that the change set modifies
+             without replacing it for certain, and whose replacement the guard denies: the value
+             changes only if that resource is replaced, which the guard refuses;
+    dynamic  anything else that CloudFormation resolves only while the change set runs, such as the
+             {{resolve:ssm:...}} image of a stack made in the console, or a Ref of a resource whose
+             replacement the guard allows."""
+    if d.get("Evaluation") != "Dynamic":
+        return "static"
+    if d.get("ChangeSource") in REFERENCES:
+        cause = plan.get(cause_of(d))
+        if not cause or cause["action"] != "Modify" or cause["replacement"] == "True":
+            return "static"
+        if cause["replacement"] == "Conditional" and cause["type"] in REPLACE_OK:
+            return "dynamic"
+        return "cascade"
+    return "dynamic"
+
+
+def image_change(rc):
+    """(before, after) of the ImageId of an instance when the change set shows both values: the
+    BeforeValue and AfterValue of its detail (describe-change-set --include-property-values), else
+    the resource's BeforeContext and AfterContext. None when it shows them not."""
+    for d in rc.get("Details") or []:
+        t = d.get("Target") or {}
+        if t.get("Name") == "ImageId" or t.get("Path") == "/Properties/ImageId":
+            if t.get("BeforeValue") is not None and t.get("AfterValue") is not None:
+                return t["BeforeValue"], t["AfterValue"]
+    values = []
+    for key in ("BeforeContext", "AfterContext"):
+        try:
+            values.append(json.loads(rc.get(key) or "null")["Properties"]["ImageId"])
+        except (ValueError, TypeError, KeyError):
+            return None
+    return values[0], values[1]
+
+
+def short(v, n=60):
+    s = v if isinstance(v, str) else json.dumps(v)
+    return s if len(s) <= n else s[:n - 3] + "..."
+
+
+def judge(rc, failed_over, plan):
+    """One resource change: (verdict, words). Verdict is ok, guarded, refused or blocked.
+
+    guarded: CloudFormation decides only while the change set runs whether the resource is
+    replaced, and the only ways it can go are no change, a change in place known to be safe, or a
+    replacement that the guard denies. Such a change set runs under the guard and nowhere else."""
     typ = rc.get("ResourceType", "?")
     rid = rc.get("LogicalResourceId", "?")
     action = rc.get("Action", "?")
     repl = rc.get("Replacement", "False")
-    labels, unsafe, recreate = [], [], repl in ("True", "Conditional")
+    labels, recreate = [], repl in ("True", "Conditional")
     for d in rc.get("Details") or []:
         t = d.get("Target") or {}
-        attr, name = t.get("Attribute", ""), t.get("Name", "")
         if t.get("RequiresRecreation", "Never") in ("Always", "Conditionally"):
             recreate = True
-        label = name or attr
+        label = t.get("Name", "") or t.get("Attribute", "")
         if label and label not in labels:
             labels.append(label)
-        if attr == "Metadata":
-            continue
-        if label not in SAFE.get(typ, ()):
-            unsafe.append(label)
     what = "%s (%s)" % (rid, typ)
     detail = ": " + ", ".join(labels) if labels else ""
 
@@ -358,38 +430,174 @@ def judge(rc, failed_over):
         return "refused", "REMOVE   %s would be deleted" % what
     if action != "Modify":
         return "refused", "%-8s %s is a change this script does not know" % (action.upper(), what)
-    if recreate:
-        if typ in REPLACE_OK:
-            return "ok", "replace  %s%s" % (what, detail)
-        word = "would be replaced" if repl == "True" else "may be replaced"
-        return "refused", "REPLACE  %s %s%s" % (what, word, detail)
+    if recreate and typ in REPLACE_OK:
+        return "ok", "replace  %s%s" % (what, detail)
     if not labels:
         return "refused", "MODIFY   %s changes in a way the change set does not describe" % what
+
+    # Each detail on its own. A property can have several (a parameter that changes gives one
+    # Dynamic DirectModification and one Static ParameterReference); the worst one counts.
+    certain, unsafe, guarded = [], [], []
+    for d in rc.get("Details") or []:
+        t = d.get("Target") or {}
+        attr = t.get("Attribute", "")
+        label = t.get("Name", "") or attr or "(a change without a name)"
+        if attr == "Metadata":
+            continue
+        need = t.get("RequiresRecreation", "Never")
+        safe = label in SAFE.get(typ, ())
+        source = source_of(d, plan)
+        if source == "cascade":
+            # It follows a resource that the guard keeps from being replaced: it stays as it is.
+            if need != "Never" or not safe:
+                guarded.append((label, "%s follows %s" % (label, cause_of(d)), need))
+        elif source == "dynamic":
+            # Resolved while the change set runs. A replacement is the guard's to deny; a change in
+            # place is not, so it must be one that is known to be safe.
+            if need == "Always" or (need == "Conditionally" and safe):
+                guarded.append((label, "%s is resolved when the change set runs" % label, need))
+            elif not safe:
+                unsafe.append(label)
+        elif need != "Never":
+            certain.append(label)
+        elif not safe:
+            unsafe.append(label)
+
+    if repl == "True" or certain:
+        word = "would be replaced" if repl == "True" else "may be replaced"
+        return "refused", "REPLACE  %s %s%s" % (what, word, detail)
     if unsafe:
-        return "refused", "MODIFY   %s: %s changes in place, which this script does not know to be safe" % (what, ", ".join(unsafe))
-    return "ok", "modify   %s%s (no interruption)" % (what, detail)
+        names = []
+        for u in unsafe:
+            if u not in names:
+                names.append(u)
+        return "refused", "MODIFY   %s: %s changes in place, which this script does not know to be safe" % (what, ", ".join(names))
+    if not guarded:
+        if repl == "Conditional":
+            # The change set says the resource may be replaced, and no detail says why.
+            return "refused", "REPLACE  %s may be replaced%s" % (what, detail)
+        return "ok", "modify   %s%s (no interruption)" % (what, detail)
+
+    notes = []
+    for g in guarded:
+        if g[1] not in notes:
+            notes.append(g[1])
+    if typ == "AWS::EC2::Instance" and "ImageId" in [g[0] for g in guarded]:
+        values = image_change(rc)
+        if values is not None:
+            before, after = values
+            if isinstance(before, str) and isinstance(after, str) and AMI.match(before) and AMI.match(after):
+                if before != after:
+                    return "refused", "REPLACE  %s would be replaced: ImageId changes from %s to %s, another image" % (what, before, after)
+                notes.append("ImageId stays %s" % before)
+            else:
+                notes.append("ImageId %s -> %s, which cannot be compared before it runs" % (short(before), short(after)))
+    may = repl == "Conditional" or [g for g in guarded if g[2] != "Never"]
+    return "guarded", "guarded  %s%s%s; %s" % (what, " may be replaced" if may else "", detail, ", ".join(notes))
 
 
 def cmd_classify(path, *flags):
     failed_over = "--failed-over" in flags
     cs = load(path)
     changes = [c["ResourceChange"] for c in cs.get("Changes", []) if c.get("Type") == "Resource" and "ResourceChange" in c]
-    verdicts = {"ok": 0, "refused": 0, "blocked": 0}
+    plan = {}
+    for rc in changes:
+        plan[rc.get("LogicalResourceId", "?")] = {
+            "action": rc.get("Action"), "replacement": rc.get("Replacement", "False"), "type": rc.get("ResourceType", "?")}
+    verdicts = {"ok": 0, "guarded": 0, "refused": 0, "blocked": 0}
     lines = []
     for rc in changes:
-        v, text = judge(rc, failed_over)
+        v, text = judge(rc, failed_over, plan)
         verdicts[v] += 1
         lines.append((v, text))
-    order = {"blocked": 0, "refused": 1, "ok": 2}
+    order = {"blocked": 0, "refused": 1, "guarded": 2, "ok": 3}
     for v, text in sorted(lines, key=lambda x: order[x[0]]):
         print("  %s" % text)
     if not changes:
         print("  (no resource changes)")
-    print("%d change(s): %d allowed, %d refused, %d blocked" % (len(changes), verdicts["ok"], verdicts["refused"], verdicts["blocked"]))
+    print("%d change(s): %d allowed, %d refused, %d blocked, %d guarded" % (
+        len(changes), verdicts["ok"], verdicts["refused"], verdicts["blocked"], verdicts["guarded"]))
     if verdicts["blocked"]:
         sys.exit(11)
     if verdicts["refused"]:
         sys.exit(10)
+    if verdicts["guarded"]:
+        sys.exit(12)
+
+
+def template_types(path):
+    """The resource types under the top-level Resources: key of the template."""
+    types, inside = set(), False
+    with open(path) as f:
+        for line in f:
+            if re.match(r"^Resources:\s*$", line):
+                inside = True
+                continue
+            if inside:
+                if re.match(r"^[A-Za-z]", line):
+                    break
+                m = re.match(r"""^    Type:\s*["']?([A-Za-z0-9]+(?:::[A-Za-z0-9]+)+)""", line)
+                if m:
+                    types.add(m.group(1))
+    return types
+
+
+def cmd_guard(own_json, template, cs_json, restore_out):
+    """Prints the guard: the stack's own policy (or one that allows every update, when it has none)
+    and two Deny statements, one for the replacement of every resource type of the template and the
+    change set but REPLACE_OK, one for the removal of every such type but REMOVE_OK. A Deny always
+    wins over an Allow, so the guard never allows what the stack's own policy denies. The types are
+    named one by one: the stack policy grammar has StringEquals and StringLike for ResourceType, not
+    a negation. Writes the policy to put back afterwards to RESTORE_OUT, the stack's own as it was,
+    or the one that allows every update (a stack policy cannot be deleted)."""
+    with open(own_json) as f:
+        text = f.read().strip()
+    own = json.loads(text) if text else {}
+    body = own.get("StackPolicyBody") if isinstance(own, dict) else None
+    if body:
+        try:
+            statements = json.loads(body)["Statement"]
+        except (ValueError, TypeError, KeyError):
+            die("the stack's own policy is not a stack policy this script can read", 3)
+        if isinstance(statements, dict):
+            statements = [statements]
+        if not isinstance(statements, list):
+            die("the stack's own policy is not a stack policy this script can read", 3)
+        restore = body
+    else:
+        statements = [ALLOW_ALL]
+        restore = json.dumps({"Statement": [ALLOW_ALL]})
+    types = template_types(template)
+    for c in load(cs_json).get("Changes", []):
+        t = (c.get("ResourceChange") or {}).get("ResourceType")
+        if t:
+            types.add(t)
+    if not types:
+        die("found no resource types to guard in %s" % template, 3)
+    deny = []
+    for action, allowed in (("Update:Replace", REPLACE_OK), ("Update:Delete", REMOVE_OK)):
+        kept = sorted(t for t in types if t not in allowed)
+        if kept:
+            deny.append({"Effect": "Deny", "Action": action, "Principal": "*", "Resource": "*",
+                         "Condition": {"StringEquals": {"ResourceType": kept}}})
+    policy = json.dumps({"Statement": list(statements) + deny})
+    if len(policy) > POLICY_MAX:
+        die("the guard with the stack's own policy is %d bytes, over the %d a stack policy may have" % (len(policy), POLICY_MAX), 3)
+    with open(restore_out, "w") as f:
+        f.write(restore)
+    print(policy)
+
+
+def cmd_failures(events_json, stack):
+    """What failed in the last update of the stack: LogicalId<TAB>reason for each UPDATE_FAILED
+    event since the stack's own UPDATE_IN_PROGRESS (describe-stack-events lists the newest first)."""
+    for e in load(events_json).get("StackEvents", []):
+        if e.get("LogicalResourceId") == stack and e.get("ResourceType") == "AWS::CloudFormation::Stack":
+            if e.get("ResourceStatus") == "UPDATE_IN_PROGRESS":
+                break
+            continue
+        if e.get("ResourceStatus") == "UPDATE_FAILED":
+            print("%s\t%s" % (e.get("LogicalResourceId", "?"), " ".join((e.get("ResourceStatusReason") or "").split())))
 
 
 def cmd_same(template, staged):
@@ -405,7 +613,8 @@ def cmd_same(template, staged):
 
 
 def main(argv):
-    cmds = {"facts": cmd_facts, "params": cmd_params, "classify": cmd_classify, "same": cmd_same}
+    cmds = {"facts": cmd_facts, "params": cmd_params, "classify": cmd_classify, "guard": cmd_guard,
+            "failures": cmd_failures, "same": cmd_same}
     if len(argv) < 2 or argv[1] not in cmds:
         die("unknown helper command", 2)
     cmds[argv[1]](*argv[2:])
@@ -755,8 +964,23 @@ make_change_set() { # TYPE
     fail "the change set failed: ${reason:-no reason given}"
   fi
   check_template_of_change_set
-  "${AWS[@]}" cloudformation describe-change-set --stack-name "$STACK" --change-set-name "$CS" --output json >"$WORK/cs.json" \
-    || fail "cannot read the change set"
+  describe_change_set || { drop_change_set; fail "cannot read the change set"; }
+}
+# The description of CS in $WORK/cs.json, with the values of the properties before and after
+# (--include-property-values) when the AWS CLI knows that option. An older CLI refuses it as an
+# unknown option, and the review then goes on without the values.
+describe_change_set() {
+  if "${AWS[@]}" cloudformation describe-change-set --stack-name "$STACK" --change-set-name "$CS" --include-property-values \
+    --output json >"$WORK/cs.json" 2>"$WORK/err"; then
+    return 0
+  fi
+  if grep -q 'Unknown options.*--include-property-values' "$WORK/err"; then
+    say "(This AWS CLI does not know --include-property-values: the review goes on without the values of the properties.)"
+    "${AWS[@]}" cloudformation describe-change-set --stack-name "$STACK" --change-set-name "$CS" --output json >"$WORK/cs.json"
+    return $?
+  fi
+  cat "$WORK/err" >&2
+  return 1
 }
 drop_change_set() {
   "${AWS[@]}" cloudformation delete-change-set --stack-name "$STACK" --change-set-name "$CS" >/dev/null 2>&1 || true
@@ -775,6 +999,14 @@ check_template_of_change_set() {
 }
 
 FAILED_OVER=0
+# What the review of the change set found: ok, guarded (it runs under the guard) or risky (the
+# person accepted a refused or guarded change set with --allow-risky, and no guard is set).
+REVIEW=""
+GUARD_NOTE="Guarded: CloudFormation decides only while the change set runs whether these resources are replaced.
+The change set runs under a temporary stack policy (the guard) that denies the replacement or removal of
+every resource but a security group rule, an IAM policy or a bucket policy. If CloudFormation decides to
+replace or remove one, the update fails, CloudFormation rolls the stack back and nothing is replaced.
+The stack's own policy is put back afterwards."
 # Shows the change set CS and stops (deleting it) at anything that is not allowed. Without ASK it
 # also asks the person to type "apply". FAILED_OVER (0/1) comes from service_address_here.
 review_change_set() { # ASK(1/0)
@@ -783,18 +1015,27 @@ review_change_set() { # ASK(1/0)
   say ""
   say "Change set $CS for stack $STACK in $REGION:"
   py classify "$WORK/cs.json" ${args[@]+"${args[@]}"} || rc=$?
+  REVIEW=ok
   case $rc in
     0) ;;
     11) drop_change_set; die "refused: the change set could take the service address back from the server it failed over to. Nothing was changed" ;;
+    12)
+      if [[ $ALLOW_RISKY -eq 1 ]]; then
+        say "--allow-risky: no guard is set for this run, so CloudFormation replaces a guarded resource if it decides to."
+        confirm_risky
+        REVIEW=risky
+      else
+        say "$GUARD_NOTE"
+        REVIEW=guarded
+      fi ;;
     10)
       if [[ $ALLOW_RISKY -eq 0 ]]; then
         drop_change_set
         die "refused: the change set replaces or removes something, or changes it in a way this script does not know to be safe. Nothing was changed. A person who has read it can pass --allow-risky"
       fi
-      [[ -t 0 ]] || { drop_change_set; die "--allow-risky asks you to type the stack name, which needs a terminal"; }
-      printf 'These changes can interrupt the node or lose data. Type the stack name (%s) to run them anyway: ' "$STACK"
-      read -r answer
-      [[ $answer == "$STACK" ]] || { drop_change_set; die "not confirmed; nothing was changed"; } ;;
+      say "--allow-risky: no guard is set for this run, so CloudFormation makes these changes as the change set says."
+      confirm_risky
+      REVIEW=risky ;;
     *) drop_change_set; fail "could not read the change set (the review exited $rc)" ;;
   esac
   [[ $1 -eq 1 && $YES -eq 0 ]] || return 0
@@ -802,6 +1043,13 @@ review_change_set() { # ASK(1/0)
   printf 'Type apply to run this change set: '
   read -r answer
   [[ $answer == apply ]] || { drop_change_set; die "not applied; the change set was deleted"; }
+}
+confirm_risky() { # --allow-risky: the person types the stack name
+  local answer
+  [[ -t 0 ]] || { drop_change_set; die "--allow-risky asks you to type the stack name, which needs a terminal"; }
+  printf 'These changes can interrupt the node or lose data. Type the stack name (%s) to run them anyway: ' "$STACK"
+  read -r answer
+  [[ $answer == "$STACK" ]] || { drop_change_set; die "not confirmed; nothing was changed"; }
 }
 # The review and the question to the person take time. A failover in between moves the address to
 # another server, and a change set that was fine before may take it back: judge it again.
@@ -812,7 +1060,7 @@ recheck_failover() { # TAG
   FAILED_OVER=1
   py classify "$WORK/cs.json" --failed-over >/dev/null || rc=$?
   case $rc in
-    0 | 10) say "WARNING: the service address moved to another server during the review; the change set does not touch it." ;;
+    0 | 10 | 12) say "WARNING: the service address moved to another server during the review; the change set does not touch it." ;;
     11) drop_change_set; die "refused: a failover moved the service address while the change set was under review, and the change set could take it back. Nothing was changed" ;;
     *) drop_change_set; fail "could not read the change set (the review exited $rc)" ;;
   esac
@@ -824,6 +1072,162 @@ execute_change_set() {
 wait_stack() { # create|update
   "${AWS[@]}" cloudformation wait "stack-$1-complete" --stack-name "$STACK" \
     || fail "the stack did not finish; see the Events tab of $STACK in the CloudFormation console (CloudFormation puts a failed update back as it was)"
+}
+
+# ---- the guard: a temporary stack policy ----------------------------------------------------
+# CloudFormation decides some replacements only while a change set runs: a value it resolves then
+# (the {{resolve:ssm:...}} image of a stack made in the console, a Ref or Fn::GetAtt of a resource
+# that it might replace) cannot be compared while the change set is made. The review calls those
+# changes guarded. A guarded change set runs under a stack policy that denies the replacement and
+# the removal of every resource type of the stack but the ones the review lets be replaced or
+# removed, so that AWS itself refuses what the review could not rule out: the update then fails and
+# CloudFormation rolls the stack back. Afterwards, whether the update succeeded or failed, the
+# stack's own policy is put back, or one that allows every update when it had none (a stack policy
+# cannot be deleted). That waits until the update has ended, also when the script is interrupted:
+# the documentation does not say whether CloudFormation reads the policy once or as it goes.
+# (GUARD, GUARD_RUNNING and the rest are set at the top, for on_exit.)
+
+# An interrupt ends the script through on_exit, which takes the guard off.
+exit_on_signals() {
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  trap 'exit 129' HUP
+}
+# Saves the stack's policy and sets the guard; stops (deleting the change set) when it cannot.
+set_guard() {
+  "${AWS[@]}" cloudformation get-stack-policy --stack-name "$STACK" --output json >"$WORK/policy-own.json" 2>"$WORK/err" \
+    || { cat "$WORK/err" >&2; drop_change_set; fail "cannot read the stack policy of $STACK (the credentials need cloudformation:GetStackPolicy), so the guard cannot be set and the change set was deleted. Nothing was changed"; }
+  py guard "$WORK/policy-own.json" "$TEMPLATE" "$WORK/cs.json" "$WORK/policy-restore.json" >"$WORK/policy-guard.json" \
+    || { drop_change_set; fail "cannot build the guard from the stack policy of $STACK, so the change set was deleted. Nothing was changed"; }
+  GUARD_HAD=""
+  if grep -q '"StackPolicyBody"' "$WORK/policy-own.json"; then GUARD_HAD=1; fi
+  GUARD_STACK=$STACK GUARD_FILE=$WORK/policy-restore.json
+  GUARD_AWS=("${AWS[@]}")
+  exit_on_signals
+  GUARD=1
+  if ! "${AWS[@]}" cloudformation set-stack-policy --stack-name "$STACK" --stack-policy-body "file://$WORK/policy-guard.json" 2>"$WORK/err"; then
+    GUARD=0
+    cat "$WORK/err" >&2
+    drop_change_set
+    fail "cannot set the guard on $STACK (the credentials need cloudformation:SetStackPolicy), so the change set was deleted. Nothing was changed"
+  fi
+  if [[ -n $GUARD_HAD ]]; then
+    say "Guard set: the stack's own policy, plus a denial of any replacement or removal but of a rule or a policy."
+  else
+    say "Guard set: a stack policy that denies any replacement or removal but of a rule or a policy (the stack had no policy)."
+  fi
+}
+
+# Waits until the update of the guarded stack has ended and sets SETTLED to the stack's status.
+# Returns 1 when the status cannot be read, when the update still runs after three waits (each is the
+# CLI waiter's, up to an hour), or when the person stops waiting (GIVE_UP, set by a trap). The caller
+# sets that trap first, so that Ctrl-C stops the wait and not the script.
+SETTLED=""
+settle() {
+  local i
+  for i in 1 2 3 4; do
+    [[ $GIVE_UP -eq 0 ]] || return 1
+    SETTLED=$("${GUARD_AWS[@]}" cloudformation describe-stacks --stack-name "$GUARD_STACK" --query 'Stacks[0].StackStatus' --output text 2>/dev/null) || SETTLED=""
+    case $SETTLED in
+      '' | None) SETTLED=""; return 1 ;;
+      *_IN_PROGRESS) ;;
+      *) return 0 ;;
+    esac
+    [[ $i -lt 4 ]] || return 1
+    printf '%s: the update of %s is still running (%s); the guard comes off when it ends. Waiting (Ctrl-C leaves the guard on) ...\n' "$SELF" "$GUARD_STACK" "$SETTLED" >&2
+    "${GUARD_AWS[@]}" cloudformation wait stack-update-complete --stack-name "$GUARD_STACK" >/dev/null 2>&1 || true
+  done
+  return 1
+}
+
+# Puts the stack's own policy back. 0 done, 1 it could not, which it says loudly.
+restore_guard() {
+  [[ $GUARD -eq 1 ]] || return 0
+  if "${GUARD_AWS[@]}" cloudformation set-stack-policy --stack-name "$GUARD_STACK" --stack-policy-body "file://$GUARD_FILE" 2>"$WORK/err"; then
+    GUARD=0
+    if [[ -n $GUARD_HAD ]]; then
+      say "Guard taken off: the stack's own policy is back."
+    else
+      say "Guard taken off: the stack's policy allows every update again (it had none, and a stack policy cannot be deleted)."
+    fi
+    return 0
+  fi
+  cat "$WORK/err" >&2
+  guard_left_on "it could not be put back"
+  return 1
+}
+guard_left_on() { # REASON
+  GUARD=0
+  {
+    printf '\n%s: WARNING: THE GUARD IS STILL ON STACK %s (%s).\n' "$SELF" "$GUARD_STACK" "$1"
+    printf 'While it is on, CloudFormation refuses to replace or remove most resources of the stack. Once the stack\n'
+    printf 'is no longer updating, put its own policy back with:\n'
+    printf '  %s\n\n' "$(show "${GUARD_AWS[@]}" cloudformation set-stack-policy --stack-name "$GUARD_STACK" --stack-policy-body "$(cat "$GUARD_FILE")")"
+  } >&2
+}
+# The script ends with the guard on (an interrupt, a failure): the guard comes off once the update
+# has ended. A second interrupt stops the wait and leaves it on, with the command to take it off.
+guard_off_at_exit() {
+  trap 'GIVE_UP=1' INT TERM HUP
+  if [[ $GUARD_RUNNING -eq 1 ]] && ! settle; then
+    guard_left_on "the update may still be running, or its state could not be read"
+    return 0
+  fi
+  restore_guard || true
+}
+
+# Runs the change set CS under the guard, waits for it, and takes the guard off.
+run_guarded() {
+  local status
+  GUARD_RUNNING=1
+  execute_change_set
+  if "${AWS[@]}" cloudformation wait stack-update-complete --stack-name "$STACK"; then
+    GUARD_RUNNING=0
+    restore_guard || true
+    return 0
+  fi
+  # The waiter stops at a failure, and after an hour. From here Ctrl-C stops a wait, not the script.
+  trap 'GIVE_UP=1' INT TERM HUP
+  if ! settle; then
+    guard_left_on "the update may still be running, or its state could not be read"
+    fail "cannot tell whether the update of $STACK has ended; see its Events tab in the CloudFormation console"
+  fi
+  status=$SETTLED
+  GUARD_RUNNING=0
+  if [[ $status == UPDATE_COMPLETE ]]; then
+    restore_guard || true
+    exit_on_signals
+    return 0
+  fi
+  say ""
+  case $status in
+    UPDATE_ROLLBACK_COMPLETE)
+      say "The update failed, and CloudFormation rolled the stack back: it is as it was before the update." ;;
+    UPDATE_ROLLBACK_FAILED)
+      say "The update failed, and CloudFormation could not finish rolling the stack back (UPDATE_ROLLBACK_FAILED)."
+      say "See the Events tab of $STACK; aws cloudformation continue-update-rollback --stack-name $STACK resumes the rollback." ;;
+    *)
+      say "The update did not complete: the stack is $status." ;;
+  esac
+  say "Nothing was replaced: the guard let CloudFormation replace or remove nothing but a security group rule, an IAM policy or a bucket policy."
+  guard_refusals
+  restore_guard || true
+  fail "the update of $STACK did not complete ($status); see the Events tab of $STACK in the CloudFormation console"
+}
+# Names what CloudFormation wanted to replace or remove and the guard denied, from the events of the
+# update (the credentials need cloudformation:DescribeStackEvents; without it the events are skipped).
+guard_refusals() {
+  : >"$WORK/failures"
+  if "${AWS[@]}" cloudformation describe-stack-events --stack-name "$STACK" --max-items 100 --output json >"$WORK/events.json" 2>/dev/null; then
+    py failures "$WORK/events.json" "$STACK" >"$WORK/failures" 2>/dev/null || : >"$WORK/failures"
+  fi
+  if grep -qi 'stack policy' "$WORK/failures"; then
+    say "CloudFormation decided to replace or remove these while the change set ran, and the guard denied it:"
+    grep -i 'stack policy' "$WORK/failures" | awk -F'\t' '{ printf "  %s: %s\n", $1, $2 }'
+  elif [[ -s $WORK/failures ]]; then
+    say "What failed:"
+    awk -F'\t' '{ printf "  %s: %s\n", $1, $2 }' "$WORK/failures"
+  fi
 }
 
 REPAIR_RULE="Before you replace an instance of this stack (a changed image or user data does), set SupaviseVersion to
@@ -890,8 +1294,13 @@ run_update() { # TAG HOW
   fi
   review_change_set 1
   recheck_failover "$tag"
-  execute_change_set
-  wait_stack update
+  if [[ $REVIEW == guarded ]]; then
+    set_guard
+    run_guarded
+  else
+    execute_change_set
+    wait_stack update
+  fi
   load_facts "$STACK" "$REGION" "$tag"
   have=$(fact "$tag" output:InfraRevision)
   say ""
@@ -940,10 +1349,20 @@ mode_update() {
     show "${AWS[@]}" cloudformation wait change-set-create-complete --stack-name "$STACK" --change-set-name "$NAME-update-<time>"
     note "the template the change set holds is read back and must be the file that was verified; if it is not, the change set is deleted:"
     show "${AWS[@]}" cloudformation get-template --stack-name "$STACK" --change-set-name "$NAME-update-<time>" --template-stage Original --query TemplateBody --output json
-    show "${AWS[@]}" cloudformation describe-change-set --stack-name "$STACK" --change-set-name "$NAME-update-<time>" --output json
+    note "the change set is read with the values of its properties (an AWS CLI that does not know --include-property-values reads it without them):"
+    show "${AWS[@]}" cloudformation describe-change-set --stack-name "$STACK" --change-set-name "$NAME-update-<time>" --include-property-values --output json
     note "every resource change is reviewed; a replacement or removal (but of a security group rule or an IAM policy) is refused and the change set deleted. Otherwise, after you type apply:"
     show "${AWS[@]}" cloudformation execute-change-set --stack-name "$STACK" --change-set-name "$NAME-update-<time>"
     show "${AWS[@]}" cloudformation wait stack-update-complete --stack-name "$STACK"
+    note "a guarded change set (CloudFormation decides only while it runs whether a resource is replaced) runs under a temporary stack policy"
+    note "that denies the replacement or removal of every resource but a security group rule, an IAM policy or a bucket policy; the stack's"
+    note "own policy is saved first and put back once the update has ended (one that allows every update when it had none), also after a failure:"
+    show "${AWS[@]}" cloudformation get-stack-policy --stack-name "$STACK" --output json
+    show "${AWS[@]}" cloudformation set-stack-policy --stack-name "$STACK" --stack-policy-body "file://<the guard>"
+    show "${AWS[@]}" cloudformation execute-change-set --stack-name "$STACK" --change-set-name "$NAME-update-<time>"
+    show "${AWS[@]}" cloudformation wait stack-update-complete --stack-name "$STACK"
+    show "${AWS[@]}" cloudformation set-stack-policy --stack-name "$STACK" --stack-policy-body "file://<the stack's own policy>"
+    note "with --allow-risky no guard is set"
     return 0
   fi
   FAIL_CODE=3

@@ -16,6 +16,12 @@ DIR="$(dirname "$0")"
 echo "$*" >> "$DIR/aws.log"
 arg() { local k=$1; shift; while [ $# -gt 0 ]; do if [ "$1" = "$k" ]; then echo "$2"; return; fi; shift; done; }
 case "$*" in
+  *"cloudformation create-stack"*) p=$(arg --parameters "$@"); cp "${p#file://}" "$DIR/console-params.json" ;;
+  *"ParameterKey=='AmiId'"*) if [ -f "$DIR/updated" ]; then echo ami-0bbbbbbbbbbbbbbbb; else echo; fi ;;
+  *"ec2 describe-instances"*"ImageId"*) echo ami-0bbbbbbbbbbbbbbbb ;;
+  *"get-stack-policy"*)
+    if [ -n "$POLICY_LEFT" ]; then echo '{"Statement": [{"Effect": "Allow", "Action": "Update:*", "Principal": "*", "Resource": "*"}, {"Effect": "Deny", "Action": "Update:Replace", "Principal": "*", "Resource": "*"}]}'
+    else echo '{"Statement": [{"Effect": "Allow", "Action": "Update:*", "Principal": "*", "Resource": "*"}]}'; fi ;;
   *"OutputKey=='InstanceId'"*) if [ -f "$DIR/replaced" ]; then echo i-0newnewnewnew0001; else echo i-0123456789abcdef0; fi ;;
   *"OutputKey=='BackupBucket'"*) echo supavise-rehearsal-backup ;;
   *"OutputKey=='ObjectsBucket'"*) echo supavise-rehearsal-objects ;;
@@ -43,7 +49,9 @@ case "$1" in
   update)
     n=$(grep -c '^update' "$DIR/deploy.log")
     if [ "$n" -ge 2 ]; then echo "Nothing to change: the stack already matches this template."; exit 0; fi
+    touch "$DIR/updated"
     echo "  add      ObjectsBucket (AWS::S3::Bucket)"
+    if [ -n "$UPDATE_GUARDED" ]; then echo "  guarded  Instance (AWS::EC2::Instance) may be replaced: Tags, ImageId, MetadataOptions; ImageId is resolved when the change set runs"; fi
     if [ -n "$UPDATE_REPLACES" ]; then echo "  REPLACE  Instance (AWS::EC2::Instance) would be replaced: ImageId"; touch "$DIR/replaced" "$DIR/recreated"; fi
     if [ -n "$UPDATE_REBOOTS" ]; then touch "$DIR/rebooted"; fi
     exit "${UPDATE_RC-0}" ;;
@@ -245,5 +253,60 @@ func TestRehearseKeepAndPurge(t *testing.T) {
 	}
 	if strings.Contains(r.stdout, "Left in your account") {
 		t.Errorf("--purge leaves nothing:\n%s", r.stdout)
+	}
+}
+
+// --console-stack: the stack is made as the CloudFormation console makes it, with AmiId empty, so
+// that the update has to pin the image and runs under deploy.sh's guard.
+func TestRehearseConsoleStack(t *testing.T) {
+	r, dir := rehearse(t, nil, "--region", "us-east-1", "--email", "a@b.co", "--dry-run", "--console-stack")
+	if r.code != 0 {
+		t.Fatalf("exit %d\n%s\n%s", r.code, r.stdout, r.stderr)
+	}
+	for _, want := range []string{"AmiId is left empty", "cloudformation create-stack --stack-name supavise-rehearsal-", "--template-body file://",
+		"testdata/supavise-v0.1.1.yaml --capabilities CAPABILITY_IAM", "wait stack-create-complete", "get-stack-policy --stack-name supavise-rehearsal-"} {
+		if !strings.Contains(r.stdout, want) {
+			t.Errorf("the plan lacks %q:\n%s", want, r.stdout)
+		}
+	}
+	if strings.Contains(r.stdout, "--version v0.1.1 --template") {
+		t.Errorf("the console's stack is not made by deploy.sh:\n%s", r.stdout)
+	}
+	if len(fileLines(t, filepath.Join(dir, "aws.log"))) != 0 || len(fileLines(t, filepath.Join(dir, "deploy.log"))) != 0 {
+		t.Error("a dry run called aws or deploy.sh")
+	}
+
+	r, dir = rehearse(t, []string{"UPDATE_GUARDED=1"}, "--region", "us-east-1", "--email", "a@b.co", "--yes", "--console-stack")
+	if r.code != 0 {
+		t.Fatalf("exit %d\n%s\n%s", r.code, r.stdout, r.stderr)
+	}
+	for _, want := range []string{"the console's way, AmiId empty", "PASS  the update ran", "PASS  the instance is the same",
+		"PASS  the stack was made with an empty AmiId", "PASS  the stack's AmiId is the image the instance runs (ami-0bbbbbbbbbbbbbbbb, instance: ami-0bbbbbbbbbbbbbbbb)",
+		"PASS  the stack policy allows every update again", "INFO  the review called the instance: guarded  Instance (AWS::EC2::Instance) may be replaced",
+		"== every check passed"} {
+		if !strings.Contains(r.stdout, want) {
+			t.Errorf("output lacks %q:\n%s", want, r.stdout)
+		}
+	}
+	// The stack is made with create-stack and the v0.1.1 template, and without AmiId; deploy.sh updates
+	// it twice and deletes it.
+	log := strings.Join(fileLines(t, filepath.Join(dir, "aws.log")), "\n")
+	if !strings.Contains(log, "cloudformation create-stack --stack-name supavise-rehearsal-") || !strings.Contains(log, "supavise-v0.1.1.yaml --capabilities CAPABILITY_IAM") {
+		t.Errorf("aws calls:\n%s", log)
+	}
+	b, err := os.ReadFile(filepath.Join(dir, "console-params.json"))
+	if err != nil || strings.Contains(string(b), "AmiId") || !strings.Contains(string(b), `"ParameterKey": "AdminEmail", "ParameterValue": "a@b.co"`) ||
+		!strings.Contains(string(b), `"ParameterKey": "SupaviseVersion", "ParameterValue": "v0.1.1"`) {
+		t.Errorf("the parameters of the console's stack: %s (%v)", b, err)
+	}
+	d := fileLines(t, filepath.Join(dir, "deploy.log"))
+	if len(d) != 3 || !strings.HasPrefix(d[0], "update ") || !strings.HasPrefix(d[1], "update ") || !strings.Contains(d[2], "--delete --yes") {
+		t.Errorf("deploy.sh calls: %v", d)
+	}
+
+	// A guard left on the stack is a failed check.
+	r, _ = rehearse(t, []string{"UPDATE_GUARDED=1", "POLICY_LEFT=1"}, "--region", "us-east-1", "--email", "a@b.co", "--yes", "--console-stack")
+	if r.code != 1 || !strings.Contains(r.stdout, "FAIL  the stack policy allows every update again") {
+		t.Errorf("exit %d\n%s", r.code, r.stdout)
 	}
 }

@@ -3,6 +3,7 @@
 #
 #   deploy/aws/rehearse.sh --region us-east-1 --email you@example.com [--profile NAME]
 #   deploy/aws/rehearse.sh --region us-east-1 --email you@example.com --purge --yes
+#   deploy/aws/rehearse.sh --region us-east-1 --email you@example.com --console-stack
 #
 # What it does, in order:
 #   1. creates a stack from the template of v0.1.1 (deploy/cloudformation/testdata/supavise-v0.1.1.yaml,
@@ -22,6 +23,15 @@
 # (about 30 minutes), then storage in the two buckets and the snapshots until --purge removes them. Run it
 # with credentials of an account you may spend in. Exit status: 0 every check passed, 1 a check failed
 # (the stack is still deleted unless --keep), 2 bad arguments or a refused step.
+#
+# --console-stack makes the stack of step 1 the way the CloudFormation console and the Launch Stack
+# button do (create-stack with AmiId left empty, so that the image comes from the template's
+# {{resolve:ssm:...}} reference) instead of with deploy.sh, which always passes an image ID. The update
+# then pins AmiId to the image the instance runs, CloudFormation cannot tell before the change set
+# runs whether that is a new image, and deploy.sh runs the change set under its guard (a temporary
+# stack policy). Step 4 also checks that the stack's AmiId is the instance's image afterwards and that
+# the stack policy allows every update again (the stack had none), and shows how the review called
+# the instance.
 #
 # --keep leaves the stack; --purge also destroys the two buckets and the snapshots the rehearsal
 # made (otherwise it prints what remains and the commands); --yes skips the prompt before the deletion;
@@ -44,13 +54,14 @@ q() {
 }
 show() { local a out=""; for a in "$@"; do out="$out $(q "$a")"; done; printf '%s\n' "${out# }"; }
 
-REGION=${AWS_REGION:-${AWS_DEFAULT_REGION:-}} EMAIL="" PROFILE="" KEEP=0 PURGE=0 YES=0 DRY=0
+REGION=${AWS_REGION:-${AWS_DEFAULT_REGION:-}} EMAIL="" PROFILE="" KEEP=0 PURGE=0 YES=0 DRY=0 CONSOLE=0
 while [[ $# -gt 0 ]]; do
   case $1 in
     --region) [[ $# -ge 2 ]] || die "--region needs a value"; REGION=$2; shift 2 ;;
     --email) [[ $# -ge 2 ]] || die "--email needs a value"; EMAIL=$2; shift 2 ;;
     --profile) [[ $# -ge 2 ]] || die "--profile needs a value"; PROFILE=$2; shift 2 ;;
     --keep) KEEP=1; shift ;;
+    --console-stack) CONSOLE=1; shift ;;
     --purge) PURGE=1; shift ;;
     --yes | -y) YES=1; shift ;;
     --dry-run) DRY=1; shift ;;
@@ -78,10 +89,24 @@ PURGE_ARG=()
 DEPLOY_ARGS=(--region "$REGION")
 [[ -z $PROFILE ]] || DEPLOY_ARGS+=(--profile "$PROFILE")
 
+# The parameters of the stack of step 1 when the console makes it: AmiId is not given, so it is empty.
+console_params() {
+  python3 -c 'import json, sys; print(json.dumps([{"ParameterKey": k, "ParameterValue": v} for k, v in zip(sys.argv[1::2], sys.argv[2::2])]))' \
+    AdminEmail "$EMAIL" SupaviseVersion v0.1.1 InstanceType t4g.medium DataVolumeSize 20 DailySnapshotsKept 0
+}
+
 if [[ $DRY -eq 1 ]]; then
   say "# dry run: nothing is sent to AWS. The rehearsal stack would be $STACK in $REGION."
-  say "# 1. a stack from the v0.1.1 template, installing v0.1.1:"
-  show "$DEPLOY" "${DEPLOY_ARGS[@]}" --stack-name "$STACK" --email "$EMAIL" --version v0.1.1 --template "$OLD_TEMPLATE" --instance-type t4g.medium --volume-size 20 --daily-snapshots 0
+  if [[ $CONSOLE -eq 1 ]]; then
+    say "# 1. a stack from the v0.1.1 template, installing v0.1.1, made the console's way: AmiId is left empty"
+    say "#    (the parameters: AdminEmail, SupaviseVersion=v0.1.1, InstanceType=t4g.medium, DataVolumeSize=20, DailySnapshotsKept=0):"
+    show "${AWS[@]}" cloudformation create-stack --stack-name "$STACK" --template-body "file://$OLD_TEMPLATE" --capabilities CAPABILITY_IAM --tags Key=Application,Value=supavise --parameters "file://<parameters without AmiId>"
+    show "${AWS[@]}" cloudformation wait stack-create-complete --stack-name "$STACK"
+    show "${AWS[@]}" cloudformation describe-stacks --stack-name "$STACK" --query "Stacks[0].Parameters[?ParameterKey=='AmiId'].ParameterValue" --output text
+  else
+    say "# 1. a stack from the v0.1.1 template, installing v0.1.1:"
+    show "$DEPLOY" "${DEPLOY_ARGS[@]}" --stack-name "$STACK" --email "$EMAIL" --version v0.1.1 --template "$OLD_TEMPLATE" --instance-type t4g.medium --volume-size 20 --daily-snapshots 0
+  fi
   say "# 2. the instance, before:"
   show "${AWS[@]}" cloudformation describe-stacks --stack-name "$STACK" --query "Stacks[0].Outputs[?OutputKey=='InstanceId'].OutputValue" --output text
   show "${AWS[@]}" ec2 describe-instances --instance-ids "<InstanceId>" --query 'Reservations[0].Instances[0].[LaunchTime,State.Name]' --output text
@@ -91,6 +116,12 @@ if [[ $DRY -eq 1 ]]; then
   show "${AWS[@]}" ec2 describe-instances --instance-ids "<InstanceId>" --query 'Reservations[0].Instances[0].[LaunchTime,State.Name]' --output text
   show "${AWS[@]}" cloudformation describe-stack-events --stack-name "$STACK" --query "StackEvents[?LogicalResourceId=='Instance'].[Timestamp,ResourceStatus]" --output text
   show "$DEPLOY" update "${DEPLOY_ARGS[@]}" --stack "$STACK" --template "$NEW_TEMPLATE" --set Failover=on --set PeerCidr1=198.51.100.0/24 --yes
+  if [[ $CONSOLE -eq 1 ]]; then
+    say "# and, for the console's stack: AmiId is now the image the instance runs, and the stack policy allows every update again:"
+    show "${AWS[@]}" cloudformation describe-stacks --stack-name "$STACK" --query "Stacks[0].Parameters[?ParameterKey=='AmiId'].ParameterValue" --output text
+    show "${AWS[@]}" ec2 describe-instances --instance-ids "<InstanceId>" --query 'Reservations[0].Instances[0].ImageId' --output text
+    show "${AWS[@]}" cloudformation get-stack-policy --stack-name "$STACK" --query StackPolicyBody --output text
+  fi
   say "# 5. the checklist for the node, then you press Enter"
   say "# 6. the deletion:"
   show "$DEPLOY" "${DEPLOY_ARGS[@]}" --stack-name "$STACK" --delete --yes ${PURGE_ARG[@]+"${PURGE_ARG[@]}"}
@@ -112,13 +143,27 @@ instance_facts() { # prints "LaunchTime State" of the instance
   "${AWS[@]}" ec2 describe-instances --instance-ids "$1" --query 'Reservations[0].Instances[0].[LaunchTime,State.Name]' --output text | tr '\t' ' '
 }
 
-say "== 1. creating $STACK from the v0.1.1 template in $REGION (about 10 minutes)"
-"$DEPLOY" "${DEPLOY_ARGS[@]}" --stack-name "$STACK" --email "$EMAIL" --version v0.1.1 --template "$OLD_TEMPLATE" \
-  --instance-type t4g.medium --volume-size 20 --daily-snapshots 0 || die "the v0.1.1 stack could not be created; look in the CloudFormation console, delete the stack $STACK if it exists"
+ami_param() { # the stack's AmiId parameter
+  "${AWS[@]}" cloudformation describe-stacks --stack-name "$STACK" --query "Stacks[0].Parameters[?ParameterKey=='AmiId'].ParameterValue" --output text
+}
+if [[ $CONSOLE -eq 1 ]]; then
+  say "== 1. creating $STACK from the v0.1.1 template in $REGION the console's way, AmiId empty (about 10 minutes)"
+  console_params >"$WORK/params.json"
+  { "${AWS[@]}" cloudformation create-stack --stack-name "$STACK" --template-body "file://$OLD_TEMPLATE" --capabilities CAPABILITY_IAM \
+      --tags Key=Application,Value=supavise --parameters "file://$WORK/params.json" >/dev/null \
+    && "${AWS[@]}" cloudformation wait stack-create-complete --stack-name "$STACK"; } \
+    || die "the v0.1.1 stack could not be created; look in the CloudFormation console, delete the stack $STACK if it exists"
+else
+  say "== 1. creating $STACK from the v0.1.1 template in $REGION (about 10 minutes)"
+  "$DEPLOY" "${DEPLOY_ARGS[@]}" --stack-name "$STACK" --email "$EMAIL" --version v0.1.1 --template "$OLD_TEMPLATE" \
+    --instance-type t4g.medium --volume-size 20 --daily-snapshots 0 || die "the v0.1.1 stack could not be created; look in the CloudFormation console, delete the stack $STACK if it exists"
+fi
 INSTANCE=$(out_of InstanceId); BACKUP=$(out_of BackupBucket); VOLUME=$(out_of DataVolumeId)
 [[ -n $INSTANCE && $INSTANCE != None ]] || die "the stack has no InstanceId output"
 BEFORE=$(instance_facts "$INSTANCE")
 say "== 2. the instance before: $INSTANCE $BEFORE"
+AMI_BEFORE=""
+if [[ $CONSOLE -eq 1 ]]; then AMI_BEFORE=$(ami_param || true); fi
 
 # shellcheck disable=SC2329  # run by the EXIT trap
 cleanup() {
@@ -193,6 +238,18 @@ SECOND_RC=$?
 set -e
 rc=0; [[ $SECOND_RC -eq 0 ]] && grep -q 'Nothing to change' "$SECOND" || rc=1
 report "a second update finds nothing to change" "$rc"
+if [[ $CONSOLE -eq 1 ]]; then
+  rc=0; [[ -z $AMI_BEFORE || $AMI_BEFORE == None ]] || rc=1
+  report "the stack was made with an empty AmiId, as the console makes it (it had: ${AMI_BEFORE:-nothing})" "$rc"
+  IMAGE=$("${AWS[@]}" ec2 describe-instances --instance-ids "$INSTANCE" --query 'Reservations[0].Instances[0].ImageId' --output text || true)
+  AMI_AFTER=$(ami_param || true)
+  rc=0; [[ -n $IMAGE && $AMI_AFTER == "$IMAGE" ]] || rc=1
+  report "the stack's AmiId is the image the instance runs ($AMI_AFTER, instance: $IMAGE)" "$rc"
+  POLICY=$("${AWS[@]}" cloudformation get-stack-policy --stack-name "$STACK" --query StackPolicyBody --output text || true)
+  rc=0; [[ $POLICY == *'"Allow"'* && $POLICY != *'"Deny"'* ]] || rc=1
+  report "the stack policy allows every update again (the guard is off): $POLICY" "$rc"
+  say "INFO  the review called the instance: $(grep -m1 'Instance (AWS::EC2::Instance)' "$UPDATE_LOG" | sed 's/^ *//' || true)"
+fi
 
 cat <<LIST
 

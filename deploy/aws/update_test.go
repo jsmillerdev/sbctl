@@ -37,7 +37,14 @@ case "$*" in
     f="$DIR/stack-$(arg --stack-name "$@").json"; [ -f "$f" ] || f="$DIR/stack.json"
     if [ ! -f "$f" ]; then echo "An error occurred (ValidationError) when calling the DescribeStacks operation: Stack with id x does not exist" >&2; exit 254; fi
     cat "$f" ;;
-  *"cloudformation describe-stacks"*"Stacks[0].StackStatus"*) echo "${NEW_STACK_STATUS-CREATE_IN_PROGRESS}" ;;
+  *"cloudformation describe-stacks"*"Stacks[0].StackStatus"*)
+    # STATUS_SEQ: the status each look returns in turn (the last one repeats).
+    if [ -n "$STATUS_SEQ" ]; then
+      i=$(grep -c 'Stacks\[0\]\.StackStatus' "$DIR/calls.log"); set -- $STATUS_SEQ
+      while [ "$i" -gt 1 ] && [ $# -gt 1 ]; do shift; i=$((i - 1)); done
+      echo "$1"; exit 0
+    fi
+    echo "${NEW_STACK_STATUS-CREATE_IN_PROGRESS}" ;;
   *"cloudformation describe-stack-resource"*) printf 'CREATE_COMPLETE\t203.0.113.77\n' ;;
   *"cloudformation create-change-set"*)
     p=$(arg --parameters "$@"); cp "${p#file://}" "$DIR/params-$n.json"
@@ -47,11 +54,30 @@ case "$*" in
   *"cloudformation wait change-set-create-complete"*) exit "${CS_WAIT_RC-0}" ;;
   *"cloudformation describe-change-set"*"StatusReason"*) echo "${CS_REASON-}" ;;
   *"cloudformation describe-change-set"*)
+    # OLD_CLI: an AWS CLI from before --include-property-values, which refuses it as the CLI does.
+    case "$*" in *--include-property-values*) if [ -n "$OLD_CLI" ]; then
+      printf '\nusage: aws [options] <command> <subcommand> [<subcommand> ...] [parameters]\nTo see help text, you can run:\n\n  aws help\n\nUnknown options: --include-property-values\n' >&2; exit 252
+    fi ;; esac
     f="$DIR/changeset-$n.json"; [ -f "$f" ] || f="$DIR/changeset.json"; cat "$f" ;;
+  *"cloudformation get-stack-policy"*)
+    if [ -n "$GET_POLICY_FAILS" ]; then echo "An error occurred (AccessDenied) when calling the GetStackPolicy operation: not allowed" >&2; exit 254; fi
+    # stack-policy.json: the stack's own policy; without it the stack has none, and the CLI prints {}.
+    if [ -f "$DIR/stack-policy.json" ]; then python3 -c 'import json, sys; print(json.dumps({"StackPolicyBody": open(sys.argv[1]).read()}))' "$DIR/stack-policy.json"; else echo '{}'; fi ;;
+  *"cloudformation set-stack-policy"*)
+    # Each policy set is kept as policy-<k>.json; SET_POLICY_FAILS_AT=k makes the k-th call fail.
+    k=$(grep -c 'cloudformation set-stack-policy' "$DIR/calls.log")
+    b=$(arg --stack-policy-body "$@"); cp "${b#file://}" "$DIR/policy-$k.json"
+    if [ "${SET_POLICY_FAILS_AT-0}" = "$k" ]; then echo "An error occurred (AccessDenied) when calling the SetStackPolicy operation: not allowed" >&2; exit 254; fi ;;
+  *"cloudformation describe-stack-events"*)
+    if [ -f "$DIR/events.json" ]; then cat "$DIR/events.json"; else echo '{"StackEvents": []}'; fi ;;
   *"cloudformation get-template"*)
     if [ -n "$GET_TEMPLATE_FAILS" ]; then echo "An error occurred (AccessDenied) when calling the GetTemplate operation" >&2; exit 254; fi
     python3 -c 'import json, sys; print(json.dumps(open(sys.argv[1]).read()))' "$DIR/template-$n.yaml" ;;
-  *"cloudformation wait stack-update-complete"*) exit "${STACK_WAIT_RC-0}" ;;
+  *"cloudformation wait stack-update-complete"*)
+    # WAIT_HANGS=n: the first n waits hang (until a signal ends them), each leaving waiting-<k> behind.
+    k=$(grep -c 'wait stack-update-complete' "$DIR/calls.log")
+    if [ "$k" -le "${WAIT_HANGS-0}" ]; then touch "$DIR/waiting-$k"; sleep 30; fi
+    exit "${STACK_WAIT_RC-0}" ;;
   *"cloudformation wait stack-create-complete"*) exit "${CREATE_WAIT_RC-${STACK_WAIT_RC-0}}" ;;
   *"ec2 describe-addresses"*)
     if [ -n "$ADDRESS_FAILS" ]; then echo "An error occurred (UnauthorizedOperation)" >&2; exit 254; fi
@@ -127,14 +153,21 @@ func (f *updFake) first(sub string) int {
 	return -1
 }
 
-// run runs deploy.sh with the stub on the path. The metadata service is unreachable unless the
+// command is deploy.sh with the stub on the path. The metadata service is unreachable unless the
 // test sets SUPAVISE_IMDS_ENDPOINT; the release key and base URL are the test's when it sets them.
-func (f *updFake) run(env []string, args ...string) result {
+func (f *updFake) command(env []string, args ...string) *exec.Cmd {
 	f.t.Helper()
 	script, _ := filepath.Abs("deploy.sh")
 	cmd := exec.Command(bashes(f.t)[0], append([]string{script}, args...)...)
 	base := []string{"PATH=" + f.dir + ":/usr/bin:/bin", "HOME=" + f.t.TempDir(), "TMPDIR=" + f.t.TempDir(), "SUPAVISE_IMDS_ENDPOINT=http://127.0.0.1:1"}
 	cmd.Env = append(append(base, f.env...), env...)
+	return cmd
+}
+
+// run runs deploy.sh (command) and returns what it printed and its exit status.
+func (f *updFake) run(env []string, args ...string) result {
+	f.t.Helper()
+	cmd := f.command(env, args...)
 	var so, se strings.Builder
 	cmd.Stdout, cmd.Stderr = &so, &se
 	err := cmd.Run()
@@ -1391,11 +1424,16 @@ func TestHelpListsTheNewCommands(t *testing.T) {
 
 // ---- the classifier --------------------------------------------------------------------------------
 
-// classify runs the review of a change set file the way update does.
+// classify runs the review of a change set file the way update does: a file of testdata, or a
+// file at an absolute path.
 func classify(t *testing.T, file string, flags ...string) (stdout string, code int) {
 	t.Helper()
 	script, _ := filepath.Abs("deploy.sh")
-	args := append([]string{script, "__classify", filepath.Join("testdata", file)}, flags...)
+	path := file
+	if !filepath.IsAbs(file) {
+		path = filepath.Join("testdata", file)
+	}
+	args := append([]string{script, "__classify", path}, flags...)
 	cmd := exec.Command(bashes(t)[0], args...)
 	cmd.Env = []string{"PATH=/usr/bin:/bin", "HOME=" + t.TempDir()}
 	var so, se strings.Builder
@@ -1456,6 +1494,22 @@ func TestClassifier(t *testing.T) {
 			"REPLACE  DefaultRoute (AWS::EC2::Route) would be replaced: DestinationCidrBlock", "replace  PeerIngress1 (AWS::EC2::SecurityGroupIngress): CidrIp",
 			"replace  FencingPolicy (AWS::IAM::Policy): PolicyName", "5 change(s): 2 allowed, 3 refused, 0 blocked"}, nil},
 		{"nothing", "changeset-empty.json", nil, 0, []string{"(no resource changes)", "0 change(s)"}, nil},
+		// A stack made in the console: AmiId was empty, so the image came from {{resolve:ssm:...}}, and the
+		// update pins it to the image the instance runs. CloudFormation cannot tell whether the resolved
+		// value changes before the change set runs: the instance may be replaced (Conditional), and so may
+		// what refers to it. None of it is a replacement the review can rule out, and none is certain.
+		{"a stack made in the console is guarded, not refused", "changeset-console-stack.json", nil, 12, []string{
+			"guarded  Instance (AWS::EC2::Instance) may be replaced: Tags, ImageId, MetadataOptions; ImageId is resolved when the change set runs",
+			"guarded  DataVolumeAttachment (AWS::EC2::VolumeAttachment) may be replaced: InstanceId; InstanceId follows Instance",
+			"guarded  DataVolume (AWS::EC2::Volume): AvailabilityZone; AvailabilityZone follows Instance",
+			"guarded  ElasticIpAssociation (AWS::EC2::EIPAssociation) may be replaced: AllocationId, InstanceId; AllocationId follows ElasticIp, InstanceId follows Instance",
+			"modify   ElasticIp (AWS::EC2::EIP): Tags (no interruption)", "add      ObjectsBucketPolicy (AWS::S3::BucketPolicy)",
+			"10 change(s): 6 allowed, 0 refused, 0 blocked, 4 guarded"}, []string{"REPLACE", "MODIFY", "REMOVE"}},
+		{"with the values of the properties, the same image is shown", "changeset-console-stack-values.json", nil, 12, []string{
+			"guarded  Instance (AWS::EC2::Instance) may be replaced: Tags, ImageId, MetadataOptions; ImageId is resolved when the change set runs, ImageId stays ami-0bbbbbbbbbbbbbbbb",
+			"4 guarded"}, []string{"REPLACE"}},
+		{"the guarded instance after a failover is blocked", "changeset-console-stack.json", []string{"--failed-over"}, 11, []string{
+			"Instance (AWS::EC2::Instance): the service address is on another server after a failover", "ElasticIpAssociation (AWS::EC2::EIPAssociation): the service address is on another server"}, nil},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

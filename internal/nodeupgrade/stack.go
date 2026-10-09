@@ -26,7 +26,8 @@ type StackOutcome struct {
 }
 
 // StackError is the stack update ending without success: the script's exit status (2 refused
-// the change set, 3 failed) and what it said.
+// the change set, 3 failed, including a guarded update that CloudFormation rolled back) and what it
+// said.
 type StackError struct {
 	Code int
 	Err  error
