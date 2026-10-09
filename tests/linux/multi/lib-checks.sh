@@ -220,10 +220,15 @@ c_prep() {
 }
 
 c_net() {
-  local n=$1 code
+  local n=$1 code i
   needs "prep@$n" services
-  code=$(on "$n" curl -sL -o /dev/null -w '%{http_code}' -m 30 https://github.com/supabase/slim-services) || true
-  [[ $code == 200 ]] || fail "$n: github.com answered '$code'"
+  # github.com answers 502/504 now and then, and the check asks whether the machine reaches the internet: asked again.
+  for ((i = 0; i < 5; i++)); do
+    code=$(on "$n" curl -sL -o /dev/null -w '%{http_code}' -m 30 https://github.com/supabase/slim-services) || true
+    [[ $code == 200 ]] && break
+    sleep 5
+  done
+  [[ $code == 200 ]] || fail "$n: github.com answered '$code' five times"
   code=$(on "$n" curl -s -o /dev/null -w '%{http_code}' -m 10 "http://$BRIDGE_IP:$S3_PORT/") || true
   [[ $code =~ ^(200|400|403|404)$ ]] || fail "$n: Garage on the bridge answered '$code'"
   code=$(on "$n" curl -s -o /dev/null -w '%{http_code}' -m 10 "http://$BRIDGE_IP:$RELEASE_PORT/download/v0.0.1/SHA256SUMS") || true
