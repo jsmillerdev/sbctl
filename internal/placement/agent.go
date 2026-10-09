@@ -345,7 +345,7 @@ func (a *NodeAgent) Ensure(ctx context.Context, spec peerapi.InstanceSpec) (peer
 			}
 			a.resume(in) // interrupted by a restart of the daemon
 		}
-		return a.status(ctx, in), nil
+		return a.status(ctx, in, nil), nil
 	}
 	p, err := a.o.Registry.GetProject(ctx, ref)
 	if err != nil {
@@ -378,7 +378,7 @@ func (a *NodeAgent) Ensure(ctx context.Context, spec peerapi.InstanceSpec) (peer
 	a.mu.Unlock()
 	a.persist(in)
 	a.run(in, false)
-	return a.status(ctx, in), nil
+	return a.status(ctx, in, nil), nil
 }
 
 // recorded returns the identifier of the replica of ref that this node holds a record of: one it
@@ -518,20 +518,33 @@ func (a *NodeAgent) waitStreaming(ctx context.Context, t lifecycle.ReplicaTarget
 	}
 }
 
+// projectIndex is the project rows of one observation pass by ref, so that the pass reads the registry
+// once and not once per replica. A nil index makes each observation read its project itself.
+type projectIndex map[string]*registry.Project
+
 // status is what the node sees of in: the setup's step and failure, and the standby's state.
-func (a *NodeAgent) status(ctx context.Context, in *instance) peerapi.InstanceStatus {
+func (a *NodeAgent) status(ctx context.Context, in *instance, ps projectIndex) peerapi.InstanceStatus {
 	step, errc, detail, _ := a.snapshot(in)
 	st := peerapi.InstanceStatus{Identifier: in.spec.Identifier, Ref: in.spec.Ref, Role: lifecycle.ReplicaRoleAbsent,
 		Step: step, Error: errc, Detail: detail, At: a.o.Now()}
-	a.observe(ctx, &st)
+	a.observe(ctx, &st, ps)
 	return st
 }
 
 // observe fills the live fields of st from the standby.
-func (a *NodeAgent) observe(ctx context.Context, st *peerapi.InstanceStatus) {
-	t, err := a.target(ctx, st.Identifier, "", false)
-	if err != nil {
-		return
+func (a *NodeAgent) observe(ctx context.Context, st *peerapi.InstanceStatus, ps projectIndex) {
+	var t lifecycle.ReplicaTarget
+	if ps == nil {
+		var err error
+		if t, err = a.target(ctx, st.Identifier, "", false); err != nil {
+			return
+		}
+	} else {
+		ref, err := refOf(st.Identifier)
+		if err != nil || ps[ref] == nil {
+			return // no such project: what target reports as an error
+		}
+		t = lifecycle.ReplicaTarget{Identifier: st.Identifier, Project: ps[ref]}
 	}
 	obs := a.o.Plane.ObserveReplica(ctx, t)
 	st.Role = obs.Role
@@ -541,16 +554,21 @@ func (a *NodeAgent) observe(ctx context.Context, st *peerapi.InstanceStatus) {
 
 // Observe implements Agent.
 func (a *NodeAgent) Observe(ctx context.Context, identifier string) (peerapi.InstanceStatus, error) {
+	return a.observeIn(ctx, identifier, nil)
+}
+
+// observeIn is Observe with the project rows of the pass (nil reads the project from the registry).
+func (a *NodeAgent) observeIn(ctx context.Context, identifier string, ps projectIndex) (peerapi.InstanceStatus, error) {
 	ref, err := refOf(identifier)
 	if err != nil {
 		return peerapi.InstanceStatus{}, err
 	}
 	if in := a.get(identifier); in != nil {
-		return a.status(ctx, in), nil
+		return a.status(ctx, in, ps), nil
 	}
 	// A replica this node holds no record of (the file was lost): report what the cluster says.
 	st := peerapi.InstanceStatus{Identifier: identifier, Ref: ref, Role: lifecycle.ReplicaRoleAbsent, Step: registry.ReplicaStepRequested, At: a.o.Now()}
-	a.observe(ctx, &st)
+	a.observe(ctx, &st, ps)
 	if st.Role != lifecycle.ReplicaRoleAbsent {
 		st.Step = StepCompleted
 	}
@@ -558,8 +576,8 @@ func (a *NodeAgent) Observe(ctx context.Context, identifier string) (peerapi.Ins
 }
 
 // ObserveAll observes every replica this node holds, for the report to the leader, a few at a time
-// (AgentOptions.Concurrency): each observation runs SQL and HTTP probes of its own. The result is in
-// the order of the identifiers.
+// (AgentOptions.Concurrency): each observation runs SQL and HTTP probes of its own. The pass lists the
+// projects once. The result is in the order of the identifiers.
 func (a *NodeAgent) ObserveAll(ctx context.Context) []peerapi.InstanceStatus {
 	ids := map[string]bool{}
 	for id := range a.known() {
@@ -577,6 +595,16 @@ func (a *NodeAgent) ObserveAll(ctx context.Context) []peerapi.InstanceStatus {
 		order = append(order, id)
 	}
 	slices.Sort(order)
+	// The projects are listed once for the whole pass; if the list cannot be read, each replica reads its own.
+	var ps projectIndex
+	if len(order) > 0 {
+		if rows, err := a.o.Registry.ListProjects(ctx); err == nil {
+			ps = make(projectIndex, len(rows))
+			for i := range rows {
+				ps[rows[i].Ref] = &rows[i]
+			}
+		}
+	}
 	type observed struct {
 		id string
 		st *peerapi.InstanceStatus
@@ -586,7 +614,7 @@ func (a *NodeAgent) ObserveAll(ctx context.Context) []peerapi.InstanceStatus {
 		got[i] = &observed{id: id}
 	}
 	EachLimit(ctx, a.o.Concurrency, got, func(o *observed) {
-		if st, err := a.Observe(ctx, o.id); err == nil {
+		if st, err := a.observeIn(ctx, o.id, ps); err == nil {
 			o.st = &st
 		}
 	})

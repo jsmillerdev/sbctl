@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -1177,5 +1178,64 @@ func TestDemoteOfTheSystemClusterNeedsNoRegistry(t *testing.T) {
 	}
 	if e.a.get(id) == nil {
 		t.Fatal("the demoted cluster is not recorded as a replica")
+	}
+}
+
+// countingRegistry counts the project reads of an observation pass.
+type countingRegistry struct {
+	registry.Registry
+	mu          sync.Mutex
+	gets, lists int
+	listErr     error
+}
+
+func (c *countingRegistry) GetProject(ctx context.Context, ref string) (*registry.Project, error) {
+	c.mu.Lock()
+	c.gets++
+	c.mu.Unlock()
+	return c.Registry.GetProject(ctx, ref)
+}
+
+func (c *countingRegistry) ListProjects(ctx context.Context) ([]registry.Project, error) {
+	c.mu.Lock()
+	c.lists++
+	c.mu.Unlock()
+	if c.listErr != nil {
+		return nil, c.listErr
+	}
+	return c.Registry.ListProjects(ctx)
+}
+
+// A pass over the node's replicas reads the projects once, not once per replica; if the list cannot be
+// read, each replica reads its own project and the report is the same.
+func TestObserveAllReadsTheProjectsOncePerPass(t *testing.T) {
+	ctx := context.Background()
+	e := newAgentEnv(t)
+	for i := 0; i < 5; i++ {
+		ref := strings.Map(func(r rune) rune { return 'a' + (r - '0') }, fmt.Sprintf("%020d", i))
+		if err := e.reg.CreateProject(ctx, &registry.Project{Ref: ref, Name: ref, Class: "micro", Engine: registry.EnginePostgres, NodeID: "n1"}); err != nil {
+			t.Fatal(err)
+		}
+		id := registry.ReplicaIdentifier(ref, "us-east-1", "abc123")
+		if err := e.reg.CreateReplica(ctx, &registry.Replica{Identifier: id, Ref: ref, NodeID: "n2"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cr := &countingRegistry{Registry: e.reg}
+	e.a.o.Registry = cr
+	want := e.a.ObserveAll(ctx)
+	if len(want) != 5 || cr.lists != 1 || cr.gets != 0 {
+		t.Fatalf("%d replicas reported with %d lists and %d project reads", len(want), cr.lists, cr.gets)
+	}
+	cr.lists, cr.listErr = 0, errors.New("registry down")
+	got := e.a.ObserveAll(ctx)
+	if cr.gets != 5 || len(got) != len(want) {
+		t.Fatalf("%d replicas reported with %d project reads", len(got), cr.gets)
+	}
+	for i := range got {
+		got[i].At, want[i].At = time.Time{}, time.Time{}
+		if !reflect.DeepEqual(got[i], want[i]) {
+			t.Fatalf("report %d differs: %+v and %+v", i, got[i], want[i])
+		}
 	}
 }
