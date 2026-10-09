@@ -10,6 +10,8 @@ import (
 	"runtime"
 	"testing"
 	"time"
+
+	"github.com/supavise/supavise/internal/storageattr"
 )
 
 func walkAll(t *testing.T, root string, o WalkStorageOptions) []StorageObject {
@@ -28,7 +30,7 @@ func TestWalkStorageReportsObjectsInPathOrder(t *testing.T) {
 	typed := e.putObject(t, testRef, "avatars/me.png/v1", []byte("one"), base.Add(time.Hour))
 	e.putObject(t, testRef, "docs/Résumé.pdf/v1", []byte("pdf!"), base.Add(2*time.Hour))
 	hasAttrs := setContentType(t, typed, "image/png")
-	if ok, err := writeStorageAttrs(typed, map[string][]byte{storageAttrPrefixes[0] + "cache-control": []byte("max-age=3600")}); err != nil || ok != hasAttrs {
+	if ok, err := writeStorageAttrs(typed, map[string][]byte{storageattr.Prefixes[0] + "cache-control": []byte("max-age=3600")}); err != nil || ok != hasAttrs {
 		t.Fatalf("cache-control attribute: %v, %v", ok, err)
 	}
 

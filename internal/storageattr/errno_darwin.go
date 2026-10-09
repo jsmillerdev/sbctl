@@ -1,8 +1,8 @@
-//go:build linux
+//go:build darwin
 
-package backup
+package storageattr
 
 import "golang.org/x/sys/unix"
 
 // errNoAttr is what a missing extended attribute reports.
-var errNoAttr = unix.ENODATA
+var errNoAttr = unix.ENOATTR
