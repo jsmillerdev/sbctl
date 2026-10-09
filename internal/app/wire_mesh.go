@@ -319,6 +319,40 @@ func wireMesh(ctx context.Context, w *Wire) error {
 	return startCluster(ctx, w, boot, dir)
 }
 
+// errPromoting is the answer of the system cluster's recovery probe while a standby has been promoted but
+// still listens on the replica port: the promotion ends with a restart on the system port, and the node
+// is the leader only after it.
+var errPromoting = errors.New("the system cluster was promoted and is not on the system port yet")
+
+// systemInRecovery is the membership's probe of the system cluster. dsns are the sockets it may answer
+// on and system is the one on the system port. Any standby that answers says the node follows. A primary
+// on the system port says it leads. A primary on the replica port only is a promotion half done (pg_promote
+// has run, the restart on the system port has not): the role stays as it was. Taking it for the leader
+// then starts the leader's shared services against a cluster that the promotion is about to stop.
+func systemInRecovery(dsns []string, system string, probe func(ctx context.Context, dsn string) (bool, error)) func(ctx context.Context) (bool, error) {
+	return func(ctx context.Context) (bool, error) {
+		var last error
+		promoting := false
+		for _, dsn := range dsns {
+			rec, err := probe(ctx, dsn)
+			switch {
+			case err != nil:
+				last = err
+			case rec:
+				return true, nil
+			case dsn == system:
+				return false, nil
+			default:
+				promoting = true
+			}
+		}
+		if promoting {
+			return false, errPromoting
+		}
+		return false, last
+	}
+}
+
 // startCluster builds the membership, the mesh and the leader's authority for a node that belongs to
 // a cluster, and registers the workers.
 func startCluster(ctx context.Context, w *Wire, boot cluster.BootDecision, dir string) error {
@@ -349,17 +383,7 @@ func startCluster(ctx context.Context, w *Wire, boot cluster.BootDecision, dir s
 	live := cluster.NewLive(cluster.LiveOptions{
 		Cfg: cfg, Reg: reg, SelfID: selfID, Boot: boot, Log: log,
 		Fence: fencer.fence, Marker: &lazyMarker{cfg: cfg},
-		InRecovery: func(ctx context.Context) (bool, error) {
-			var last error
-			for _, dsn := range dsns {
-				rec, err := cluster.InRecovery(ctx, dsn)
-				if err == nil {
-					return rec, nil
-				}
-				last = err
-			}
-			return false, last
-		},
+		InRecovery: systemInRecovery(dsns, RegistryDSNs(cfg)[0], cluster.InRecovery),
 		OnFenced: func(rec cluster.FencedRecord) {
 			_ = alerts.Notify(context.Background(), alerts.Event{
 				Kind: alerts.KindFenced, Severity: alerts.SeverityCritical, Title: "This node is fenced",
