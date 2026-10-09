@@ -499,7 +499,7 @@ c_rejoin() {
 # ---- 7. upgrade ------------------------------------------------------------------------------------------------------
 # upgrade_one NODE: supavise upgrade to v0.0.2 on NODE, which restarts no PostgreSQL cluster, and the cluster after it.
 upgrade_one() {
-  local n=$1 lead other ref ident id secs
+  local n=$1 lead other ref ident id secs out rc=0
   lead=$(lead)
   node_push "$n" "$WORK/keys/pub.pem" /root/release-pub.pem
   onl "$n" unit_stamp >"$WORK/stamp-$n.before"
@@ -508,9 +508,20 @@ upgrade_one() {
   [[ $(wc -l <"$WORK/stamp-$n.before") -ge 3 ]] && ! grep -q ' none$' "$WORK/stamp-$n.before" \
     || fail "$n: the stamp of the PostgreSQL clusters is not complete: $(cat "$WORK/stamp-$n.before")"
   log "$n: $(on "$n" /usr/local/bin/supavise --version | head -n1) -> v0.0.2; PostgreSQL clusters here: $(wc -l <"$WORK/stamp-$n.before")"
+  out=$WORK/upgrade-$n.out
   on "$n" timeout 3000 /usr/local/bin/supavise upgrade --repo o/r --api-base "http://$BRIDGE_IP:$RELEASE_PORT" \
-    --public-key-file /root/release-pub.pem --yes --version v0.0.2 \
-    || fail "$n: supavise upgrade exited $?"
+    --public-key-file /root/release-pub.pem --yes --version v0.0.2 >"$out" 2>&1 || rc=$?
+  cat "$out"
+  [[ $rc -eq 0 ]] || fail "$n: supavise upgrade exited $rc"
+  # The leader announces maintenance before it stops anything, so that no automatic failover fires while its daemon
+  # restarts (design 2.10.7), and clears it when the run ends. A follower announces nothing.
+  if [[ $n == "$lead" ]]; then
+    grep -q 'announced maintenance on' "$out" || fail "$n: the leader's upgrade did not announce maintenance"
+    [[ $(onl "$n" reg "select maintenance::text from supavise.cluster") == '{}' ]] \
+      || fail "$n: the maintenance announcement is still there after the upgrade: $(onl "$n" reg "select maintenance::text from supavise.cluster")"
+  else
+    ! grep -q 'announced maintenance on' "$out" || fail "$n: a follower announced maintenance"
+  fi
   [[ $(on "$n" /usr/local/bin/supavise --version) == *v0.0.2* ]] || fail "$n: the installed binary is $(on "$n" /usr/local/bin/supavise --version)"
   [[ $(onl "$n" daemon_version) == *v0.0.2* ]] || fail "$n: the daemon runs $(onl "$n" daemon_version)"
   [[ $n != "$lead" ]] || onl "$n" wait_healthy 300
