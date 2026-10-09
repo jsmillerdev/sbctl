@@ -1,6 +1,7 @@
 package api
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -159,9 +160,9 @@ func ssoError(err error) error {
 	if errors.As(err, &ae) {
 		switch {
 		case ae.Status == http.StatusNotFound:
-			return errf(http.StatusNotFound, "%s", firstNonEmpty(ae.Message, "SSO provider not found"))
+			return errf(http.StatusNotFound, "%s", cmp.Or(ae.Message, "SSO provider not found"))
 		case ae.Status >= 400 && ae.Status < 500 && ae.Status != http.StatusUnauthorized && ae.Status != http.StatusForbidden:
-			return errf(ae.Status, "%s", firstNonEmpty(ae.Message, "the sign-in service refused the request"))
+			return errf(ae.Status, "%s", cmp.Or(ae.Message, "the sign-in service refused the request"))
 		}
 		return errf(http.StatusBadGateway, "the sign-in service answered %d", ae.Status)
 	}

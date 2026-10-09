@@ -64,17 +64,12 @@ type backupInfo struct {
 	window           backup.RestoreWindow
 }
 
-// isRunning reports whether p's cluster is up: the restore window then reaches to now.
-func isRunning(p *registry.Project) bool {
-	return p.Status == registry.StatusActiveHealthy || p.Status == registry.StatusActiveUnhealthy
-}
-
 // restorable refuses a restore of a project that is not running with 409, before the request's
 // time or backup is judged: the cluster must be up, and the window of a project that is not running
 // (one that is already RESTORING, for instance) says nothing about what a restore could reach.
 // A project whose last restore failed can be restored again; its window then comes from the archive alone.
 func restorable(p *registry.Project) error {
-	if !isRunning(p) && p.Status != registry.StatusRestoreFailed {
+	if !p.Status.Running() && p.Status != registry.StatusRestoreFailed {
 		return errf(http.StatusConflict, "Cannot restore project %s while it is %s", p.Ref, p.Status)
 	}
 	return nil
@@ -93,7 +88,7 @@ func (s *Server) backupInfoOf(ctx context.Context, p *registry.Project) (backupI
 		return bi, nil
 	}
 	bi.enabled = true
-	w, err := s.backups.RestoreWindow(ctx, p.Ref, isRunning(p))
+	w, err := s.backups.RestoreWindow(ctx, p.Ref, p.Status.Running())
 	if err != nil {
 		s.log.Warn("could not read the backups", "ref", p.Ref, "err", err)
 		return bi, errf(http.StatusBadGateway, "Could not read the project's backups from the backup storage; the Supavise log has the details")

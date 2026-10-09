@@ -5,7 +5,6 @@ import (
 	"net"
 	"net/http"
 
-	"github.com/supavise/supavise/internal/config"
 	"github.com/supavise/supavise/internal/projectconfig"
 	"github.com/supavise/supavise/internal/secrets"
 )
@@ -26,7 +25,7 @@ func (s *Server) serveTemplate(w http.ResponseWriter, r *http.Request) error {
 		return errf(http.StatusNotFound, "Not Found")
 	}
 	ref := r.PathValue("ref")
-	if ref == config.SystemRef || !secrets.ValidRef(ref) {
+	if !secrets.ValidRef(ref) {
 		return errf(http.StatusNotFound, "Not Found")
 	}
 	if !s.settings.TemplateTokenOK(ref, r.PathValue("name"), r.URL.Query().Get("t")) {
