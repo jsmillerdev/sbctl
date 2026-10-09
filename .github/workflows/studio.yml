@@ -45,3 +45,43 @@ jobs:
           name: studio-spike-${{ matrix.platform }}
           path: studio/.build-cache/spike/out
           if-no-files-found: ignore
+
+  # The remote MCP endpoint end to end, on the Studio build the `build` job just made (amd64): the same
+  # walk as the `oauth-smoke` job of linux.yml (tests/linux/oauth-smoke.sh) with Studio running from the
+  # artifact, plus step L-09: MCP over Streamable HTTP at /mcp with two protocol revisions, a project-scoped
+  # and an account-scoped URL, read_only, features, a personal access token as bearer, get_project_url and
+  # create_project. It reuses the build's artifact, so it costs no second Studio build. `!cancelled()` runs
+  # it when only the spike (or the arm64 build) failed; a missing amd64 artifact fails the download step.
+  mcp-e2e:
+    needs: build
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: actions/download-artifact@v4
+        with:
+          name: studio-linux-amd64
+          path: /tmp/studio-dist
+      - name: build supavise
+        run: CGO_ENABLED=0 go build -trimpath -o /tmp/supavise ./cmd/supavise
+      - name: mcp end to end
+        run: |
+          ls -l /tmp/studio-dist
+          sudo env "PATH=$PATH" LOG_DIR=/tmp/supavise-mcp-logs SUPAVISE_BIN=/tmp/supavise \
+            tests/linux/oauth-smoke.sh --studio-artifact "$(ls /tmp/studio-dist/supavise-studio-*-linux-amd64.tar.zst)"
+      - if: always()
+        name: collect logs
+        run: sudo chmod -R a+rX /tmp/supavise-mcp-logs || true
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mcp-e2e
+          path: /tmp/supavise-mcp-logs
+          if-no-files-found: ignore
