@@ -118,15 +118,24 @@ func (n *Notifier) NotifyBounded(ctx context.Context, ev Event) error {
 
 // NotifyDetached delivers ev on a goroutine of its own, on NotifyBounded's kind of context, so that
 // a slow webhook does not hold up the request or the upgrade that raised the event. A failure to
-// send is logged and never reaches the caller. Drain waits for the deliveries still in flight.
+// send is logged ("could not send the alert") and never reaches the caller. Drain waits for the
+// deliveries still in flight.
 func (n *Notifier) NotifyDetached(ctx context.Context, ev Event) {
+	n.NotifyDetachedFunc(ctx, ev, func(err error) {
+		n.log.Warn("could not send the alert", "kind", ev.Kind, "ref", ev.Ref, "error", err)
+	})
+}
+
+// NotifyDetachedFunc is NotifyDetached for a caller that reports a failure to send in its own
+// words: failed is called, on the delivery's goroutine, with the error Notify returned.
+func (n *Notifier) NotifyDetachedFunc(ctx context.Context, ev Event, failed func(error)) {
 	ctx, cancel := detach(ctx)
 	n.wg.Add(1)
 	go func() {
 		defer n.wg.Done()
 		defer cancel()
 		if err := n.Notify(ctx, ev); err != nil {
-			n.log.Warn("could not send the alert", "kind", ev.Kind, "ref", ev.Ref, "error", err)
+			failed(err)
 		}
 	}()
 }

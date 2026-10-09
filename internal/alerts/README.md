@@ -9,7 +9,7 @@ alerts.Notify(ctx, alerts.Event{Kind: alerts.KindUpgradeFailed, Severity: "criti
 
 `Notify` uses the node's default `Notifier` (`alerts.Configure(cfg, log)` sets it; the daemon does at start). Without one it does nothing and returns nil, so raising an event never fails the work that raised it. Every event is also logged under the message key `alert`, with `kind`, `severity`, `ref`, `title` and `detail`, whether or not a destination exists.
 
-A caller that must not wait for the delivery uses `Notifier.NotifyDetached(ctx, ev)`: it sends on a goroutine of its own, on a context that outlives `ctx` and ends after 90 seconds, and logs a failure (`could not send the alert`). `Notifier.Drain()` waits for the deliveries in flight, which the daemon does when it stops. `Notifier.NotifyBounded` is the same context for a caller that waits and wants the error (the CLI's upgrade hooks).
+A caller that must not wait for the delivery uses `Notifier.NotifyDetached(ctx, ev)`: it sends on a goroutine of its own, on a context that outlives `ctx` and ends after 90 seconds, and logs a failure (`could not send the alert`). `NotifyDetachedFunc(ctx, ev, failed)` is the same for a caller that words the failure itself (the daemon's upgrade and OAuth hooks do). `Notifier.Drain()` waits for the deliveries in flight, which the daemon does when it stops. `Notifier.NotifyBounded` is the same context for a caller that waits and wants the error (the CLI's upgrade hooks).
 
 ## Kinds
 

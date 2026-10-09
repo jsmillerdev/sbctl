@@ -1028,3 +1028,28 @@ func TestNotifyDetachedLogsAFailureAndNotifyBoundedReturnsIt(t *testing.T) {
 		t.Errorf("NotifyBounded on a canceled context: %v", err)
 	}
 }
+
+// NotifyDetachedFunc hands a failed delivery to the caller's own report, and Drain waits for it.
+func TestNotifyDetachedFuncReportsAFailureToTheCaller(t *testing.T) {
+	s := newSink(t)
+	s.setStatus(400)
+	n := New(testCfg(t, config.AlertWebhook{URL: s.srv.URL}), Options{})
+
+	var failed atomic.Int32
+	n.NotifyDetachedFunc(context.Background(), Event{Kind: KindUpgradeFailed, Title: "x"}, func(err error) {
+		if err == nil {
+			t.Error("failed was called with no error")
+		}
+		failed.Add(1)
+	})
+	n.Drain()
+	if failed.Load() != 1 {
+		t.Errorf("failed called %d times, want once", failed.Load())
+	}
+	s.setStatus(200)
+	n.NotifyDetachedFunc(context.Background(), Event{Kind: KindUpgradeFailed, Title: "y"}, func(error) { failed.Add(1) })
+	n.Drain()
+	if failed.Load() != 1 {
+		t.Errorf("failed called for a delivery that worked: %d", failed.Load())
+	}
+}

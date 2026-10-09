@@ -12,21 +12,23 @@ import (
 
 // upgradeAlerter turns the events of project upgrades (lifecycle.Options.UpgradeNotify) into
 // alerts. lifecycle cannot import alerts (alerts reads the node's health through lifecycle), so the
-// daemon passes this hook in. Delivery is detached (alerts.Notifier.NotifyDetached): a slow webhook
-// must not hold up the upgrade that raised the event, and a failure to send is logged, never the
-// upgrade's.
+// daemon passes this hook in. Delivery is detached (alerts.Notifier.NotifyDetachedFunc): a slow
+// webhook must not hold up the upgrade that raised the event, and a failure to send is logged, never
+// the upgrade's.
 type upgradeAlerter struct {
 	notifier *alerts.Notifier
+	log      *slog.Logger
 }
 
-// newUpgradeAlerter takes a logger for symmetry with newOAuthAlerter; the notifier logs a failed
-// delivery with its own.
-func newUpgradeAlerter(n *alerts.Notifier, _ *slog.Logger) *upgradeAlerter {
-	return &upgradeAlerter{notifier: n}
+func newUpgradeAlerter(n *alerts.Notifier, log *slog.Logger) *upgradeAlerter {
+	return &upgradeAlerter{notifier: n, log: log}
 }
 
 func (a *upgradeAlerter) notify(ctx context.Context, n lifecycle.UpgradeNotice) {
-	a.notifier.NotifyDetached(ctx, upgradeEvent(n))
+	ev := upgradeEvent(n)
+	a.notifier.NotifyDetachedFunc(ctx, ev, func(err error) {
+		a.log.Warn("could not send the upgrade alert", "kind", ev.Kind, "ref", ev.Ref, "error", err)
+	})
 }
 
 // wait lets the deliveries in flight finish when the daemon stops.

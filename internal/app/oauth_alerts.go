@@ -11,8 +11,8 @@ import (
 // oauthAlerter turns what the OAuth service raises (oauth.Service.Alert) into alerts. internal/oauth
 // does not import alerts, so the daemon hands the service this hook. The service calls it from the
 // token endpoint, on the request that replays a code or a refresh token, so delivery is detached
-// (alerts.Notifier.NotifyDetached): a slow webhook must not hold that request up, and a failure to
-// send is logged, never the request's.
+// (alerts.Notifier.NotifyDetachedFunc): a slow webhook must not hold that request up, and a failure
+// to send is logged, never the request's.
 type oauthAlerter struct {
 	notifier *alerts.Notifier
 	log      *slog.Logger
@@ -29,7 +29,9 @@ func (a *oauthAlerter) alert(ctx context.Context, e oauth.AlertEvent) {
 		a.log.Warn("an OAuth alert of an unknown kind was dropped", "kind", e.Kind)
 		return
 	}
-	a.notifier.NotifyDetached(ctx, ev)
+	a.notifier.NotifyDetachedFunc(ctx, ev, func(err error) {
+		a.log.Warn("could not send the OAuth alert", "kind", ev.Kind, "error", err)
+	})
 }
 
 // wait lets the deliveries in flight finish when the daemon stops.
