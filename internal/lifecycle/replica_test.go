@@ -968,6 +968,46 @@ func TestRunSchemaReloadSpreadsTheRefsAcrossTheInterval(t *testing.T) {
 	}
 }
 
+func TestRunSchemaReloadStopsPromptlyWhenCancelledBetweenRefs(t *testing.T) {
+	f := newReplicaFixture(t)
+	refs := []string{"aaaaaaaaaaaaaaaaaaaa", "bbbbbbbbbbbbbbbbbbbb"}
+	every := time.Second // the second ref waits 500 ms
+	sup := stampSup{replicaSup: f.sup, mu: &sync.Mutex{}, times: map[string][]time.Time{}}
+	f.pl.sup = sup
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		f.pl.RunSchemaReload(ctx, every, func(context.Context) ([]string, error) { return refs, nil })
+		close(done)
+	}()
+	first := config.UnitName(config.SvcPostgREST, refs[0])
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		sup.mu.Lock()
+		n := len(sup.times[first])
+		sup.mu.Unlock()
+		if n > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the reload did not reach the first ref")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(300 * time.Millisecond):
+		t.Fatal("RunSchemaReload kept waiting for the next ref after ctx was cancelled")
+	}
+	sup.mu.Lock()
+	defer sup.mu.Unlock()
+	if n := len(sup.times[config.UnitName(config.SvcPostgREST, refs[1])]); n != 0 {
+		t.Errorf("the second ref was signalled %d times after the cancel", n)
+	}
+}
+
 func signalsAvailable() bool {
 	_, err := exec.LookPath("sh")
 	return err == nil

@@ -56,8 +56,12 @@ func (pl *PostgresPlane) RunSchemaReload(ctx context.Context, every time.Duratio
 			continue
 		}
 		gap := every / time.Duration(max(len(rs), 1))
+		start := time.Now()
 		for i, ref := range rs {
-			if i > 0 && ctxutil.Sleep(ctx, gap) != nil {
+			// Each signal has its own moment in the round, counted from its start, so that the time
+			// ReloadSchema takes does not add up over the refs and the round ends before the next tick.
+			// The first ref is signalled at once.
+			if i > 0 && ctxutil.Sleep(ctx, time.Until(start.Add(time.Duration(i)*gap))) != nil {
 				return
 			}
 			if err := pl.ReloadSchema(ctx, ref); err != nil {
