@@ -1,0 +1,561 @@
+From 22dbada4d7c6343d636f6740e7a0f9d26d31b819 Mon Sep 17 00:00:00 2001
+From: supavise <supavise@users.noreply.invalid>
+Date: Thu, 8 Oct 2026 22:50:29 -0700
+Subject: [PATCH 4/4] feat(studio): serve the MCP route in platform mode
+ through the Management API
+
+Hosted runs the MCP server as a separate service, so /api/mcp answers 404
+in platform mode. A deployment that runs its own control plane has no such
+process, and Studio already bundles the server package with every tool.
+
+In platform mode the route now builds the package's Management API platform
+from the caller's bearer token (createSupabaseApiPlatform) and serves it over
+the same stateless JSON transport as the self-hosted route. The Management
+API URL is SUPAVISE_MANAGEMENT_API_URL, read for every request. Missing or
+malformed configuration answers 500, a missing bearer 401, a method other than
+POST 405.
+
+The query is checked strictly: project_ref must be 20 lowercase letters,
+read_only must be true or false (anything else is a 400, never a silent
+read-write server), features must name groups the package knows, and
+skip_elicitations is accepted and ignored because the stateless transport
+cannot ask the client. A project_ref scopes the server to the project and
+hides the account tools.
+
+get_project_url is answered from SUPAVISE_PROJECT_URL_TEMPLATE (for example
+https://{ref}.api.example.com): the package derives a hosted domain from the
+API host, which is wrong for any other host. The ref comes from a tool
+argument and is checked before it is put into the template.
+
+The route accepts bodies up to 8 MB (deploying an Edge Function sends the
+files). The token is never logged or put into a response.
+
+Only the pages router is changed; the TanStack twin of the route is not built
+by this deployment.
+---
+ apps/studio/lib/api/platform-mcp.test.ts | 322 +++++++++++++++++++++++
+ apps/studio/lib/api/platform-mcp.ts      | 136 ++++++++++
+ apps/studio/lib/hosted-api-allowlist.ts  |   1 +
+ apps/studio/pages/api/mcp/index.ts       |   9 +
+ 4 files changed, 468 insertions(+)
+ create mode 100644 apps/studio/lib/api/platform-mcp.test.ts
+ create mode 100644 apps/studio/lib/api/platform-mcp.ts
+
+diff --git a/apps/studio/lib/api/platform-mcp.test.ts b/apps/studio/lib/api/platform-mcp.test.ts
+new file mode 100644
+index 0000000..50fe95c
+--- /dev/null
++++ b/apps/studio/lib/api/platform-mcp.test.ts
+@@ -0,0 +1,322 @@
++import { EventEmitter } from 'node:events'
++import { createSupabaseMcpServer } from '@supabase/mcp-server-supabase'
++import { createSupabaseApiPlatform } from '@supabase/mcp-server-supabase/platform/api'
++import { createMocks } from 'node-mocks-http'
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
++
++import { handlePlatformMcp } from './platform-mcp'
++
++// The SDK transport and the MCP server package are replaced: these tests are about what the route
++// accepts and what it hands to the package, not about the MCP protocol.
++const transport = { handleRequest: vi.fn(), close: vi.fn() }
++vi.mock('@modelcontextprotocol/sdk/server/streamableHttp.js', () => ({
++  StreamableHTTPServerTransport: vi.fn().mockImplementation(function () {
++    return transport
++  }),
++}))
++
++const server = { connect: vi.fn(), close: vi.fn() }
++vi.mock('@supabase/mcp-server-supabase', () => ({
++  CURRENT_FEATURE_GROUPS: [
++    'docs',
++    'account',
++    'database',
++    'debugging',
++    'development',
++    'functions',
++    'branching',
++    'storage',
++  ],
++  createSupabaseMcpServer: vi.fn(),
++}))
++
++vi.mock('@supabase/mcp-server-supabase/platform/api', () => ({
++  createSupabaseApiPlatform: vi.fn(),
++}))
++
++const TOKEN = 'sbp_oauth_0123456789abcdef0123456789abcdef01234567'
++const REF = 'abcdefghijklmnopqrst'
++
++const apiPlatform = {
++  database: { executeSql: vi.fn() },
++  development: { getProjectUrl: vi.fn(), getPublishableKeys: vi.fn() },
++}
++
++type Options = {
++  method?: string
++  query?: Record<string, string | string[]>
++  authorization?: string | null
++}
++
++function call({ method = 'POST', query = {}, authorization = `Bearer ${TOKEN}` }: Options = {}) {
++  const { req, res } = createMocks(
++    {
++      method: method as 'POST',
++      query,
++      body: { jsonrpc: '2.0', id: 1, method: 'tools/list' },
++      headers: authorization === null ? {} : { authorization },
++    },
++    { eventEmitter: EventEmitter }
++  )
++  return { req, res, done: handlePlatformMcp(req as never, res as never) }
++}
++
++function serverOptions() {
++  const calls = vi.mocked(createSupabaseMcpServer).mock.calls
++  expect(calls).toHaveLength(1)
++  return calls[0][0]
++}
++
++describe('handlePlatformMcp', () => {
++  beforeEach(() => {
++    vi.stubEnv('SUPAVISE_MANAGEMENT_API_URL', 'http://127.0.0.1:7000')
++    vi.stubEnv('SUPAVISE_PROJECT_URL_TEMPLATE', 'https://{ref}.api.example.com')
++    vi.mocked(createSupabaseApiPlatform).mockReturnValue(apiPlatform as never)
++    vi.mocked(createSupabaseMcpServer).mockReturnValue(server as never)
++    server.connect.mockResolvedValue(undefined)
++    server.close.mockResolvedValue(undefined)
++    transport.handleRequest.mockResolvedValue(undefined)
++    transport.close.mockResolvedValue(undefined)
++  })
++
++  afterEach(() => {
++    vi.unstubAllEnvs()
++    vi.clearAllMocks()
++  })
++
++  describe('request checks', () => {
++    it('answers 405 with Allow: POST to any other method', async () => {
++      for (const method of ['GET', 'DELETE', 'PUT']) {
++        const { res, done } = call({ method })
++        await done
++        expect(res._getStatusCode()).toBe(405)
++        expect(res._getHeaders()).toMatchObject({ allow: ['POST'] })
++      }
++      expect(createSupabaseMcpServer).not.toHaveBeenCalled()
++    })
++
++    it('answers 401 without a usable bearer token', async () => {
++      const headers = [
++        null,
++        '',
++        'Bearer',
++        'Bearer ',
++        `Basic ${TOKEN}`,
++        TOKEN,
++        `Bearer ${TOKEN} extra`,
++        'Bearer a"b',
++        `Bearer ${'a'.repeat(2049)}`,
++      ]
++      for (const authorization of headers) {
++        const { res, done } = call({ authorization })
++        await done
++        expect(res._getStatusCode(), String(authorization)).toBe(401)
++        expect(res._getJSONData()).toEqual({ message: 'No access token provided' })
++      }
++      expect(createSupabaseApiPlatform).not.toHaveBeenCalled()
++      expect(createSupabaseMcpServer).not.toHaveBeenCalled()
++    })
++
++    it('takes the scheme in any case and a personal access token too', async () => {
++      const { res, done } = call({ authorization: 'bearer sbp_0123456789abcdef' })
++      await done
++      expect(res._getStatusCode()).not.toBe(401)
++      expect(createSupabaseApiPlatform).toHaveBeenCalledWith({
++        accessToken: 'sbp_0123456789abcdef',
++        apiUrl: 'http://127.0.0.1:7000',
++      })
++    })
++
++    it('answers 500 when the node did not configure MCP', async () => {
++      const bad: Array<[string, string | undefined, string | undefined]> = [
++        ['no API URL', undefined, 'https://{ref}.api.example.com'],
++        ['API URL not http', 'ftp://127.0.0.1:7000', 'https://{ref}.api.example.com'],
++        ['API URL not a URL', 'not a url', 'https://{ref}.api.example.com'],
++        ['API URL with credentials', 'http://u:p@127.0.0.1:7000', 'https://{ref}.api.example.com'],
++        ['no template', 'http://127.0.0.1:7000', undefined],
++        ['template without {ref}', 'http://127.0.0.1:7000', 'https://api.example.com'],
++        ['template with two {ref}', 'http://127.0.0.1:7000', 'https://{ref}.{ref}.example.com'],
++        ['template not http', 'http://127.0.0.1:7000', 'javascript:{ref}'],
++      ]
++      for (const [name, apiUrl, template] of bad) {
++        vi.stubEnv('SUPAVISE_MANAGEMENT_API_URL', apiUrl as string)
++        vi.stubEnv('SUPAVISE_PROJECT_URL_TEMPLATE', template as string)
++        if (apiUrl === undefined) delete process.env.SUPAVISE_MANAGEMENT_API_URL
++        if (template === undefined) delete process.env.SUPAVISE_PROJECT_URL_TEMPLATE
++        const { res, done } = call()
++        await done
++        expect(res._getStatusCode(), name).toBe(500)
++        expect(res._getJSONData()).toEqual({ message: 'MCP is not configured' })
++      }
++      expect(createSupabaseMcpServer).not.toHaveBeenCalled()
++    })
++  })
++
++  describe('query', () => {
++    it('defaults to every tool group, read-write and no project', async () => {
++      const { res, req, done } = call()
++      await done
++      expect(res._getStatusCode()).toBe(200)
++      expect(serverOptions()).toMatchObject({
++        projectId: undefined,
++        readOnly: false,
++        features: undefined,
++      })
++      expect(transport.handleRequest).toHaveBeenCalledWith(req, res, req.body)
++      expect(server.connect).toHaveBeenCalledWith(transport)
++    })
++
++    it('hands the project, read-only mode and the feature groups to the package', async () => {
++      const { done } = call({
++        query: { project_ref: REF, read_only: 'true', features: 'docs, database,storage' },
++      })
++      await done
++      expect(serverOptions()).toMatchObject({
++        projectId: REF,
++        readOnly: true,
++        features: ['docs', 'database', 'storage'],
++      })
++    })
++
++    it('accepts skip_elicitations and ignores it', async () => {
++      const { res, done } = call({ query: { skip_elicitations: 'execute_sql,create_project' } })
++      await done
++      expect(res._getStatusCode()).toBe(200)
++      expect(JSON.stringify(serverOptions())).not.toContain('execute_sql')
++    })
++
++    it.each([
++      ['read_only', '1'],
++      ['read_only', 'TRUE'],
++      ['read_only', 'yes'],
++      ['read_only', ''],
++      ['project_ref', 'ABCDEFGHIJKLMNOPQRST'],
++      ['project_ref', 'abcdefghijklmnopqrs'],
++      ['project_ref', 'abcdefghijklmnopqrstu'],
++      ['project_ref', 'abcdefghijklmnop-rst'],
++      ['project_ref', '../../v1/projects'],
++      ['features', 'docs,unknown'],
++      ['features', 'unknown'],
++      ['features', ''],
++      ['features', ','],
++    ])('answers 400 to %s=%j and creates no server', async (key, value) => {
++      const { res, done } = call({ query: { [key]: value } })
++      await done
++      expect(res._getStatusCode()).toBe(400)
++      expect(res._getJSONData().error).toHaveProperty(key)
++      expect(createSupabaseMcpServer).not.toHaveBeenCalled()
++    })
++
++    it('answers 400 to a key that is given twice', async () => {
++      for (const key of ['read_only', 'project_ref', 'features']) {
++        const { res, done } = call({ query: { [key]: [REF, REF] } })
++        await done
++        expect(res._getStatusCode(), key).toBe(400)
++      }
++      expect(createSupabaseMcpServer).not.toHaveBeenCalled()
++    })
++  })
++
++  describe('platform', () => {
++    it('is built for this request with the caller token and the Management API URL', async () => {
++      vi.stubEnv('SUPAVISE_MANAGEMENT_API_URL', 'http://127.0.0.1:7000//')
++      const { done } = call()
++      await done
++      expect(createSupabaseApiPlatform).toHaveBeenCalledTimes(1)
++      expect(createSupabaseApiPlatform).toHaveBeenCalledWith({
++        accessToken: TOKEN,
++        apiUrl: 'http://127.0.0.1:7000',
++      })
++    })
++
++    it('does not share a token between two requests', async () => {
++      const first = call({ authorization: 'Bearer sbp_first' })
++      await first.done
++      const second = call({ authorization: 'Bearer sbp_second' })
++      await second.done
++      expect(vi.mocked(createSupabaseApiPlatform).mock.calls.map((c) => c[0].accessToken)).toEqual([
++        'sbp_first',
++        'sbp_second',
++      ])
++    })
++
++    it('answers get_project_url from the template, whatever host the API has', async () => {
++      const { done } = call()
++      await done
++      const { platform } = serverOptions()
++      expect(await platform.development!.getProjectUrl(REF)).toBe(`https://${REF}.api.example.com`)
++      // the rest of the platform is the package's own
++      expect(platform.database).toBe(apiPlatform.database)
++      expect(platform.development!.getPublishableKeys).toBe(
++        apiPlatform.development.getPublishableKeys
++      )
++    })
++
++    it('fills the template only with a project ref', async () => {
++      const { done } = call()
++      await done
++      const { getProjectUrl } = serverOptions().platform.development!
++      for (const id of ['', 'x', REF.toUpperCase(), `${REF}.evil.com`, `${REF}/../`, `${REF}\n`]) {
++        await expect(getProjectUrl(id), id).rejects.toThrow('Invalid project id.')
++      }
++    })
++  })
++
++  describe('lifecycle and secrets', () => {
++    it('closes the server and the transport when the response closes', async () => {
++      const { res, done } = call()
++      await done
++      expect(server.close).not.toHaveBeenCalled()
++      res.emit('close')
++      expect(transport.close).toHaveBeenCalledTimes(1)
++      expect(server.close).toHaveBeenCalledTimes(1)
++    })
++
++    it('does not leave a rejection unhandled when closing the server or the transport fails', async () => {
++      // Plain functions: a vi.fn() handles the promise it returns, which hides the rejection.
++      const { close: closeTransport } = transport
++      const { close: closeServer } = server
++      let closed = 0
++      transport.close = (() => (closed++, Promise.reject(new Error('already closed')))) as never
++      server.close = (() => (closed++, Promise.reject(new Error('already closed')))) as never
++      const unhandled = vi.fn()
++      process.on('unhandledRejection', unhandled)
++      try {
++        const { res, done } = call()
++        await done
++        res.emit('close')
++        await new Promise((resolve) => setTimeout(resolve, 20))
++      } finally {
++        process.off('unhandledRejection', unhandled)
++        transport.close = closeTransport
++        server.close = closeServer
++      }
++      expect(closed).toBe(2)
++      expect(unhandled).not.toHaveBeenCalled()
++    })
++
++    it('answers a setup failure with a fixed message that has nothing from the request', async () => {
++      vi.mocked(createSupabaseMcpServer).mockImplementation(() => {
++        throw new Error(`boom with ${TOKEN}`)
++      })
++      const { res, done } = call({ query: { project_ref: REF } })
++      await done
++      expect(res._getStatusCode()).toBe(500)
++      expect(res._getJSONData()).toEqual({ message: 'Unable to process MCP request' })
++      expect(res._getData()).not.toContain(TOKEN)
++    })
++
++    it('never writes the token to the console', async () => {
++      const spies = (['log', 'info', 'warn', 'error', 'debug'] as const).map((m) =>
++        vi.spyOn(console, m).mockImplementation(() => {})
++      )
++      transport.handleRequest.mockRejectedValue(new Error('stream closed'))
++      const { done } = call()
++      await done
++      for (const spy of spies) {
++        expect(JSON.stringify(spy.mock.calls)).not.toContain(TOKEN)
++      }
++      spies.forEach((spy) => spy.mockRestore())
++    })
++  })
++})
+diff --git a/apps/studio/lib/api/platform-mcp.ts b/apps/studio/lib/api/platform-mcp.ts
+new file mode 100644
+index 0000000..db58db9
+--- /dev/null
++++ b/apps/studio/lib/api/platform-mcp.ts
+@@ -0,0 +1,136 @@
++import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js'
++import { createSupabaseMcpServer, CURRENT_FEATURE_GROUPS } from '@supabase/mcp-server-supabase'
++import { createSupabaseApiPlatform } from '@supabase/mcp-server-supabase/platform/api'
++import type { NextApiRequest, NextApiResponse } from 'next'
++import { z } from 'zod'
++
++import { commaSeparatedStringIntoArray, zBooleanString } from '@/lib/api/apiHelpers'
++
++/**
++ * The MCP endpoint of a platform-mode Studio that is not hosted by Supabase (the Supavise build).
++ *
++ * Hosted runs the MCP server as its own service. A node has no such process, so Studio serves the
++ * route, which already bundles the server package with every tool. The caller's bearer token is the
++ * only credential: the tools call the Management API with it, and the API decides what it may do.
++ * The token is never logged, stored or put in a response.
++ *
++ * Configuration comes from the environment of the Studio process, read for every request:
++ * - SUPAVISE_MANAGEMENT_API_URL: the Management API as this process reaches it (a loopback URL).
++ * - SUPAVISE_PROJECT_URL_TEMPLATE: the public API URL of a project with `{ref}` in place of its
++ *   ref, for example https://{ref}.api.example.com. The package derives a hosted domain from the
++ *   API host instead, which is wrong for any other host.
++ */
++
++const PROJECT_REF = /^[a-z]{20}$/
++
++// The characters of a personal access token or an OAuth access token, with room to spare. A header
++// that does not match is treated like a missing one.
++const BEARER = /^Bearer +([A-Za-z0-9._~+/=-]{1,2048})$/i
++
++// Built per request: the feature groups come from the package, which a test replaces.
++function querySchema() {
++  return z.object({
++    // A project scopes the server to that project and hides the account tools, as on hosted.
++    project_ref: z.string().regex(PROJECT_REF).optional(),
++    // Anything but `true` or `false` is a 400, so a typo never leaves a client with write access.
++    read_only: zBooleanString().default('false'),
++    features: z
++      .string()
++      .transform(commaSeparatedStringIntoArray)
++      .optional()
++      .pipe(z.array(z.enum(CURRENT_FEATURE_GROUPS)).min(1).optional()),
++    // Accepted so that URLs from the Connect panel work. The stateless JSON transport cannot ask
++    // the client to confirm anything, so it has no effect.
++    skip_elicitations: z.string().optional(),
++  })
++}
++
++function managementApiUrl(): string | undefined {
++  const raw = process.env.SUPAVISE_MANAGEMENT_API_URL
++  if (!raw) return undefined
++  try {
++    const url = new URL(raw)
++    if ((url.protocol !== 'http:' && url.protocol !== 'https:') || url.username || url.password) {
++      return undefined
++    }
++    return raw.replace(/\/+$/, '')
++  } catch {
++    return undefined
++  }
++}
++
++// Returns a function that fills the project ref into the template, or undefined when the template
++// is missing or does not make an http(s) URL.
++function projectUrlFor(): ((ref: string) => string) | undefined {
++  const template = process.env.SUPAVISE_PROJECT_URL_TEMPLATE
++  if (!template || template.split('{ref}').length !== 2) return undefined
++  try {
++    const probe = new URL(template.replace('{ref}', 'a'.repeat(20)))
++    if (probe.protocol !== 'http:' && probe.protocol !== 'https:') return undefined
++  } catch {
++    return undefined
++  }
++  return (ref) => {
++    // The ref comes from a tool argument, which a model writes.
++    if (!PROJECT_REF.test(ref)) throw new Error('Invalid project id.')
++    return template.replace('{ref}', ref)
++  }
++}
++
++export async function handlePlatformMcp(req: NextApiRequest, res: NextApiResponse) {
++  if (req.method !== 'POST') {
++    res.setHeader('Allow', ['POST'])
++    return res.status(405).json({ error: { message: `Method ${req.method} Not Allowed` } })
++  }
++
++  const accessToken = BEARER.exec(req.headers.authorization ?? '')?.[1]
++  if (!accessToken) {
++    return res.status(401).json({ message: 'No access token provided' })
++  }
++
++  const apiUrl = managementApiUrl()
++  const projectUrl = projectUrlFor()
++  if (!apiUrl || !projectUrl) {
++    return res.status(500).json({ message: 'MCP is not configured' })
++  }
++
++  const { error, data } = querySchema().safeParse(req.query)
++  if (error) {
++    return res.status(400).json({ error: error.flatten().fieldErrors })
++  }
++  const { project_ref, read_only, features } = data
++
++  try {
++    const platform = createSupabaseApiPlatform({ accessToken, apiUrl })
++    const server = createSupabaseMcpServer({
++      platform: {
++        ...platform,
++        development: platform.development && {
++          ...platform.development,
++          getProjectUrl: async (projectId: string) => projectUrl(projectId),
++        },
++      },
++      projectId: project_ref,
++      readOnly: read_only,
++      features,
++    })
++
++    const transport = new StreamableHTTPServerTransport({
++      sessionIdGenerator: undefined, // Stateless, don't use session management
++      enableJsonResponse: true, // Stateless, discourage SSE streams
++    })
++    // One server per request, so nothing outlives the response.
++    res.on('close', () => {
++      void Promise.allSettled([transport.close(), server.close()])
++    })
++
++    await server.connect(transport)
++    await transport.handleRequest(req, res, req.body)
++  } catch {
++    // Errors at this point are MCP setup issues. Later errors are handled at the JSON-RPC level.
++    // The message is fixed: nothing from the request or the token goes into it.
++    if (!res.headersSent) {
++      return res.status(500).json({ message: 'Unable to process MCP request' })
++    }
++  }
++}
+diff --git a/apps/studio/lib/hosted-api-allowlist.ts b/apps/studio/lib/hosted-api-allowlist.ts
+index 59c7b0c..ba1cc4c 100644
+--- a/apps/studio/lib/hosted-api-allowlist.ts
++++ b/apps/studio/lib/hosted-api-allowlist.ts
+@@ -29,6 +29,7 @@ export const HOSTED_SUPPORTED_API_URLS = [
+   '/content/graphql',
+   '/parse-query',
+   '/scoped-access-token-permissions',
++  '/mcp',
+ ]
+ 
+ // `pathname` must be basePath-relative — Next's `nextUrl.pathname` already is,
+diff --git a/apps/studio/pages/api/mcp/index.ts b/apps/studio/pages/api/mcp/index.ts
+index 509d5f5..4ffe5d5 100644
+--- a/apps/studio/pages/api/mcp/index.ts
++++ b/apps/studio/pages/api/mcp/index.ts
+@@ -9,11 +9,13 @@ import {
+   fromNodeHeaders,
+   zBooleanString,
+ } from '@/lib/api/apiHelpers'
++import { handlePlatformMcp } from '@/lib/api/platform-mcp'
+ import {
+   getDatabaseOperations,
+   getDebuggingOperations,
+   getDevelopmentOperations,
+ } from '@/lib/api/self-hosted/mcp'
++import { IS_PLATFORM } from '@/lib/constants'
+ import { DEFAULT_PROJECT } from '@/lib/constants/api'
+ 
+ const supportedFeatureGroupSchema = z.enum(['docs', 'database', 'development', 'debugging'])
+@@ -38,7 +40,14 @@ const mcpQuerySchema = z.object({
+     ),
+ })
+ 
++// Deploying an Edge Function sends the files in the request body.
++export const config = { api: { bodyParser: { sizeLimit: '8mb' } } }
++
+ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
++  // A platform build has no self-hosted API behind it: the tools call the Management API with the
++  // caller's token (lib/api/platform-mcp.ts).
++  if (IS_PLATFORM) return handlePlatformMcp(req, res)
++
+   switch (req.method) {
+     case 'POST':
+       return handlePost(req, res)
+-- 
+2.50.1 (Apple Git-155)
+

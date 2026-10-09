@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Starts a packaged supavise Studio build on a loopback port and checks that it is a platform-mode
-# build whose placeholders are replaced, twice with different values, and that missing required
-# values stop it with exit code 78.
+# build whose placeholders are replaced, twice with different values, that the MCP route of patch
+# 0004 answers (with and without the node's MCP settings), and that missing required values stop it
+# with exit code 78.
 #
 #   studio/verify.sh <supavise-studio-*.tar.zst | extracted directory>
 #
@@ -64,14 +65,20 @@ files_containing() { # needle -> count of listed files that contain it
 
 # build.sh exports the build-time placeholders as NEXT_PUBLIC_* for next build. Studio must
 # start from a clean slate here, or it would read a placeholder as a configured value.
-while IFS= read -r v; do unset "$v"; done < <(compgen -e | grep -E '^(NEXT_PUBLIC_|CSP_EXTRA_PROJECT_HOSTS$)' || true)
+while IFS= read -r v; do unset "$v"; done < <(compgen -e | grep -E '^(NEXT_PUBLIC_|CSP_EXTRA_PROJECT_HOSTS$|SUPAVISE_MANAGEMENT_API_URL$|SUPAVISE_PROJECT_URL_TEMPLATE$)' || true)
 
-start() { # api_url gotrue_url site_url hosts
+# start api_url gotrue_url site_url hosts [mcp_url management_api_url project_url_template]
+# An empty or missing MCP value is left unset, as an older unit leaves it.
+start() {
   local port; port="$(free_port)"; PORT_NOW="$port"
   : > "$TMP/studio.log"
+  local extra=()
+  [[ -z "${5:-}" ]] || extra+=("NEXT_PUBLIC_MCP_URL=$5")
+  [[ -z "${6:-}" ]] || extra+=("SUPAVISE_MANAGEMENT_API_URL=$6")
+  [[ -z "${7:-}" ]] || extra+=("SUPAVISE_PROJECT_URL_TEMPLATE=$7")
   env PORT="$port" HOSTNAME=127.0.0.1 \
     NEXT_PUBLIC_API_URL="$1" NEXT_PUBLIC_GOTRUE_URL="$2" NEXT_PUBLIC_SITE_URL="$3" \
-    CSP_EXTRA_PROJECT_HOSTS="$4" \
+    CSP_EXTRA_PROJECT_HOSTS="$4" ${extra[@]+"${extra[@]}"} \
     "$ROOT/bin/studio" > "$TMP/studio.log" 2>&1 &
   PID=$!
   local i
@@ -90,8 +97,45 @@ stop() {
   [[ $rc -eq 143 || $rc -eq 0 ]] || fail "Studio exited with $rc on SIGTERM (want 143 or 0)"
 }
 
-check_round() { # api origin, hosts-regex-literal
-  local api="$1" host_a="$2" port="$PORT_NOW"
+# mcp_call query authorization json-body: POST /api/mcp, sets MCP_CODE and MCP_BODY. An empty
+# authorization sends none. The token is made up; the route only passes it on.
+mcp_call() {
+  local args=(-sS -o "$TMP/mcp.body" -w '%{http_code}' --max-time 30 -X "${MCP_METHOD:-POST}"
+    -H 'content-type: application/json' -H 'accept: application/json, text/event-stream')
+  [[ -z "$2" ]] || args+=(-H "authorization: $2")
+  MCP_CODE="$(curl "${args[@]}" -d "$3" "http://127.0.0.1:$PORT_NOW/api/mcp$1")"
+  MCP_BODY="$(cat "$TMP/mcp.body")"
+}
+
+# The MCP route of patch 0004 (platform mode). It is on the allowlist of Studio's own API routes,
+# answers without a token, and builds the server per request. tools/list and get_project_url make
+# no call to the Management API, so the URL it is given here is never contacted.
+check_mcp_route() { # project-url-host-suffix, or "unconfigured"
+  local ref=aaaaaaaaaaaaaaaaaaaa auth='Bearer sbp_verify_not_a_real_token'
+  local list='{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
+  mcp_call "" "" "$list"
+  [[ "$MCP_CODE" == 401 && "$MCP_BODY" == *"No access token provided"* ]] || fail "POST /api/mcp without a token returned $MCP_CODE $MCP_BODY, want 401 (404 means patch 0004 is not in this build)"
+  MCP_METHOD=GET mcp_call "" "$auth" ""
+  [[ "$MCP_CODE" == 405 ]] || fail "GET /api/mcp returned $MCP_CODE, want 405"
+  if [[ "$1" == unconfigured ]]; then
+    mcp_call "" "$auth" "$list"
+    [[ "$MCP_CODE" == 500 && "$MCP_BODY" == *"MCP is not configured"* ]] || fail "/api/mcp without the node's MCP settings returned $MCP_CODE $MCP_BODY, want 500"
+    ok "MCP route: 401 without a token, 405 for GET, 500 when the node did not configure it"
+    return
+  fi
+  mcp_call "?read_only=maybe" "$auth" "$list"
+  [[ "$MCP_CODE" == 400 ]] || fail "/api/mcp?read_only=maybe returned $MCP_CODE, want 400"
+  mcp_call "?project_ref=$ref&read_only=true" "$auth" "$list"
+  [[ "$MCP_CODE" == 200 && "$MCP_BODY" == *'"execute_sql"'* ]] || fail "tools/list returned $MCP_CODE $MCP_BODY"
+  [[ "$MCP_BODY" != *'"list_organizations"'* ]] || fail "a project-scoped server lists the account tools"
+  [[ "$MCP_BODY" != *'"apply_migration"'* ]] || fail "a read-only server lists a write tool"
+  mcp_call "?project_ref=$ref" "$auth" '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"get_project_url","arguments":{}}}'
+  [[ "$MCP_CODE" == 200 && "$MCP_BODY" == *"https://$ref.$1"* ]] || fail "get_project_url returned $MCP_CODE $MCP_BODY, want https://$ref.$1"
+  ok "MCP route: 401, 405, 400 for a bad read_only, project-scoped read-only tool list, project URL from the template"
+}
+
+check_round() { # api origin, hosts-regex-literal, mcp url, project-url-host-suffix or "unconfigured"
+  local api="$1" host_a="$2" mcp="$3" port="$PORT_NOW"
   local headers; headers="$(curl -sS -D - -o /dev/null --max-time 10 "http://127.0.0.1:$port/sign-in")"
   echo "$headers" | grep -qi '^content-security-policy:' || fail "no CSP header (not a platform build?)"
   echo "$headers" | grep -i '^content-security-policy:' | grep -qF "$api" || fail "CSP does not allow $api"
@@ -116,19 +160,24 @@ check_round() { # api origin, hosts-regex-literal
   leftover_placeholders || fail "placeholders left in rewritten files"
   [[ "$(files_containing "$api/platform")" -gt 0 ]] || fail "$api/platform is not in any rewritten file"
   ok "rewritten files carry $api/platform, no placeholder left"
+  [[ "$(files_containing "$mcp")" -gt 0 ]] || fail "$mcp (NEXT_PUBLIC_MCP_URL) is not in any rewritten file"
+  ok "rewritten files carry the MCP URL $mcp"
+  check_mcp_route "$4"
   if command -v pgrep >/dev/null 2>&1; then
     local child; child="$(pgrep -P "$PID" | head -n 1)"
     [[ -z "$child" ]] || printf 'verify: studio server RSS: %s MB\n' "$(ps -o rss= -p "$child" | awk '{printf "%d", $1/1024}')" >&2
   fi
 }
 
-# round 1
-start "https://api.one.test/platform" "https://auth.one.test/auth/v1" "https://studio.one.test" "*.api.one.test, db.one.test:8443"
-check_round "https://api.one.test" "*.api.one.test"
+# round 1: every setting, including the node's MCP settings (127.0.0.1:9 is never contacted)
+start "https://api.one.test/platform" "https://auth.one.test/auth/v1" "https://studio.one.test" "*.api.one.test, db.one.test:8443" \
+  "https://api.one.test/mcp" "http://127.0.0.1:9" "https://{ref}.api.one.test"
+check_round "https://api.one.test" "*.api.one.test" "https://api.one.test/mcp" "api.one.test"
 stop
-# round 2: other values over the same tree
+# round 2: other values over the same tree, and no MCP settings, as an older unit starts it: the
+# build's default MCP URL, and a route that says it is not configured
 start "https://api.two.test" "https://auth.two.test/auth/v1" "https://studio.two.test" "*.api.two.test"
-check_round "https://api.two.test" "*.api.two.test"
+check_round "https://api.two.test" "*.api.two.test" "http://localhost:8080/mcp" "unconfigured"
 if [[ "$(files_containing "api.one.test")" -ne 0 ]]; then fail "first round's values are still in the tree"; fi
 stop
 

@@ -89,6 +89,7 @@ type server struct {
 	auth    *authState
 	mu      sync.Mutex
 	content map[string]map[string]any // SQL snippets per project ref, by id
+	authz   map[string]*authzState    // authorization requests by id (oauth.go)
 }
 
 func newServer(cfg *Config) (*server, error) {
@@ -99,6 +100,10 @@ func newServer(cfg *Config) (*server, error) {
 		client:  &http.Client{Timeout: 70 * time.Second, Transport: &http.Transport{IdleConnTimeout: 2 * time.Second, MaxIdleConnsPerHost: 8}},
 		auth:    newAuthState(cfg),
 		content: map[string]map[string]any{},
+		authz:   map[string]*authzState{},
+	}
+	for _, a := range cfg.Authorizations {
+		s.authz[a.ID] = &authzState{Authorization: a}
 	}
 	var err error
 	if s.log, err = newRequestLog(cfg.RequestLog); err != nil {
@@ -216,6 +221,12 @@ func (s *server) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s.auth.serve(w, r, body)
+		return
+	}
+	if r.URL.Path == callbackPath {
+		// The query holds the authorization code; it stays out of the log.
+		entry.Handler, entry.Template, entry.Query = "real", callbackPath, ""
+		serveCallback(w)
 		return
 	}
 	if strings.HasPrefix(r.URL.Path, "/healthz") {
