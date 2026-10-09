@@ -2,7 +2,6 @@ package failover
 
 import (
 	"context"
-	"crypto/rand"
 	"errors"
 	"fmt"
 	"net/http"
@@ -19,6 +18,7 @@ import (
 	"github.com/supavise/supavise/internal/pglsn"
 	"github.com/supavise/supavise/internal/placement"
 	"github.com/supavise/supavise/internal/registry"
+	"github.com/supavise/supavise/internal/replicas/replicaid"
 )
 
 // A project move (design 2.10.3). The leader runs it, holding the project's lock; the project
@@ -647,7 +647,7 @@ func (o *Orchestrator) addReplicaRow(ctx context.Context, ref string, node regis
 		origin = registry.ReplicaSystem
 	}
 	r := registry.Replica{
-		Identifier: registry.ReplicaIdentifier(ref, o.regionOf(node), newID6()), Ref: ref, NodeID: node.ID, Origin: origin,
+		Identifier: registry.ReplicaIdentifier(ref, o.regionOf(node), replicaid.Short()), Ref: ref, NodeID: node.ID, Origin: origin,
 		Status: "ACTIVE_UNHEALTHY", InitStep: registry.ReplicaStepDone,
 	}
 	if err := st.CreateReplica(ctx, &r); err != nil {
@@ -666,18 +666,6 @@ func (o *Orchestrator) regionOf(n registry.Node) string {
 		r = "local"
 	}
 	return r
-}
-
-func newID6() string {
-	const alphabet = "abcdefghijklmnopqrstuvwxyz0123456789"
-	var b [6]byte
-	if _, err := rand.Read(b[:]); err != nil {
-		panic(err)
-	}
-	for i := range b {
-		b[i] = alphabet[int(b[i])%len(alphabet)]
-	}
-	return string(b[:])
 }
 
 // lockHold is the project's lock as a move holds it, released once whatever happens.
