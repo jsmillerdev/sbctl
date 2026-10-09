@@ -72,8 +72,7 @@ reconcile_seconds = 5
 CONF
 
 log "system init (downloads artifacts)"
-system_init
-wait_active supavise-postgres@system.service 30
+system_up
 
 log "fleet start (downloads pooler, realtime, storage and pgmeta)"
 supavise fleet start || fail "fleet start"   # no Studio artifact configured: skipped with a note
@@ -138,19 +137,11 @@ for svc in pgmeta supavisor realtime storage; do
   [[ $(unit_state "supavise-$svc.service") == inactive ]] || fail "supavise-$svc is $(unit_state "supavise-$svc.service") after fleet stop"
 done
 systemctl start supavise.service
-for ((i = 0; i < 180; i++)); do
-  supavise fleet status >/dev/null 2>&1 && break
-  sleep 2
-done
-supavise fleet status || { journalctl --no-pager -u supavise.service | tail -40 >&2; fail "the daemon did not bring the shared services up"; }
+wait_fleet
 for svc in pgmeta supavisor realtime storage; do
   [[ $(unit_state "supavise-$svc.service") == active ]] || fail "supavise-$svc is $(unit_state "supavise-$svc.service") after the daemon started"
 done
-for ((i = 0; i < 30; i++)); do
-  [[ $(http_code -H "Host: $API_HOST" http://127.0.0.1/v1/projects) == 401 ]] && break
-  sleep 1
-done
-[[ $(http_code -H "Host: $API_HOST" http://127.0.0.1/v1/projects) == 401 ]] || fail "the Management API does not answer through the proxy"
+wait_proxy_api 30
 
 log "create a project through the Management API: the daemon registers it with the shared services"
 claim_and_token
@@ -263,7 +254,10 @@ tenant_gone() {
   [[ $(storage_code "$1") != 200 ]] || { log "storage still serves $REF"; return 1; }
   if ws_join "$P_REALTIME" "$REF.realtime.internal" "$2" >/dev/null 2>&1; then log "realtime still serves $REF"; return 1; fi
 }
-wait_for() { # SECONDS CMD...: retries CMD every second
+# retry_for SECONDS CMD...: retries CMD every second, with its output shown (tenant_served and tenant_gone say why they
+# fail), and returns the status of one last try, so that the caller prints what it needs before it fails. lib.sh's
+# wait_for is the quiet kind that fails by itself.
+retry_for() {
   local n=$1 i; shift
   for ((i = 0; i < n; i++)); do "$@" && return 0; sleep 1; done
   "$@"
@@ -288,7 +282,7 @@ done
 project_keys "$REF"
 [[ $SEC != "$OLDSEC" ]] || fail "the API still lists the old secret key"
 rotated_proxy() { curl -fsS -m 30 -H "Host: $HOST" -H "apikey: $SEC" -H "Authorization: Bearer $SEC" "http://127.0.0.1/storage/v1/bucket" >/dev/null 2>&1; }
-wait_for 20 rotated_proxy || fail "the proxy refuses the new secret key"
+retry_for 20 rotated_proxy || fail "the proxy refuses the new secret key"
 [[ $(http_code -H "Host: $HOST" -H "apikey: $OLDSEC" -H "Authorization: Bearer $OLDSEC" "http://127.0.0.1/storage/v1/bucket") != 200 ]] || fail "the proxy accepts the old secret key"
 
 log "crash recovery: kill -9 each shared service"
@@ -307,15 +301,15 @@ for svc in supavisor realtime storage pgmeta; do
   log "$u recovered"
 done
 # The tenants live in the services' databases, so they survive the restarts.
-wait_for 30 tenant_served "$NEWSVC" "$NEWANON" || fail "the tenant was lost in the restarts"
+retry_for 30 tenant_served "$NEWSVC" "$NEWANON" || fail "the tenant was lost in the restarts"
 
 fleet_memory "one project registered, after the crash recovery"
 
 log "CLI tenant commands, a separate step: remove-tenant, then ensure-tenant again"
 supavise fleet remove-tenant "$REF" || fail "remove-tenant"
-wait_for 20 tenant_gone "$NEWSVC" "$NEWANON" || fail "remove-tenant left the tenant in a service"
+retry_for 20 tenant_gone "$NEWSVC" "$NEWANON" || fail "remove-tenant left the tenant in a service"
 supavise fleet ensure-tenant "$REF" || fail "ensure-tenant"
-wait_for 30 tenant_served "$NEWSVC" "$NEWANON" || fail "ensure-tenant did not register the tenant again"
+retry_for 30 tenant_served "$NEWSVC" "$NEWANON" || fail "ensure-tenant did not register the tenant again"
 
 # What a customer relies on a backup for: an object uploaded through the real Storage API and a function
 # deployed through the Management API are copied by the backup, deleted through the same APIs, and come
@@ -336,7 +330,7 @@ fn_served() { [[ $(fn_body || true) == "$FN_BODY" ]]; }
 obj_served() { [[ $(obj_body || true) == "an object that a restore brings back" ]]; }
 st_proxy -X POST -H 'Content-Type: text/plain' --data-binary 'an object that a restore brings back' \
   "http://127.0.0.1/storage/v1/object/proxied/restore-check.txt" >/dev/null || fail "upload through the real Storage API"
-wait_for 90 fn_served || { journalctl --no-pager -u supavise-edge-runtime.service | tail -20 >&2; fail "the deployed function is not served through the proxy"; }
+retry_for 90 fn_served || { journalctl --no-pager -u supavise-edge-runtime.service | tail -20 >&2; fail "the deployed function is not served through the proxy"; }
 obj_served || fail "the uploaded object is not served"
 
 supavise backups create "$REF" || fail "backups create $REF"
@@ -351,19 +345,19 @@ st_proxy -X DELETE "http://127.0.0.1/storage/v1/object/proxied/restore-check.txt
 [[ $(papi GET "/v1/projects/$REF/functions/$FN_SLUG" -o /dev/null -w '%{http_code}') == 404 ]] || fail "the deleted function is still listed"
 ! obj_served || fail "the deleted object is still served"
 gone() { ! fn_served; }
-wait_for 60 gone || fail "the deleted function is still served"
+retry_for 60 gone || fail "the deleted function is still served"
 
 log "restore to a time before the deletes through the Management API"
 [[ $(papi POST "/v1/projects/$REF/database/backups/restore-pitr" -H 'Content-Type: application/json' -d "{\"recovery_time_target_unix\":$RESTORE_T}" \
   -o "$LOG_DIR/restore-pitr.json" -w '%{http_code}') == 201 ]] || { cat "$LOG_DIR/restore-pitr.json" >&2; fail "restore-pitr was refused"; }
 restored() { [[ $(papi GET "/v1/projects/$REF" | json_get 'd["status"]' 2>/dev/null || true) == ACTIVE_HEALTHY ]]; }
-wait_for 900 restored || { journalctl --no-pager -u supavise.service | grep -i restore | tail -20 >&2; fail "$REF is not ACTIVE_HEALTHY after the restore"; }
+retry_for 900 restored || { journalctl --no-pager -u supavise.service | grep -i restore | tail -20 >&2; fail "$REF is not ACTIVE_HEALTHY after the restore"; }
 [[ -z $(journalctl --no-pager -u supavise.service 2>/dev/null | grep 'msg="restore failed"' | tail -1) ]] || fail "the restore failed"
 
 log "the real services serve the object and the function again"
-wait_for 120 obj_served || { journalctl --no-pager -u supavise.service | tail -30 >&2; fail "the object did not come back through the Storage API after the restore"; }
+retry_for 120 obj_served || { journalctl --no-pager -u supavise.service | tail -30 >&2; fail "the object did not come back through the Storage API after the restore"; }
 [[ $(papi GET "/v1/projects/$REF/functions/$FN_SLUG" -o /dev/null -w '%{http_code}') == 200 ]] || fail "the function is not listed after the restore"
-wait_for 120 fn_served || { journalctl --no-pager -u supavise-edge-runtime.service | tail -20 >&2; fail "the function did not come back through the Edge Runtime after the restore"; }
+retry_for 120 fn_served || { journalctl --no-pager -u supavise-edge-runtime.service | tail -20 >&2; fail "the function did not come back through the Edge Runtime after the restore"; }
 supavise projects health "$REF" || fail "$REF is not healthy after the restore"
 
 log "delete through the Management API: the daemon's engine removes the tenants (no remove-tenant before)"
@@ -371,7 +365,7 @@ papi DELETE "/v1/projects/$REF" -o /dev/null -m 900 || fail "project delete thro
 for svc in postgres gotrue postgrest; do
   [[ $(unit_state "supavise-$svc@$REF.service") == inactive ]] || fail "supavise-$svc@$REF is $(unit_state "supavise-$svc@$REF.service") after the delete"
 done
-wait_for 20 tenant_gone "$NEWSVC" "$NEWANON" || fail "the project delete left the tenant in a service"
+retry_for 20 tenant_gone "$NEWSVC" "$NEWANON" || fail "the project delete left the tenant in a service"
 supavise fleet remove-tenant "$REF" || fail "remove-tenant of a deleted project must be a no-op"
 
 log "fleet stop"

@@ -21,21 +21,13 @@ TEARDOWN=0
 [[ ${1:-} == --teardown ]] && TEARDOWN=1
 trap 'rc=$?; collect_logs; [[ $TEARDOWN -eq 1 ]] && teardown; exit $rc' EXIT
 
-ADMIN=http://127.0.0.1:7000
-
 preflight
 install_binary
 setup_node
 
 log "system init, daemon"
-system_init
-wait_active supavise-postgres@system.service 30
-systemctl start supavise.service
-for ((i = 0; i < 60; i++)); do
-  [[ $(http_code "$ADMIN/v1/projects") == 401 ]] && break
-  sleep 1
-done
-[[ $(http_code "$ADMIN/v1/projects") == 401 ]] || { journalctl --no-pager -u supavise.service | tail -30 >&2; fail "the Management API does not answer on the admin listener"; }
+system_up
+start_daemon
 
 log "a project through the Management API"
 claim_and_token
@@ -49,29 +41,9 @@ pg_admin() { # SQL: as supabase_admin over the cluster's private socket
 }
 rows() { pg_admin "select coalesce(string_agg(label, ',' order by id), '') from public.restore_smoke"; }
 status() { papi GET "$CFG" | json_get 'd["status"]'; }
-code() { # METHOD PATH [BODY]: the HTTP status of a Management API call
-  local m=$1 p=$2 b=${3:-}
-  papi "$m" "$p" -o /dev/null -w '%{http_code}' ${b:+-H 'Content-Type: application/json' -d "$b"} || true
-}
-must() { # STATUS METHOD PATH [BODY]
-  local want=$1 got
-  got=$(code "$2" "$3" "${4:-}")
-  [[ $got == "$want" ]] || { log "response: $(papi "$2" "$3" ${4:+-H 'Content-Type: application/json' -d "$4"} | head -c 400)"; fail "$2 $3 answered $got, want $want"; }
-}
 # restore_failed prints the daemon's log line of a restore that failed (the project is then
-# RESTORE_FAILED, which wait_status treats as the end of the wait).
+# RESTORE_FAILED, which the waits below treat as the end of the wait).
 restore_failed() { journalctl --no-pager -u supavise.service 2>/dev/null | grep 'msg="restore failed"' | tail -1 || true; }
-wait_status() { # STATUS SECONDS
-  local want=$1 n=${2:-600} i s=""
-  for ((i = 0; i < n; i++)); do
-    s=$(status 2>/dev/null || true)
-    [[ $s == "$want" ]] && return 0
-    [[ $s == RESTORE_FAILED ]] && break
-    sleep 1
-  done
-  journalctl --no-pager -u supavise.service | tail -40 >&2
-  fail "$REF is $s after ${n}s, want $want"
-}
 
 log "the backup list and the PITR add-on of a new project"
 LIST=$(papi GET "$CFG/database/backups")
@@ -79,7 +51,6 @@ LIST=$(papi GET "$CFG/database/backups")
 # /platform routes take the dashboard session, not a personal access token.
 JWT=$(api POST '/auth/v1/token?grant_type=password' -H 'Content-Type: application/json' \
   -d '{"email":"smoke@example.com","password":"smoke-correct-horse-battery"}' | json_get 'd["access_token"]') || fail "dashboard sign-in"
-japi() { local m=$1 p=$2; shift 2; api "$m" "$p" -H "Authorization: Bearer $JWT" "$@"; }
 ADDONS=$(japi GET "/platform/projects/$REF/billing/addons")
 # The compute size is listed first (compute.go); the PITR add-on is the one of type pitr.
 [[ $(json_get '[a["type"] for a in d["selected_addons"]]' <<<"$ADDONS") == *pitr* ]] || fail "no PITR add-on: $ADDONS"
@@ -122,7 +93,7 @@ must 201 POST "$CFG/database/backups/restore-pitr" "{\"recovery_time_target_unix
 [[ $(status) == RESTORING ]] || fail "the project is $(status) right after the restore began, want RESTORING"
 must 409 POST "$CFG/database/backups/restore-pitr" "{\"recovery_time_target_unix\":$T}"
 must 409 POST "$CFG/pause"
-wait_status ACTIVE_HEALTHY 900
+wait_status "$REF" ACTIVE_HEALTHY 900 RESTORE_FAILED
 [[ -z $(restore_failed) ]] || fail "the restore failed: $(restore_failed)"
 GOT=$(rows)
 [[ $GOT == one,two ]] || fail "after the restore to T the rows are '$GOT', want one,two"
@@ -136,7 +107,7 @@ LIST=$(papi GET "$CFG/database/backups")
 log "restore the state of the first listed base backup (id $FIRST_ID)"
 must 201 POST "$CFG/database/backups/restore" "{\"id\":$FIRST_ID}"
 [[ $(status) == RESTORING ]] || fail "the project is $(status) right after the restore began, want RESTORING"
-wait_status ACTIVE_HEALTHY 900
+wait_status "$REF" ACTIVE_HEALTHY 900 RESTORE_FAILED
 [[ -z $(restore_failed) ]] || fail "the restore failed: $(restore_failed)"
 GOT=$(rows)
 [[ $GOT == one ]] || fail "after the restore of the first base backup the rows are '$GOT', want one"

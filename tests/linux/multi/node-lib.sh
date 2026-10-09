@@ -67,23 +67,14 @@ node_version() { nodes_json | json_get '[n["version"] for n in d["nodes"] if n["
 node_has_version() { [[ $(node_version "$1") == "$2" ]]; } # NODE VERSION
 
 # ---- waiting -----------------------------------------------------------------------------------------
-# wait_for SECONDS WHAT CMD...: polls CMD every two seconds until it succeeds. CMD runs in a subshell, so a
-# function of this file that calls `fail` ends only that attempt.
-wait_for() {
-  local n=$1 what=$2 i
-  shift 2
-  for ((i = 0; i < n; i += 2)); do
-    ( "$@" ) >/dev/null 2>&1 && return 0
-    sleep 2
-  done
-  fail "timed out after ${n}s waiting for $what"
-}
+# The waits here are lib.sh's wait_for SECONDS INTERVAL WHAT CMD..., polling every two seconds: CMD runs in a
+# subshell, so a function of this file that calls `fail` ends only that attempt.
 
 # wait_node_versions VERSION SECONDS NODE...: this node's copy of the registry shows every NODE at VERSION.
 wait_node_versions() {
   local want=$1 n=$2 id
   shift 2
-  for id in "$@"; do wait_for "$n" "the registry to show $id at $want" node_has_version "$id" "$want"; done
+  for id in "$@"; do wait_for "$n" 2 "the registry to show $id at $want" node_has_version "$id" "$want"; done
 }
 
 wait_api() { # SECONDS: the Management API answers (401 without a token) on this node
@@ -293,7 +284,7 @@ make_join_token() {
   (umask 077; supavise node token --ttl 30m >/root/join-token) || fail "supavise node token"
   [[ -s /root/join-token ]] || fail "supavise node token printed no token"
   # wait_for ends its shell when it gives up, hence the subshell: the journal is printed first.
-  ( wait_for 180 "the daemon to listen on the peer port 7443" bash -c 'ss -ltnH "sport = :7443" | grep -q .' ) \
+  ( wait_for 180 2 "the daemon to listen on the peer port 7443" bash -c 'ss -ltnH "sport = :7443" | grep -q .' ) \
     || { journalctl --no-pager -u supavise.service -n 60 | cut -c1-300 >&2; fail "the daemon does not listen on the peer port 7443 after a join token"; }
   wait_active supavise.service 60
   wait_api 120
@@ -308,7 +299,7 @@ assert_nodes() {
     || fail "the nodes are not both active: $(json_get '[(n["id"], n["state"]) for n in d["nodes"]]' <<<"$j")"
 }
 wait_nodes() { # LEADER SECONDS: assert_nodes holds
-  wait_for "${2:-180}" "$1 to be the leader of two active nodes in this node's registry" assert_nodes "$1"
+  wait_for "${2:-180}" 2 "$1 to be the leader of two active nodes in this node's registry" assert_nodes "$1"
 }
 
 # wait_healthy SECONDS: `supavise status` exits 0 (healthy); the report is printed when it does not.
@@ -347,7 +338,7 @@ leader_services() {
 follower_services() {
   local u
   for u in supavise.service supavise-postgres@system.service supavise-supavisor.service; do wait_active "$u" 120; done
-  wait_for 120 "the shared services other than the pooler to be parked" parked
+  wait_for 120 2 "the shared services other than the pooler to be parked" parked
 }
 parked() {
   local u
@@ -365,8 +356,6 @@ unit_stamp() {
     printf '%s %s %s\n' "$u" "$(systemctl show -p InvocationID --value "$u")" "$(pg_start_time "$ref" 2>/dev/null || echo none)"
   done
 }
-
-daemon_version() { "/proc/$(systemctl show -p MainPID --value supavise.service)/exe" --version; }
 
 # fenced_refs: the PostgreSQL clusters of this node. They are the ones in the data directory: after a restart of the
 # machine `systemctl list-units` shows only the units that are loaded, and a unit that never started is not, so the
@@ -398,7 +387,7 @@ fenced_settled() {
 # state is waited for, not read once.
 wait_fenced() {
   local n=${1:-240} i why="" u ref
-  wait_for "$n" "the node to record that it is fenced" test -s /var/lib/supavise/fenced.json
+  wait_for "$n" 2 "the node to record that it is fenced" test -s /var/lib/supavise/fenced.json
   for ((i = 0; i < 120; i += 3)); do
     why=$(fenced_settled 2>&1) && break
     sleep 3
@@ -422,7 +411,7 @@ wait_fenced() {
 
 # wait_unfenced SECONDS: the record is gone and the daemon runs as a follower.
 wait_unfenced() {
-  wait_for "${1:-300}" "fenced.json to go" test ! -e /var/lib/supavise/fenced.json
+  wait_for "${1:-300}" 2 "fenced.json to go" test ! -e /var/lib/supavise/fenced.json
   wait_active supavise.service 120
   wait_active supavise-postgres@system.service 120
 }

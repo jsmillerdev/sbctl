@@ -46,7 +46,6 @@ trap 'rc=$?; [[ -n $HTTP_PID ]] && kill "$HTTP_PID" 2>/dev/null; collect_logs; [
 
 # Ports away from anything the runner may listen on, as in roles-smoke.sh.
 P_SESSION=15432 P_TRANSACTION=16543 P_REALTIME=14000 P_STORAGE=15000 P_STORAGE_ADMIN=15001 P_PGMETA=18080 P_API=14001 P_STUDIO=13000
-ADMIN=http://127.0.0.1:7000
 ORG=default       # the claim keeps the organization the first project created
 ORG2=second       # inserted into the registry below, before `projects create --org`; the Owner joins it after the claim
 OWNER_EMAIL=owner@example.com
@@ -103,8 +102,7 @@ CONF
 systemctl daemon-reload
 
 log "system init, fleet, a project in each of two organizations"
-system_init
-wait_active supavise-postgres@system.service 30
+system_up
 supavise fleet start || fail "fleet start"
 REF=$(create_project oauth micro)
 [[ $REF =~ ^[a-z]{20}$ ]] || fail "bad ref '$REF'"
@@ -118,12 +116,7 @@ REF2=$(supavise projects create --name oauth-second --class micro --org "$ORG2" 
 supavise fleet ensure-tenant "$REF2" || fail "ensure-tenant $REF2"
 
 log "daemon: supavise.service"
-systemctl start supavise.service
-for ((i = 0; i < 60; i++)); do
-  [[ $(http_code "$ADMIN/v1/projects") == 401 ]] && break
-  sleep 1
-done
-[[ $(http_code "$ADMIN/v1/projects") == 401 ]] || { journalctl --no-pager -u supavise.service | tail -30 >&2; fail "the Management API does not answer on the admin listener"; }
+start_daemon
 
 if [[ $MCP -eq 1 ]]; then
   log "Studio from the build under test"

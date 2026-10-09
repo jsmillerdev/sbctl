@@ -29,7 +29,6 @@ trap 'rc=$?; [[ -n $SMTP_PID ]] && kill "$SMTP_PID" 2>/dev/null; collect_logs; [
 # Ports away from anything the runner may listen on, as in fleet-smoke.sh.
 P_SESSION=15432 P_TRANSACTION=16543 P_REALTIME=14000 P_STORAGE=15000 P_STORAGE_ADMIN=15001 P_PGMETA=18080 P_API=14001 P_STUDIO=13000
 P_SMTP=12525
-ADMIN=http://127.0.0.1:7000
 ADMIN_EMAIL=admin@example.com
 ADMIN_PASSWORD=settings-correct-horse-battery
 
@@ -61,8 +60,7 @@ CONF
 systemctl daemon-reload
 
 log "system init, fleet, one project"
-system_init
-wait_active supavise-postgres@system.service 30
+system_up
 supavise fleet start || fail "fleet start"
 REF=$(create_project settings micro)
 [[ $REF =~ ^[a-z]{20}$ ]] || fail "bad ref '$REF'"
@@ -84,12 +82,7 @@ direct_login() { PGPASSWORD=$1 "$PSQL" "host=127.0.0.1 port=$PGPORT user=postgre
 pooler_login() { PGPASSWORD=$1 "$PSQL" "host=127.0.0.1 port=$P_SESSION user=postgres.$REF dbname=postgres sslmode=disable connect_timeout=10" -Atc 'select 1' </dev/null >/dev/null 2>&1; }
 
 log "daemon: supavise.service"
-systemctl start supavise.service
-for ((i = 0; i < 60; i++)); do
-  [[ $(http_code "$ADMIN/v1/projects") == 401 ]] && break
-  sleep 1
-done
-[[ $(http_code "$ADMIN/v1/projects") == 401 ]] || { journalctl --no-pager -u supavise.service | tail -30 >&2; fail "the Management API does not answer on the admin listener"; }
+start_daemon
 
 # A personal access token through the claim flow, as the installer's users get one.
 dash() { curl -sS -m 60 -X "$1" -H "Host: api.$SUPAVISE_DOMAIN" "${@:3}" "http://127.0.0.1$2"; }

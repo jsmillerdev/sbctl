@@ -36,15 +36,6 @@ trap 'rc=$?; rm -f "$W/live.run"; collect_logs; cp "$W"/*.log "$W"/*.txt "$LOG_D
 
 s3() { python3 "$S3PY" "$@"; }
 sha() { sha256sum | cut -d' ' -f1; }
-wait_for() { # SECONDS WHAT CMD...: polls CMD every half second until it succeeds
-  local n=$1 what=$2 i
-  shift 2
-  for ((i = 0; i < n * 2; i++)); do
-    "$@" >/dev/null 2>&1 && return 0
-    sleep 0.5
-  done
-  fail "timed out after ${n}s waiting for $what"
-}
 
 # Ports away from anything the runner may already listen on, as in fleet-smoke.sh.
 P_SESSION=15432 P_TRANSACTION=16543 P_REALTIME=14000 P_STORAGE=15000 P_STORAGE_ADMIN=15001 P_PGMETA=18080 P_API=14001 P_STUDIO=13000 P_EDGE=19000
@@ -79,20 +70,11 @@ install -m 0600 -o "$SUPAVISE_USER" -g "$SUPAVISE_USER" /dev/null "$CREDS"
 printf 'access_key_id=%s\nsecret_access_key=%s\n' "$S3_KEY" "$S3_SECRET" >"$CREDS"
 
 log "system init, shared services, daemon"
-system_init
-wait_active supavise-postgres@system.service 30
+system_up
 supavise fleet start || fail "fleet start"
 systemctl start supavise.service
-for ((i = 0; i < 180; i++)); do
-  supavise fleet status >/dev/null 2>&1 && break
-  sleep 2
-done
-supavise fleet status || { journalctl --no-pager -u supavise.service | tail -40 >&2; fail "the shared services are not up"; }
-for ((i = 0; i < 60; i++)); do
-  [[ $(http_code -H "Host: $API_HOST" http://127.0.0.1/v1/projects) == 401 ]] && break
-  sleep 1
-done
-[[ $(http_code -H "Host: $API_HOST" http://127.0.0.1/v1/projects) == 401 ]] || fail "the Management API does not answer through the proxy"
+wait_fleet "the shared services are not up"
+wait_proxy_api 60
 claim_and_token
 gen_dbpass
 REF=$(api_create_project storage-migrate)
@@ -212,7 +194,7 @@ for ((i = 0; i < 120; i++)); do
 done
 status_has '^phase:  *copying' || { cat "$W/migrate1.log" >&2; fail "the run never reached the copy"; }
 bucket_has_some() { [[ $(s3 list "$REF/" | wc -l) -ge 3 ]]; }
-wait_for 90 "some of the objects in the bucket" bucket_has_some
+wait_for 90 0.5 "some of the objects in the bucket" bucket_has_some
 pkill -KILL -f 'supavise storage migrate' || true
 wait "$MIGRATE" 2>/dev/null || true
 s3 list "$REF/" | LC_ALL=C sort >"$W/keys-at-kill.txt"
@@ -289,7 +271,7 @@ grep -q 'content-type: text/plain' <<<"$head_of" && grep -q 'cache-control: max-
 [[ $(s3 get "$REF/docs/big.bin/$BIG_VERSION" | sha) == "$(sha <"$KEPT/stub/$REF/docs/big.bin/$BIG_VERSION")" ]] || fail "the 80 MiB file differs in the bucket"
 
 log "Storage serves every object from the bucket, with the headers it had"
-wait_for 60 "Storage" storage_up
+wait_for 60 0.5 "Storage" storage_up
 for o in "${OBJECTS[@]}"; do
   IFS='|' read -r name _ file <<<"$o"
   [[ $(st "$BASE/object/docs/$(enc "$name")" | sha) == "$(sha <"$file")" ]] || fail "$name from the bucket differs from what was uploaded"
@@ -323,7 +305,7 @@ if conf_has storage_backend s3; then fail "config.toml still names the s3 backen
 grep -q '^STORAGE_BACKEND="file"' "$STORAGE_ENV" || fail "storage.env does not name the file backend"
 [[ -d $STORAGE_DIR/objects/stub/$REF ]] || fail "the files are not back in place"
 [[ -z $(ls -d "$STORAGE_DIR"/objects.migrated-* 2>/dev/null || true) ]] || fail "the kept files are still aside after the rollback"
-wait_for 60 "Storage" storage_up
+wait_for 60 0.5 "Storage" storage_up
 for o in "${OBJECTS[@]}"; do
   IFS='|' read -r name _ file <<<"$o"
   [[ $name == doomed.txt ]] && continue

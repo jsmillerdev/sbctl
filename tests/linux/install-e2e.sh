@@ -52,7 +52,7 @@ api() { # METHOD PATH [curl args...]  (Host api.<base>)
   local m=$1 p=$2; shift 2
   curl -sS -m 60 -X "$m" -H "Host: api.$BASE" "$@" "http://127.0.0.1$p"
 }
-code() { # curl args... URL -> status code
+url_code() { # curl args... URL -> status code
   curl -s -o /dev/null -w '%{http_code}' -m 30 "$@" || true
 }
 jq_() { python3 -c 'import json,sys; d=json.load(sys.stdin); print('"$1"')'; }
@@ -86,26 +86,16 @@ if [[ -z $RELEASETOOL ]]; then
 fi
 make_release() { # TAG BINARY-FILE [nolatest]: builds $WORK/srv/download/TAG and the fake GitHub API files for repo o/r
   local tag=$1 bin=$2 latest=${3:-latest} d=$WORK/srv/download/$1
-  rm -rf "$d"; mkdir -p "$d"
-  cp "$bin" "$d/supavise-linux-$ARCH"
-  if [[ $ARCH == amd64 ]]; then echo other-arch >"$d/supavise-linux-arm64"; else echo other-arch >"$d/supavise-linux-amd64"; fi
+  release_stage "$d" "$bin" "$ARCH"
   echo "not a real studio build" >"$d/supavise-studio-test-p1-linux-$ARCH.tar.zst"
   SUPAVISE_RELEASE_TAG=$tag SUPAVISE_RELEASETOOL=$RELEASETOOL deploy/release-assets.sh "$d" "$KEYS/sign.pem" "$KEYS/pub.pem" >/dev/null
-  mkdir -p "$WORK/srv/repos/o/r/releases/tags"
-  python3 - "$tag" "$d" "$SRV_PORT" "$WORK/srv/repos/o/r/releases" "$latest" <<'PY'
-import json, os, sys
-tag, d, port, out, latest = sys.argv[1:]
-rel = {"tag_name": tag, "assets": [{"name": n, "browser_download_url": f"http://127.0.0.1:{port}/download/{tag}/{n}"} for n in sorted(os.listdir(d))]}
-for name in (("latest",) if latest == "latest" else ()) + (f"tags/{tag}",):
-    with open(os.path.join(out, name), "w") as f:
-        json.dump(rel, f)
-PY
+  release_api "$tag" "$d" "127.0.0.1:$SRV_PORT" "$latest"
 }
 mkdir -p "$WORK/srv"
 make_release v0.0.1 "$SUPAVISE_BIN"
 (cd "$WORK/srv" && exec python3 -m http.server "$SRV_PORT" --bind 127.0.0.1 >"$WORK/http.log" 2>&1) &
 SRV_PID=$!
-for ((i = 0; i < 20; i++)); do [[ $(code "http://127.0.0.1:$SRV_PORT/download/v0.0.1/SHA256SUMS") == 200 ]] && break; sleep 0.5; done
+for ((i = 0; i < 20; i++)); do [[ $(url_code "http://127.0.0.1:$SRV_PORT/download/v0.0.1/SHA256SUMS") == 200 ]] && break; sleep 0.5; done
 
 log "the release carries a manifest that the signed checksum list covers"
 M=$WORK/srv/download/v0.0.1/supavise-release.json
@@ -161,10 +151,7 @@ grep -q __SUPAVISE_RELEASE_PUBKEY_B64__ "$D/install.sh" && fail "the stamped ins
 
 # ---- 3. install ------------------------------------------------------------------------
 # A runner image may ship services on our ports.
-systemctl stop apache2 nginx postgresql mysql 2>/dev/null || true
-for p in 80 443 5432 6543 5433 9999 7000 3000 8080 4000 5000; do
-  if ss -ltnH "sport = :$p" | grep -q .; then ss -ltnp "sport = :$p" >&2; fail "port $p is already in use on this VM"; fi
-done
+require_free_ports
 
 STUDIO_ARGS=(--no-studio)
 if [[ $E2E_STUDIO == 1 ]]; then
@@ -234,20 +221,20 @@ grep -q "claim token from an earlier run is still valid" "$WORK/install-preclaim
 grep -q "$TOKEN" "$WORK/install-preclaim.log" && fail "the re-run printed the claim token"
 
 log "dashboard through the proxy"
-[[ $(code -H "Host: studio.$BASE" http://127.0.0.1/api/incident-banner) == 200 ]] || fail "studio host: the proxy does not answer its banner route"
+[[ $(url_code -H "Host: studio.$BASE" http://127.0.0.1/api/incident-banner) == 200 ]] || fail "studio host: the proxy does not answer its banner route"
 if [[ $E2E_STUDIO == 1 ]]; then
   for ((i = 0; i < 30; i++)); do
-    [[ $(code -H "Host: studio.$BASE" http://127.0.0.1/api/get-utc-time) == 200 ]] && break
+    [[ $(url_code -H "Host: studio.$BASE" http://127.0.0.1/api/get-utc-time) == 200 ]] && break
     sleep 2
   done
-  [[ $(code -H "Host: studio.$BASE" http://127.0.0.1/api/get-utc-time) == 200 ]] || { journalctl --no-pager -u supavise-studio -n 40 >&2; fail "Studio is not served through studio.<domain>"; }
-  [[ $(code -H "Host: studio.$BASE" http://127.0.0.1/) =~ ^(200|307|308)$ ]] || fail "Studio's front page does not answer through the proxy"
+  [[ $(url_code -H "Host: studio.$BASE" http://127.0.0.1/api/get-utc-time) == 200 ]] || { journalctl --no-pager -u supavise-studio -n 40 >&2; fail "Studio is not served through studio.<domain>"; }
+  [[ $(url_code -H "Host: studio.$BASE" http://127.0.0.1/) =~ ^(200|307|308)$ ]] || fail "Studio's front page does not answer through the proxy"
 fi
-[[ $(code -H "Host: nothing.$BASE" http://127.0.0.1/) == 404 ]] || fail "an unknown host did not get a 404"
+[[ $(url_code -H "Host: nothing.$BASE" http://127.0.0.1/) == 404 ]] || fail "an unknown host did not get a 404"
 
 # ---- 4. claim --------------------------------------------------------------------------
 log "claim page and token"
-[[ $(code -H "Host: api.$BASE" http://127.0.0.1/claim) == 200 ]] || fail "GET /claim"
+[[ $(url_code -H "Host: api.$BASE" http://127.0.0.1/claim) == 200 ]] || fail "GET /claim"
 [[ $(api GET /claim -D - -o /dev/null | tr -d '\r' | grep -i '^content-security-policy:' | wc -l) -eq 1 ]] || fail "the claim page has no CSP"
 [[ $(api GET /v1/projects -o /dev/null -w '%{http_code}') == 401 ]] || fail "the Management API answered without credentials"
 claim_body() { printf '{"token":"%s","email":"%s","password":"%s","organization_name":"E2E"}' "$1" "$ADMIN_EMAIL" "$ADMIN_PASSWORD"; }
@@ -328,9 +315,9 @@ for ((i = 0; i < 30; i++)); do
   sleep 2
 done
 [[ $n == 2 ]] || fail "REST /rest/v1/e2e_items with the publishable key returned '$n' rows, want 2"
-[[ $(code -H "Host: $REF.api.$BASE" http://127.0.0.1/rest/v1/e2e_items) == 401 ]] || fail "REST without a key was not a 401"
-[[ $(code -H "Host: $REF.api.$BASE" -H "apikey: sb_publishable_wrong" http://127.0.0.1/rest/v1/e2e_items) == 401 ]] || fail "REST with a wrong key was not a 401"
-[[ $(code -H "Host: $REF.api.$BASE" -H "apikey: $SEC" http://127.0.0.1/storage/v1/bucket) == 200 ]] || fail "Storage tenant: GET /storage/v1/bucket with the secret key (the daemon did not register the project with Storage)"
+[[ $(url_code -H "Host: $REF.api.$BASE" http://127.0.0.1/rest/v1/e2e_items) == 401 ]] || fail "REST without a key was not a 401"
+[[ $(url_code -H "Host: $REF.api.$BASE" -H "apikey: sb_publishable_wrong" http://127.0.0.1/rest/v1/e2e_items) == 401 ]] || fail "REST with a wrong key was not a 401"
+[[ $(url_code -H "Host: $REF.api.$BASE" -H "apikey: $SEC" http://127.0.0.1/storage/v1/bucket) == 200 ]] || fail "Storage tenant: GET /storage/v1/bucket with the secret key (the daemon did not register the project with Storage)"
 
 log "pooler login as postgres.$REF on both ports"
 PSQL=$(ls -d "$SUPAVISE_STATE"/artifacts/postgres/*/bin/psql | head -1)
@@ -368,9 +355,9 @@ HUMAN=$(sup status) || fail "supavise status exited non-zero on a healthy node"
 log "GET /healthz: public, a verdict and nothing else"
 HZ=$(api GET /healthz)
 [[ $HZ == '{"status":"healthy"}' ]] || fail "/healthz answered '$HZ'"
-[[ $(code -H "Host: api.$BASE" http://127.0.0.1/healthz) == 200 ]] || fail "/healthz is not a 200 on a healthy node"
+[[ $(url_code -H "Host: api.$BASE" http://127.0.0.1/healthz) == 200 ]] || fail "/healthz is not a 200 on a healthy node"
 [[ $HZ != *"$REF"* ]] || fail "/healthz names a project"
-[[ $(code -H "Host: api.$BASE" http://127.0.0.1/healthz/detail) == 401 ]] || fail "/healthz/detail answered without credentials"
+[[ $(url_code -H "Host: api.$BASE" http://127.0.0.1/healthz/detail) == 401 ]] || fail "/healthz/detail answered without credentials"
 # The daemon shares one report between callers for a few seconds (health.cache), so a report taken
 # before the project existed may still be served right after it was created: ask again until
 # the cache has turned over.
@@ -403,7 +390,7 @@ for ((i = 0; i < 40; i++)); do
   HZ=$(api GET /healthz); [[ $HZ == '{"status":"degraded"}' ]] && break; sleep 2
 done
 [[ $HZ == '{"status":"degraded"}' ]] || fail "/healthz is '$HZ' with a project's PostgREST stopped, want degraded"
-[[ $(code -H "Host: api.$BASE" http://127.0.0.1/healthz) == 200 ]] || fail "/healthz is not a 200 on a degraded node (a load balancer would pull it)"
+[[ $(url_code -H "Host: api.$BASE" http://127.0.0.1/healthz) == 200 ]] || fail "/healthz is not a 200 on a degraded node (a load balancer would pull it)"
 systemctl start "supavise-postgrest@$REF.service"
 wait_active "supavise-postgrest@$REF.service" 60
 rc=1
@@ -509,7 +496,6 @@ build_version() { # VERSION OUT [GIVEN-PATH]
 }
 V2=$WORK/supavise-v2; build_version v0.0.2 "$V2" "${SUPAVISE_BIN_V2:-}"
 V3=$WORK/supavise-v3; build_version v0.0.3 "$V3" "${SUPAVISE_BIN_V3:-}"
-daemon_version() { "/proc/$(systemctl show -p MainPID --value supavise.service)/exe" --version; }
 [[ $(daemon_version) == *v0.0.1* ]] || fail "the daemon does not run v0.0.1 before the upgrade: $(daemon_version)"
 log "re-running install.sh with the v0.0.2 binary moves the daemon onto it"
 ENTER=$(systemctl show -p ActiveEnterTimestampMonotonic --value supavise.service)

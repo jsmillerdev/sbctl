@@ -35,7 +35,6 @@ TEARDOWN=0
 [[ ${1:-} == --teardown ]] && TEARDOWN=1
 trap 'rc=$?; collect_logs; [[ $TEARDOWN -eq 1 ]] && teardown; exit $rc' EXIT
 
-ADMIN=http://127.0.0.1:7000
 VERSIONS_SRC=$REPO_ROOT/internal/versions/versions.yaml
 # Real slim-services releases (github.com/supabase/slim-services/releases), each with its linux
 # amd64 and arm64 archives: GoTrue 2.195.0 in two packaging revisions and two PostgREST releases.
@@ -74,13 +73,7 @@ use_pins() {
 }
 restart_daemon() {
   systemctl restart supavise.service
-  local i
-  for ((i = 0; i < 120; i++)); do
-    [[ $(http_code "$ADMIN/v1/projects") == 401 ]] && return 0
-    sleep 1
-  done
-  journalctl --no-pager -u supavise.service | tail -40 >&2
-  fail "the Management API does not answer after the daemon restart"
+  wait_admin 120 "the Management API does not answer after the daemon restart"
 }
 
 pins_file old "$OLD_AUTH" "$OLD_REST"
@@ -89,20 +82,13 @@ pins_file bad "$NEW_AUTH" "$BAD_REST"
 
 log "release 1: GoTrue $OLD_AUTH, PostgREST $OLD_REST; system init, daemon"
 use_pins old
-system_init
-wait_active supavise-postgres@system.service 30
-systemctl start supavise.service
-for ((i = 0; i < 60; i++)); do
-  [[ $(http_code "$ADMIN/v1/projects") == 401 ]] && break
-  sleep 1
-done
-[[ $(http_code "$ADMIN/v1/projects") == 401 ]] || { journalctl --no-pager -u supavise.service | tail -30 >&2; fail "the Management API does not answer"; }
+system_up
+start_daemon 60 "the Management API does not answer"
 
 log "two projects on the old versions"
 claim_and_token
 JWT=$(api POST '/auth/v1/token?grant_type=password' -H 'Content-Type: application/json' \
   -d '{"email":"smoke@example.com","password":"smoke-correct-horse-battery"}' | json_get 'd["access_token"]') || fail "dashboard sign-in"
-japi() { local m=$1 p=$2; shift 2; api "$m" "$p" -H "Authorization: Bearer $JWT" "$@"; }
 gen_dbpass
 REF=$(api_create_project upgrade-smoke)
 gen_dbpass
@@ -114,25 +100,6 @@ pg_admin() { # REF SQL: as supabase_admin over the cluster's private socket
   sudo -u "$SUPAVISE_USER" "$PSQL" "host=$SUPAVISE_STATE/projects/$ref/postgres/sock port=$port user=supabase_admin dbname=postgres" -Atc "$2" </dev/null
 }
 status() { papi GET "/v1/projects/$1" | json_get 'd["status"]'; }
-code() { # METHOD PATH [BODY]
-  local m=$1 p=$2 b=${3:-}
-  papi "$m" "$p" -o /dev/null -w '%{http_code}' ${b:+-H 'Content-Type: application/json' -d "$b"} || true
-}
-must() { # STATUS METHOD PATH [BODY]
-  local want=$1 got
-  got=$(code "$2" "$3" "${4:-}")
-  [[ $got == "$want" ]] || { log "response: $(papi "$2" "$3" ${4:+-H 'Content-Type: application/json' -d "$4"} | head -c 400)"; fail "$2 $3 answered $got, want $want"; }
-}
-wait_status() { # REF STATUS SECONDS
-  local ref=$1 want=$2 n=${3:-600} i s=""
-  for ((i = 0; i < n; i++)); do
-    s=$(status "$ref" 2>/dev/null || true)
-    [[ $s == "$want" ]] && return 0
-    sleep 1
-  done
-  journalctl --no-pager -u supavise.service | tail -60 >&2
-  fail "$ref is $s after ${n}s, want $want"
-}
 # upgrade_status REF PYEXPR: a field of GET /v1/projects/{ref}/upgrade/status's databaseUpgradeStatus.
 upgrade_status() { papi GET "/v1/projects/$1/upgrade/status" | json_get "$2"; }
 wait_upgrade() { # REF STATUS_NUMBER SECONDS: until the newest upgrade of REF has that status

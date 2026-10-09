@@ -140,21 +140,11 @@ openssl genpkey -algorithm ed25519 -out "$KEYS/sign.pem"
 openssl pkey -in "$KEYS/sign.pem" -pubout -out "$KEYS/pub.pem"
 make_release() { # TAG BINARY VERSIONS-YAML [latest|nolatest]: $WORK/srv/download/TAG and the API files for repo o/r
   local tag=$1 bin=$2 yaml=$3 latest=${4:-nolatest} d=$WORK/srv/download/$1
-  rm -rf "$d"; mkdir -p "$d"
-  cp "$bin" "$d/supavise-linux-$ARCH"
-  if [[ $ARCH == amd64 ]]; then echo other-arch >"$d/supavise-linux-arm64"; else echo other-arch >"$d/supavise-linux-amd64"; fi
+  release_stage "$d" "$bin" "$ARCH"
   echo "not a real studio build" >"$d/supavise-studio-test-p1-linux-$ARCH.tar.zst"
   SUPAVISE_RELEASE_TAG=$tag SUPAVISE_RELEASETOOL=$BINS/releasetool SUPAVISE_VERSIONS_FILE=$yaml \
     deploy/release-assets.sh "$d" "$KEYS/sign.pem" "$KEYS/pub.pem" >/dev/null
-  mkdir -p "$WORK/srv/repos/o/r/releases/tags"
-  python3 - "$tag" "$d" "$SRV_PORT" "$WORK/srv/repos/o/r/releases" "$latest" <<'PY'
-import json, os, sys
-tag, d, port, out, latest = sys.argv[1:]
-rel = {"tag_name": tag, "assets": [{"name": n, "browser_download_url": f"http://127.0.0.1:{port}/download/{tag}/{n}"} for n in sorted(os.listdir(d))]}
-for name in (("latest",) if latest == "latest" else ()) + (f"tags/{tag}",):
-    with open(os.path.join(out, name), "w") as f:
-        json.dump(rel, f)
-PY
+  release_api "$tag" "$d" "127.0.0.1:$SRV_PORT" "$latest"
 }
 mkdir -p "$WORK/srv"
 cat >"$WORK/srv.py" <<'PY'
@@ -175,17 +165,13 @@ make_release v0.0.1 "$B/prev" "$BINS/prev.versions.yaml"
 for ((i = 0; i < 20; i++)); do [[ $(http_code "http://127.0.0.1:$SRV_PORT/download/v0.0.1/SHA256SUMS") == 200 ]] && break; sleep 0.5; done
 
 # ---- install the previous release ---------------------------------------------------------
-systemctl stop apache2 nginx postgresql mysql 2>/dev/null || true
-for p in 80 443 5432 6543 5433 9999 7000 3000 8080 4000 5000; do
-  if ss -ltnH "sport = :$p" | grep -q .; then ss -ltnp "sport = :$p" >&2; fail "port $p is already in use on this VM"; fi
-done
+require_free_ports
 log "install.sh --binary: the previous release (v0.0.1, older GoTrue, PostgREST, postgres-meta and Storage)"
 deploy/install.sh --binary "$B/prev" --public-ip 127.0.0.1 --tls off --email ci@example.com --firewall none --no-studio \
   --claim-token-file "$WORK/claim-token" 2>&1 | tee "$WORK/install.log"
 [[ ${PIPESTATUS[0]} -eq 0 ]] || fail "install.sh failed"
 [[ $($SV --version) == *v0.0.1* ]] || fail "the installed binary is $($SV --version)"
 for u in supavise.service supavise-postgres@system.service supavise-gotrue@system.service supavise-pgmeta.service supavise-supavisor.service supavise-realtime.service supavise-storage.service; do wait_active "$u" 90; done
-ADMIN=http://127.0.0.1:7000
 
 # ---- helpers --------------------------------------------------------------------------------
 PSQL=$(ls -d "$STATE"/artifacts/postgres/*/bin/psql | head -1)
@@ -208,22 +194,7 @@ unit_runs() {
 }
 runs() { unit_runs "$1" "$2" || fail "$1 does not run $2"; }
 runs_not() { ! unit_runs "$1" "$2" || fail "$1 runs $2, which it should not"; }
-daemon_version() { "/proc/$(systemctl show -p MainPID --value supavise.service)/exe" --version; }
-wait_daemon() {
-  local i
-  for ((i = 0; i < 120; i++)); do [[ $(http_code "$ADMIN/v1/projects") == 401 ]] && return 0; sleep 1; done
-  journalctl --no-pager -u supavise.service | tail -40 >&2
-  fail "the Management API does not answer"
-}
-wait_status() { # REF STATUS SECONDS
-  local ref=$1 want=$2 n=${3:-300} i s=""
-  for ((i = 0; i < n; i++)); do
-    s=$(papi GET "/v1/projects/$ref" | json_get 'd["status"]' 2>/dev/null || true)
-    [[ $s == "$want" ]] && return 0
-    sleep 1
-  done
-  fail "$ref is $s after ${n}s, want $want"
-}
+wait_daemon() { wait_admin 120 "the Management API does not answer"; }
 # run CMD...: OUT and RC from a command that may fail; the output is kept in $WORK/outputs too.
 run() {
   local n; n=$(ls "$WORK/outputs" | wc -l)

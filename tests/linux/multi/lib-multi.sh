@@ -335,19 +335,9 @@ garage_down() { docker rm -f garage >/dev/null 2>&1 || true; }
 make_release() {
   local tag=$1 bin=$2 arch d=$WORK/srv/download/$1
   arch=$(dpkg --print-architecture)
-  rm -rf "$d"; mkdir -p "$d"
-  cp "$bin" "$d/supavise-linux-$arch"
-  if [[ $arch == amd64 ]]; then echo other-arch >"$d/supavise-linux-arm64"; else echo other-arch >"$d/supavise-linux-amd64"; fi
+  release_stage "$d" "$bin" "$arch"
   SUPAVISE_RELEASE_TAG=$tag deploy/release-assets.sh "$d" "$WORK/keys/sign.pem" "$WORK/keys/pub.pem" >/dev/null
-  mkdir -p "$WORK/srv/repos/o/r/releases/tags"
-  python3 - "$tag" "$d" "$BRIDGE_IP:$RELEASE_PORT" "$WORK/srv/repos/o/r/releases" <<'PY'
-import json, os, sys
-tag, d, addr, out = sys.argv[1:]
-rel = {"tag_name": tag, "assets": [{"name": n, "browser_download_url": f"http://{addr}/download/{tag}/{n}"} for n in sorted(os.listdir(d))]}
-for name in ("latest", f"tags/{tag}"):
-    with open(os.path.join(out, name), "w") as f:
-        json.dump(rel, f)
-PY
+  release_api "$tag" "$d" "$BRIDGE_IP:$RELEASE_PORT" latest
 }
 
 # release_server_up TAG BINARY: a signed release of BINARY, served on the bridge address. A node installs
