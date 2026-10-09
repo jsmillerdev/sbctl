@@ -372,7 +372,7 @@ One placeholder, `NEXT_PUBLIC_MCP_URL`, carries the URL into Connect > MCP (`req
 | Discovery hosts | an MCP host and an API host | one host | no extra DNS name |
 | `revocation_endpoint` | not advertised | advertised | clients can revoke on sign-out |
 | Dynamic app logo | probably shown | never returned | a self-asserted logo spoofs the consent page |
-| Public clients | a secret is issued even to a `none` client | a dynamic app may omit its secret when its PKCE verifier is right | tolerates clients that registered `none` |
+| Public clients | a secret is issued even to a `none` client | a dynamic app may omit its secret when its PKCE verifier is right, and one registered `none` may refresh with its refresh token alone | tolerates clients that registered `none` |
 | CORS | echoes the origin, with credentials | `*`, no credentials | cannot leak cookies |
 | `scope` at authorize | deprecated | honored, narrowing only | least privilege |
 | `skip_elicitations` | works | accepted and ignored | stateless transport |

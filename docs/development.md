@@ -47,6 +47,8 @@ The unpacked artifacts default to `~/.cache/sbctl/unpacked`, a path the test cod
 | `replication-spike` | the two-node Incus harness of `tests/linux/multi` on both architectures |
 | `screenshots` | README screenshots |
 
+The `studio` workflow starts on changes under `studio/`, in `internal/versions/versions.yaml` and in its own file. A change that touches only `tests/linux/oauth/`, the `/mcp` gate or the proxy does not start `mcp-e2e`, so start the workflow by hand after one and before a release. `release-gate.sh` requires `linux.yml` and not `studio.yml`, so the release gate does not wait for `mcp-e2e`.
+
 ## Conventions
 
 Rules the code follows. A change that breaks one needs a reason in [design.md](design.md).

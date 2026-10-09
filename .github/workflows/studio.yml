@@ -52,6 +52,10 @@ jobs:
   # and an account-scoped URL, read_only, features, a personal access token as bearer, get_project_url and
   # create_project. It reuses the build's artifact, so it costs no second Studio build. `!cancelled()` runs
   # it when only the spike (or the arm64 build) failed; a missing amd64 artifact fails the download step.
+  # The path filter above is Studio's, so a push that changes only the walk, the /mcp gate or the proxy
+  # does not start this workflow: run it by hand (workflow_dispatch) after such a change and before a
+  # release. The `oauth-smoke` job of linux.yml, which release-gate.sh requires, covers the same walk
+  # without L-09 and the Studio checks.
   mcp-e2e:
     needs: build
     if: ${{ !cancelled() }}

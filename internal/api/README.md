@@ -232,7 +232,7 @@ Provider changes and sign-in decisions are events of the system project (`sso.pr
 
 ## OAuth sign-in for MCP clients
 
-`internal/oauth` holds the rules and the stores (apps, authorizations, grants, tokens); this package holds the HTTP layer, the principal and the gate. `Deps.OAuth` is the `oauth.Authority` the handlers call, and tests fake it by embedding the interface. [docs/design.md](../../docs/design.md#13-oauth-sign-in-and-the-remote-mcp-endpoint) section 13 has the design; this section says where each part lives.
+`internal/oauth` holds the rules and the stores (apps, authorizations, grants, tokens); this package holds the HTTP layer, the principal and the gate. `Deps.OAuth` is the `*oauth.Service` the server is built with; the handlers reach it through the `oauth.Authority` interface (`Server.oauth`), and tests fake that interface by embedding it. [docs/design.md](../../docs/design.md#13-oauth-sign-in-and-the-remote-mcp-endpoint) section 13 has the design; this section says where each part lives.
 
 | File | What it holds |
 |---|---|
@@ -341,7 +341,7 @@ Afterwards check that nothing still listens on `32100-32999` and no CLI started 
 - **`supabase db push --linked`.** The CLI dials `db.<ref>.<project_host>:5432` and the pooler on 5432; both ports are hard-coded in the CLI.
 - **MCP `get_project_url`.** The stdio MCP server derives it from the API host (`*.supabase.red`), so it is wrong for any custom domain. This is an upstream limitation. The remote endpoint (`/mcp`) fills it from `SUPAVISE_PROJECT_URL_TEMPLATE` and is correct.
 - **OAuth tokens and operations without a scope.** An OAuth token is denied every operation whose spec entry has no `x-oauth-scope` (21 of 50 in `v2` are annotated, 134 of 169 in `v1`, none in `platform`), apart from the two storage-config overrides. If hosted treats some of those differently, only the opt-in `storage` tool group is known to be affected.
-- **Refresh and public clients.** A dynamic app without a secret is accepted for `authorization_code` with a valid PKCE verifier (design section 2.7). The design does not say whether it may also refresh without a secret. `oauth-walk.mjs` (step L-07) records what the server does and sends the secret it was issued on every refresh.
+- **Refresh and public clients.** A dynamic app without a secret is accepted for `authorization_code` with a valid PKCE verifier, and, when it registered with `token_endpoint_auth_method` `none`, for `refresh_token` with the refresh token alone (`publicClientOK`): the token rotates and a reuse outside the grace window revokes the grant. A dynamic app that registered for a secret and every manual app must present it on both grants, and a presented secret must always be correct. Design section 2.7 names only `authorization_code` for a client without a secret, so the refresh rule is the server's decision; `oauth-walk.mjs` (steps L-05 and L-07) asserts it.
 - **Query serialization.** Parameterized queries are wrapped in a CTE so Postgres serializes the rows (trailing semicolons and comments are stripped first). Statements that cannot sit in a CTE (DDL, INSERT without RETURNING, SHOW, EXPLAIN) run unwrapped and their rows are marshaled from the driver's values, which can differ from Postgres's JSON for exotic types. `bigint` columns can differ between `parameters` queries and pg-meta SQL (number vs string).
 - **Advisors** return no lints.
 - **Region and provider** are reported as the configured AWS region code (`region`, default `us-east-1`) and `AWS`.
