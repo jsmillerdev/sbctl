@@ -49,7 +49,7 @@ when no artifact is installed and [studio] artifact_url is not set.`,
 			if err != nil {
 				return err
 			}
-			n, err := lifecycle.Open(cmd.Context(), cfg, openOptions(cfg))
+			n, err := openLifecycle(cmd.Context(), cfg, openOptions(cfg))
 			if err != nil {
 				return err
 			}
@@ -214,7 +214,7 @@ func withFleet(cmd *cobra.Command, run func(ctx context.Context, d fleet.Deps, f
 	if err != nil {
 		return err
 	}
-	n, err := lifecycle.Open(cmd.Context(), cfg, openOptions(cfg))
+	n, err := openLifecycle(cmd.Context(), cfg, openOptions(cfg))
 	if err != nil {
 		return err
 	}

@@ -88,11 +88,16 @@ func runStatus(ctx context.Context, w io.Writer, asJSON, verbose bool) (int, err
 	return rep.Verdict.ExitCode(), nil
 }
 
-// statusSections are the blocks a cluster adds below the node report: the nodes and replicas, the
-// failover readiness and the infrastructure the release needs. Each is nil on a node that has
-// nothing to say, which is every node that is not part of a cluster or on a stack that lags, so
-// for those the output is the node report alone. They do not change the verdict.
+// hostBlockOf reads the host block of the report; the tests of the other blocks replace it.
+var hostBlockOf = hostStatusBlock
+
+// statusSections are the blocks added below the node report: the host layer when a step of
+// `supavise system converge` has work or could not be checked, and, for a cluster, the nodes and replicas,
+// the failover readiness and the infrastructure the release needs. Each is nil on a node that has
+// nothing to say, which is every node that is not part of a cluster, converged and not on a stack that
+// lags, so for those the output is the node report alone. They do not change the verdict.
 type statusSections struct {
+	Host           *hostBlock          `json:"host,omitempty"`
 	Cluster        *clusterBlock       `json:"cluster,omitempty"`
 	Failover       *failover.Readiness `json:"failover,omitempty"`
 	Infrastructure *infra.Report       `json:"infrastructure,omitempty"`
@@ -120,6 +125,9 @@ func collectStatusSections(ctx context.Context, cfg *config.Config) statusSectio
 		s.Errors[name] = err.Error()
 	}
 	var err error
+	if s.Host, err = hostBlockOf(ctx, cfg); err != nil {
+		fail("host", err)
+	}
 	if s.Cluster, err = clusterStatus(ctx, cfg); err != nil {
 		fail("cluster", err)
 	}
@@ -134,6 +142,10 @@ func collectStatusSections(ctx context.Context, cfg *config.Config) statusSectio
 
 // render writes the blocks, each after a blank line.
 func (s statusSections) render(w io.Writer) {
+	if s.Host != nil {
+		fmt.Fprintln(w)
+		s.Host.Render(w)
+	}
 	if s.Cluster != nil {
 		fmt.Fprintln(w)
 		s.Cluster.render(w)
@@ -146,7 +158,7 @@ func (s statusSections) render(w io.Writer) {
 		fmt.Fprintln(w)
 		s.Infrastructure.Render(w)
 	}
-	for _, name := range []string{"cluster", "failover", "infrastructure"} {
+	for _, name := range []string{"host", "cluster", "failover", "infrastructure"} {
 		if msg, ok := s.Errors[name]; ok {
 			fmt.Fprintf(w, "\n%s  could not be read: %s\n", name, msg)
 		}
@@ -160,7 +172,7 @@ func (s statusSections) render(w io.Writer) {
 // files from a node that is down.
 func statusDeps(ctx context.Context, cfg *config.Config) (health.Deps, func(), error) {
 	log := newLogger(cfg)
-	node, err := lifecycle.Open(ctx, cfg, openOptions(cfg))
+	node, err := openLifecycle(ctx, cfg, openOptions(cfg))
 	if err != nil {
 		return downDeps(cfg, log, err), func() {}, err
 	}

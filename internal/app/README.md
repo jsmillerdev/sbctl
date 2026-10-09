@@ -90,8 +90,11 @@ is the daemon that `supavise.service` runs.
   is a day old). A restore, an upgrade and an upgrade's backup of such a project are still refused by the
   leader's Engine until the project is moved to it. Without the backup service none of this runs, and the
   node says so (`placement.RoutedBackups` is off).
-- The commands of the CLI that open the node (`openNode`, `openOptions`) open the registry as a
-  leader's; a follower needs the read-only open that `openFollower` gives the daemon.
+- The commands of the CLI that open the node or the registry (`openLifecycle`, `openRegistry` in
+  `cmd/supavise`) ask which socket of `RegistryDSNs` answers and whether it is in recovery, as `supavise node`
+  does: on a follower they open the standby read-only, and a write fails with `registry.ErrReadOnly`, which
+  the CLI explains ("run it on the leader"). `supavise backups create` of a project homed on a follower
+  therefore refuses; the leader backs those projects up (`routeBackups`).
 - A server move that the restart interrupts is finished by the daemon that starts as the leader, without
   the CLI that started it: the CLI's stream ends when the old daemon stops, and `supavise failover --resume`
   or the log shows the rest.

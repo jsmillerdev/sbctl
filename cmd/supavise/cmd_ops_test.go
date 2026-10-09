@@ -206,6 +206,7 @@ func TestAlertsListIsEmptyOnAFreshNode(t *testing.T) {
 // A node whose system cluster is not running is down: exit status 2, and the report says why
 // without needing the registry.
 func TestStatusOfANodeThatIsNotRunning(t *testing.T) {
+	noHostBlock(t)
 	cfg, _ := opsConfig(t, "")
 	configPath = cfg
 	var out bytes.Buffer

@@ -68,9 +68,7 @@ func openNode(ctx context.Context) (*lifecycle.Node, error) {
 		return nil, err
 	}
 	o := appOptions(cfg)
-	lo := app.LifecycleOptions(cfg, o)
-	lo.RegistryDSN = os.Getenv(envRegistryDSN) // the same override as the backups commands
-	n, err := lifecycle.Open(ctx, cfg, lo)
+	n, err := openLifecycle(ctx, cfg, app.LifecycleOptions(cfg, o)) // SUPAVISE_REGISTRY_DSN overrides, as for the backups commands
 	if err != nil {
 		return nil, err
 	}
