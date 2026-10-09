@@ -16,6 +16,12 @@ SUPAVISE_DOMAIN=${SUPAVISE_DOMAIN:-supavise.test}
 LOG_DIR=${LOG_DIR:-/tmp/supavise-linux-logs}
 
 log()  { printf '%s %s\n' "$(date -u +%H:%M:%S)" "$*" >&2; }
+# free_port: prints a TCP port on 127.0.0.1 that nothing listens on now, for a local server the test starts
+# (a fixed port that another process holds fails the test for a reason that is not the test's).
+free_port() {
+  python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])'
+}
+
 fail() { log "FAIL: $*"; exit 1; }
 
 need_root() { [[ $(id -u) -eq 0 ]] || fail "run as root (sudo)"; }
