@@ -8,7 +8,7 @@ import (
 	"github.com/supavise/supavise/internal/notice"
 )
 
-// Studio is served unmodified (three patches, no fixups), so the two things its build
+// Studio is served unmodified (four patches, no fixups), so the two things its build
 // gets wrong for a self-hosted node are corrected here, on the way through.
 
 // Studio's own /api/incident-banner route asks incident.io, answers 500 without a key, and

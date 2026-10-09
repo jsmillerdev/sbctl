@@ -179,6 +179,9 @@ type Server struct {
 	// oauth is the OAuth service (Deps.OAuth, completed by oauthService). Handlers read it when they
 	// run, never when their routes are registered, so that a test can put a fake in its place.
 	oauth oauth.Authority
+	// mcp limits the requests of each grant and personal access token on the /mcp gate (mcp.go). The
+	// zero value is usable.
+	mcp mcpLimiter
 
 	// disk is the data volume and the projects' disk limits (compute.go).
 	disk DiskLimits
@@ -362,6 +365,8 @@ func NewServer(d Deps) (*Server, error) {
 	s.auth.sso = s.sso.Admit
 	s.auth.ssoUser = s.sso.AdmitUser
 	s.oauth = s.oauthService(d.OAuth)
+	// s.sso holds the same *Accounts, so a removed or denied SSO user's OAuth grants are revoked too.
+	s.accounts.OAuth = s.oauth
 	s.auth.oauth = newOAuthAuthn(s)
 	h, err := s.build()
 	if err != nil {
@@ -390,7 +395,16 @@ func (s *Server) oauthService(svc *oauth.Service) *oauth.Service {
 		if pg, ok := s.reg.(*registry.Postgres); ok {
 			svc.Store = oauth.NewPGStore(pg.Pool())
 		} else {
-			svc.Store = oauth.NewMemoryStore()
+			// The memory store has no organizations table; the registry names them.
+			mem := oauth.NewMemoryStore()
+			mem.SetOrgSlugs(func(id int64) string {
+				o, err := s.reg.GetOrganizationByID(context.Background(), id)
+				if err != nil {
+					return ""
+				}
+				return o.Slug
+			})
+			svc.Store = mem
 		}
 	}
 	if svc.Issuer == "" {

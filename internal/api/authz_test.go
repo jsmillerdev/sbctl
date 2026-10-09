@@ -126,6 +126,10 @@ func matrixCases() []routeCase {
 		rc("YYNNNN", "POST", "/v1/projects/"+testRef+"/config/auth/sso/providers", map[string]any{"type": "saml"}),
 		rc("YYNNNN", "DELETE", "/v1/projects/"+testRef+"/config/auth/sso/providers/a0000000-0000-4000-8000-000000000001", nil),
 		rc("YYNNNN", "POST", org+"/oauth/apps", map[string]any{}),
+		// OAuth Apps: the lists and the secrets' aliases are for Owners and Administrators too
+		rc("YYNNNN", "GET", org+"/oauth/apps?type=published", nil),
+		rc("YYNNNN", "GET", org+"/oauth/apps?type=authorized", nil),
+		rc("YYNNNN", "GET", org+"/oauth/apps/"+matrixAuthID+"/client-secrets", nil),
 		// OAuth sign-in for MCP clients: only Owners and Administrators see an authorization request
 		// (the spec's organization_admin_read) and decide it. The decisions change state, so only the
 		// refusals are checked.

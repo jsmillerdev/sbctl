@@ -207,8 +207,9 @@ var routeRules = []routeRule{
 	rule("W", "/platform/organizations/{slug}/customer", chk(members.ActBillingWrite, "stripe.customer")),
 	rule("R", "/platform/organizations/{slug}/tax-ids", chk(members.ActBillingRead, "stripe.tax_ids")),
 	rule("R", "/platform/organizations/{slug}/usage/**", chk(members.ActBillingRead, "stripe.subscriptions")),
-	rule("R", "/platform/organizations/{slug}/oauth/**", chk(members.ActRead, "oauth_apps")),
-	rule("W", "/platform/organizations/{slug}/oauth/**", chk(members.ActUpdate, "oauth_apps")),
+	// OAuth Apps: every method, reads included, is for Owners and Administrators. The lists name the clients
+	// that act for the organization and the aliases of their secrets, which only the people who manage them see.
+	rule("", "/platform/organizations/{slug}/oauth/**", chk(members.ActUpdate, "oauth_apps")),
 	rule("R", "/platform/organizations/{slug}/apps/**", chk(members.ActRead, "oauth_apps")),
 	rule("W", "/platform/organizations/{slug}/apps/**", chk(members.ActUpdate, "oauth_apps")),
 	rule("POST", "/platform/organizations/{slug}/available-versions", chk(members.ActRead, O)),

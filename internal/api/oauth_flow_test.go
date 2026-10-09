@@ -376,17 +376,20 @@ func TestOAuthFlowEndToEnd(t *testing.T) {
 		t.Fatalf("token response %v", tok)
 	}
 
-	// A code that is redeemed twice revokes the grant that the first redemption made.
-	code, _ = f.approve(t, f.start(t, app))
-	first := f.token(app, "grant_type", "authorization_code", "code", code, "code_verifier", flowVerifier, "redirect_uri", app.redirect)
+	// A code that is redeemed twice revokes the grant that the first redemption made. The replayed
+	// code belongs to an app of its own: a new grant of the same app, user and organization would
+	// supersede the grant that the refresh steps below use.
+	replayApp := f.register(t, "")
+	code, _ = f.approve(t, f.start(t, replayApp))
+	first := f.token(replayApp, "grant_type", "authorization_code", "code", code, "code_verifier", flowVerifier, "redirect_uri", replayApp.redirect)
 	if first.Code != 200 {
 		t.Fatalf("first redemption: %d %s", first.Code, first.Body)
 	}
-	if rec := f.token(app, "grant_type", "authorization_code", "code", code, "code_verifier", flowVerifier, "redirect_uri", app.redirect); rec.Code != 400 {
+	if rec := f.token(replayApp, "grant_type", "authorization_code", "code", code, "code_verifier", flowVerifier, "redirect_uri", replayApp.redirect); rec.Code != 400 {
 		t.Errorf("replay: %d", rec.Code)
 	}
 	firstRefresh := jsonMap(t, first)["refresh_token"].(string)
-	if rec := f.token(app, "grant_type", "refresh_token", "refresh_token", firstRefresh); rec.Code != 400 || jsonMap(t, rec)["error"] != "invalid_grant" {
+	if rec := f.token(replayApp, "grant_type", "refresh_token", "refresh_token", firstRefresh); rec.Code != 400 || jsonMap(t, rec)["error"] != "invalid_grant" {
 		t.Errorf("the grant of a replayed code still refreshes: %d %s", rec.Code, rec.Body)
 	}
 	f.mu.Lock()

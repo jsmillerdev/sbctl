@@ -44,6 +44,8 @@ func openSSOOn(cmd *cobra.Command, n *lifecycle.Node) (*api.DashboardSSO, *api.A
 	}
 	acc := &api.Accounts{Reg: n.Registry, Store: api.NewPGClaimStore(pg.Pool()), Keys: n.Engine.Keys, Config: n.Cfg, Log: newLogger(n.Cfg)}
 	acc.EnableMembers(n.Registry, api.NewPGStore(pg.Pool()))
+	// `sso remove` and `orgs delete` revoke the OAuth grants of the SSO users they remove.
+	acc.OAuth = newOAuthService(n, pg)
 	d := api.NewDashboardSSO(acc, api.NewPGSSOStore(pg.Pool()))
 	fm, err := fleet.NewManager(fleet.Deps{Cfg: n.Cfg, Log: newLogger(n.Cfg), Registry: n.Registry, Secrets: n.Secrets, Supervisor: n.Supervisor, Artifacts: n.Artifacts})
 	if err != nil {

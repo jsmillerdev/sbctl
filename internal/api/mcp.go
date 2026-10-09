@@ -287,16 +287,8 @@ func mcpQuery(raw string) (string, *Error) {
 
 // ---- limits ----------------------------------------------------------------------------------
 
-// mcpLimiters holds the limiter of each Server, made on first use. Server has no field for it.
-var mcpLimiters sync.Map // *Server -> *mcpLimiter
-
-func (s *Server) mcpLimiter() *mcpLimiter {
-	if l, ok := mcpLimiters.Load(s); ok {
-		return l.(*mcpLimiter)
-	}
-	l, _ := mcpLimiters.LoadOrStore(s, &mcpLimiter{})
-	return l.(*mcpLimiter)
-}
+// mcpLimiter returns the server's limiter (Server.mcp).
+func (s *Server) mcpLimiter() *mcpLimiter { return &s.mcp }
 
 // mcpLimiter bounds each grant and personal access token to mcpRatePerMinute requests per minute and
 // mcpMaxInFlight requests at a time, in memory on this node (a cluster has the limits per node, as
