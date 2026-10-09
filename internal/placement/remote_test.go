@@ -189,13 +189,18 @@ func TestPlaneEndpointsAuthorizeTheLeaderAtItsEpoch(t *testing.T) {
 
 	// A node that is not the leader is refused.
 	e := newRemoteEnv(t, "n3", 5)
+	// The refusal says who asked and who leads; that text reaches the operator through the leader's error.
 	if err := e.remote.Stop(ctx, testRef); !errors.Is(err, cluster.ErrNotLeader) {
 		t.Fatalf("a caller that is not the leader: %v", err)
+	} else if want := `node n2: cluster: this node is not the leader: n3 asked, the leader is "n1"`; err.Error() != want {
+		t.Fatalf("a caller that is not the leader: error %q, want %q", err, want)
 	}
 	// A request that carries no node certificate (the join endpoints' kind) is refused too.
 	e = newRemoteEnv(t, "", 5)
 	if err := e.remote.Stop(ctx, testRef); !errors.Is(err, cluster.ErrNotLeader) {
 		t.Fatalf("no certificate: %v", err)
+	} else if want := "node n2: cluster: this node is not the leader: the request carries no node certificate"; err.Error() != want {
+		t.Fatalf("no certificate: error %q, want %q", err, want)
 	}
 	// A leader that has been replaced acts under an older epoch.
 	e = newRemoteEnv(t, "n1", 4)

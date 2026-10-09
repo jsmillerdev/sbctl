@@ -58,13 +58,12 @@ func Register(handle func(pattern string, fn mesh.HandlerFunc), d HandlerDeps) e
 	}
 	h := &handlers{d}
 	// The endpoints change what runs on the node: they admit the cluster leader only, before they read the request.
-	leader := func(fn mesh.HandlerFunc) mesh.HandlerFunc { return mesh.RequireLeader(d.Members, fn) }
-	handle("PUT "+peerapi.PathInstance, leader(h.ensure))
-	handle("GET "+peerapi.PathInstance, leader(h.observe))
-	handle("DELETE "+peerapi.PathInstance, leader(h.remove))
-	handle("POST "+peerapi.PathInstanceAction, leader(h.action))
-	handle("POST "+peerapi.PathPlane, leader(h.plane))
-	handle("POST "+peerapi.PathBackup, leader(h.backup))
+	handle("PUT "+peerapi.PathInstance, h.leaderOnly(h.ensure))
+	handle("GET "+peerapi.PathInstance, h.leaderOnly(h.observe))
+	handle("DELETE "+peerapi.PathInstance, h.leaderOnly(h.remove))
+	handle("POST "+peerapi.PathInstanceAction, h.leaderOnly(h.action))
+	handle("POST "+peerapi.PathPlane, h.leaderOnly(h.plane))
+	handle("POST "+peerapi.PathBackup, h.leaderOnly(h.backup))
 	return nil
 }
 
@@ -103,6 +102,33 @@ func decode(w http.ResponseWriter, r *http.Request, v any) bool {
 		return false
 	}
 	return true
+}
+
+// authorize admits the cluster leader only: the endpoints here change what runs on the node. The
+// refusal names who asked and who leads, which the leader's log and the remote error carry.
+func (h *handlers) authorize(r *http.Request) error {
+	peer, ok := mesh.PeerFrom(r.Context())
+	if !ok || peer.Node == "" {
+		return fmt.Errorf("%w: the request carries no node certificate", cluster.ErrNotLeader)
+	}
+	leader, ok := h.d.Members.Leader()
+	if !ok || leader.ID != peer.Node {
+		return fmt.Errorf("%w: %s asked, the leader is %q", cluster.ErrNotLeader, peer.Node, leader.ID)
+	}
+	return nil
+}
+
+// leaderOnly runs fn for the leader's requests and answers every other with writeErr, before fn reads
+// the request. (mesh.RequireLeader answers with a generic message; the one here is what callers have
+// always got.)
+func (h *handlers) leaderOnly(fn mesh.HandlerFunc) mesh.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if err := h.authorize(r); err != nil {
+			writeErr(w, err)
+			return
+		}
+		fn(w, r)
+	}
 }
 
 func (h *handlers) epochOK(epoch int64) error {
