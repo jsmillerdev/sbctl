@@ -299,6 +299,13 @@ func (l *Live) Refresh(ctx context.Context) {
 		}
 	}
 	snap := Snapshot{Nodes: nodes, Leader: cl.Leader, Epoch: cl.Epoch, Role: role, Maintenance: cl.Maintenance}
+	// The epoch only rises. A copy of the registry that has not replayed a move this node was told about (the
+	// boot decision asked the peers; a ping named the leader) is behind, and its leader is the old one: the
+	// old leader of a planned switchover restarts as a follower with exactly such a copy, and the forwarders
+	// that its standby streams through are bound from the leader the membership names.
+	if prev.Epoch > snap.Epoch && prev.Leader != "" {
+		snap.Epoch, snap.Leader = prev.Epoch, prev.Leader
+	}
 	for _, n := range nodes {
 		if n.ID == l.o.SelfID {
 			snap.Self = n

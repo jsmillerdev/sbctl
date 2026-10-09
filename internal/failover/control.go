@@ -196,7 +196,17 @@ func (s *ControlServer) Handler(ctx context.Context) http.Handler {
 		if !decodeControl(w, r, &req) {
 			return
 		}
-		s.run(ctx, w, r, func(ctx context.Context) (*registry.Move, error) { return s.Svc.FailoverServer(ctx, req.options()) })
+		s.run(ctx, w, r, func(ctx context.Context) (*registry.Move, error) {
+			mv, err := s.Svc.FailoverServer(ctx, req.options())
+			// The daemon stops in the middle of a server move when the move gives its node another role (the old
+			// leader of a switchover it asked for, which becomes a follower): the move goes on elsewhere, and the
+			// client waits for the daemon that starts and follows the move there (Follow), as it does for a
+			// restart the move itself announced.
+			if err != nil && ctx.Err() != nil && errors.Is(err, context.Canceled) && !errors.Is(err, ErrRestarting) {
+				err = fmt.Errorf("%w (%v)", ErrRestarting, err)
+			}
+			return mv, err
+		})
 	})
 	return mux
 }

@@ -571,6 +571,12 @@ func (o *Orchestrator) quiesceLocal(ctx context.Context, req QuiesceRequest, rec
 	g.SetLimit(quiesceParallel)
 	for _, ref := range rec.Refs {
 		g.Go(func() error {
+			// The hold first: until the new leader has the projects, the registry of this node still homes them
+			// here, and a restart of the daemon would start them again (design 2.10.3, the window of a planned stop).
+			reason := fmt.Sprintf("the primary of %s was stopped for the planned switchover of the server to %s at epoch %d; finish it with supavise failover --resume", ref, req.To, req.Epoch)
+			if err := o.holdHere(ref, req.To, req.Epoch, reason); err != nil {
+				return fmt.Errorf("keeping %s from starting again: %w", ref, err)
+			}
 			o.quiesceTenant(ctx, ref)
 			lsn, err := o.d.LocalPrimaries.Stop(ctx, ref)
 			if err != nil {
@@ -646,6 +652,13 @@ func (o *Orchestrator) handleResume(w http.ResponseWriter, r *http.Request) {
 	if rec == nil || rec.To != peer.Node {
 		writePeerError(w, http.StatusConflict, "no_quiesce", "no switchover to that node is waiting")
 		return
+	}
+	// The projects the quiesce held start again: the hold is released before the plane is asked.
+	for _, ref := range rec.Refs {
+		if err := fenced.ReleaseProject(o.d.Cfg.Paths(), ref); err != nil {
+			writePeerError(w, http.StatusInternalServerError, "resume_failed", err.Error())
+			return
+		}
 	}
 	if err := o.resumeLocal(context.WithoutCancel(r.Context())); err != nil {
 		writePeerError(w, http.StatusInternalServerError, "resume_failed", err.Error())

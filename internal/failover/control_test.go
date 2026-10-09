@@ -468,3 +468,31 @@ func TestFollowWaitsForALogThatCannotBeReadAndStopsWaitingForAMoveThatRecordsNot
 		}
 	})
 }
+
+// A server move whose daemon is stopping (the move gave the node another role) ends the stream with the
+// restart that the client follows, not with the bare "context canceled" of a cancelled run.
+func TestADaemonThatStopsInTheMiddleOfAServerMoveTellsTheClientToFollow(t *testing.T) {
+	svc, c, stop := controlRig(t)
+	started := make(chan struct{})
+	svc.run = func(ctx context.Context, report func(string, string)) (*registry.Move, error) {
+		report("begin", "")
+		close(started)
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	errc := make(chan error, 1)
+	go func() {
+		_, err := c.RunServer(context.Background(), ServerOptions{}, func(registry.MoveStep) {})
+		errc <- err
+	}()
+	<-started
+	stop() // the daemon's context ends
+	select {
+	case err := <-errc:
+		if !errors.Is(err, ErrRestarting) && !errors.Is(err, ErrStreamClosed) {
+			t.Fatalf("the client got %v, want a restart to follow", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the client heard nothing")
+	}
+}

@@ -220,7 +220,15 @@ func (o *Orchestrator) demoteOldLeader(ctx context.Context, j *journal, run *ser
 			return
 		}
 		if err := j.step(ctx, step, func() (string, error) {
-			return o.demoteOld(ctx, run.from, ref, identifier, run.epoch, timeout)
+			d, err := o.demoteOld(ctx, run.from, ref, identifier, run.epoch, timeout)
+			if err != nil || ref == config.SystemRef {
+				return d, err // the system cluster is not held: it is no project's primary
+			}
+			// The old leader's clusters were held when its quiesce stopped them; this one follows the new primary.
+			if err := o.releaseOn(ctx, run.from.ID, ref, run.epoch); err != nil {
+				return "", fmt.Errorf("%s follows the new primary, but the hold on its old primary could not be released: %w; run supavise failover --resume", run.from.Name, err)
+			}
+			return d, nil
 		}); err != nil {
 			failed = append(failed, fmt.Sprintf("demote %s: %v", ref, err))
 		}

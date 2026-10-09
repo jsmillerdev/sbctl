@@ -396,6 +396,7 @@ server_move() {
   onl "$new" wait_nodes "$new" 600
   sset leader "$new"
   reached "server-moved-$new"
+  onl "$new" wait_move_ended 900
   [[ $(onl "$new" node_epoch) == $((epoch0 + 1)) ]] || fail "the epoch is $(onl "$new" node_epoch), want $((epoch0 + 1))"
   [[ $(onl "$new" last_move | cut -d'|' -f2,3,5,6,8) == "server|switchover|$old|$new|done" ]] || fail "the last move is $(onl "$new" last_move)"
   onl "$new" wait_api 300

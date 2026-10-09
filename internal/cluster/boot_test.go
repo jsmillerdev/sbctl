@@ -1175,3 +1175,30 @@ func TestLiveFollowsTheSuccessorItStoppedFor(t *testing.T) {
 		t.Fatalf("a refresh took the successor back: %+v", lead)
 	}
 }
+
+// The epoch only rises: the old leader of a planned switchover restarts as a follower with a copy of the
+// registry that has not replayed the move, and the boot decision (which asked the peers) knows better.
+func TestARegistryCopyBehindTheBootDecisionDoesNotTakeTheLeaderBack(t *testing.T) {
+	cfg := config.Default()
+	cfg.StateDir = t.TempDir()
+	reg := registry.NewMemory()
+	ctx := context.Background()
+	if err := reg.CreateNode(ctx, &registry.Node{Name: "second", State: registry.NodeActive}); err != nil {
+		t.Fatal(err)
+	}
+	p := &probe{rec: true} // a standby
+	boot := BootDecision{Role: RoleFollower, SelfID: "n1", Joined: true, Epoch: 2, Leader: "n2"}
+	l := NewLive(LiveOptions{Cfg: cfg, Reg: reg, SelfID: "n1", Boot: boot, InRecovery: p.InRecovery, Poll: 10 * time.Millisecond})
+	l.Refresh(ctx) // the copy says: epoch 1, led by n1
+	if lead, ok := l.Leader(); !ok || lead.ID != "n2" || l.Epoch() != 2 {
+		t.Fatalf("leader %+v (%v) at epoch %d, want n2 at 2", lead, ok, l.Epoch())
+	}
+	// Once the copy has caught up, it is the registry's word again.
+	if err := reg.SetLeader(ctx, "n2", 2); err != nil {
+		t.Fatal(err)
+	}
+	l.Refresh(ctx)
+	if lead, _ := l.Leader(); lead.ID != "n2" || l.Epoch() != 2 {
+		t.Fatalf("leader %+v at epoch %d after the copy caught up", lead, l.Epoch())
+	}
+}

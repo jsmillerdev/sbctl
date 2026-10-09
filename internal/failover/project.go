@@ -568,14 +568,19 @@ func (o *Orchestrator) holdPrimary(ctx context.Context, run *projectRun) error {
 
 // releasePrimary removes the hold of holdPrimary from the old home.
 func (o *Orchestrator) releasePrimary(ctx context.Context, run *projectRun) error {
-	ref := run.project.Ref
-	if run.from.ID == o.self().ID {
+	return o.releaseOn(ctx, run.from.ID, run.project.Ref, run.epoch)
+}
+
+// releaseOn removes the hold of a planned stop of ref's primary from node: the old home follows the new
+// primary now, or the move was undone.
+func (o *Orchestrator) releaseOn(ctx context.Context, node, ref string, epoch int64) error {
+	if node == o.self().ID {
 		return fenced.ReleaseProject(o.d.Cfg.Paths(), ref)
 	}
 	if o.d.Peers == nil {
 		return errors.New("no way to reach the old home")
 	}
-	return o.whileTheNodeLearnsWhoLeads(ctx, func() error { return o.d.Peers.Release(ctx, run.from.ID, ref, run.epoch) })
+	return o.whileTheNodeLearnsWhoLeads(ctx, func() error { return o.d.Peers.Release(ctx, node, ref, epoch) })
 }
 
 // fenceProject asks the old home to stop the project's primary and keep it stopped. A home that is

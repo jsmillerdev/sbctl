@@ -96,6 +96,19 @@ wait_api() { # SECONDS: the Management API answers (401 without a token) on this
   fail "the Management API does not answer on this node after ${n}s"
 }
 
+# wait_move_ended SECONDS: the newest move in the registry is no longer running. A server move goes on in the daemon of
+# the node that takes over after the old leader's daemon restarted, and the command that started it may have ended.
+wait_move_ended() {
+  local n=${1:-600} i st=""
+  for ((i = 0; i < n; i += 3)); do
+    st=$(last_move 2>/dev/null | cut -d'|' -f8) || st=""
+    [[ -n $st && $st != running ]] && return 0
+    sleep 3
+  done
+  last_move >&2 || true
+  fail "the newest move is '${st:-unknown}' after ${n}s"
+}
+
 # wait_project REF STATUS SECONDS: the registry shows the project in STATUS.
 wait_project() {
   local ref=$1 want=$2 n=${3:-300} i s=""

@@ -986,6 +986,7 @@ func (l *worldLocal) Stop(ctx context.Context, ref string) (string, error) {
 	if err := w.do("local.stop %s", ref); err != nil {
 		return "", err
 	}
+	w.noteHold(w.self, ref)
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if s := w.prim[w.self+"/"+ref]; s != nil {

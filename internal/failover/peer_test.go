@@ -405,6 +405,19 @@ func TestQuiesceStopsEverythingInOrderAndReportsWhereEachStopped(t *testing.T) {
 	if !cl.Maintenance.Active(w.now()) || cl.Maintenance.Node != "n1" || cl.Maintenance.Reason != "switchover to n2" {
 		t.Fatalf("maintenance: %+v", cl.Maintenance)
 	}
+	// Each project is held before it stops, so that a restart of the daemon between the stop and the move of
+	// the home does not start it again; the system cluster is no project's primary and is not held.
+	for _, ref := range []string{refA, refB} {
+		if !w.heldAtStop[w.self+"/"+ref] {
+			t.Errorf("%s was not held when it stopped", ref)
+		}
+		if r, _ := fenced.Project(w.cfg.Paths(), ref); r == nil || !r.Planned || r.Epoch != 2 || r.Leader != "n2" {
+			t.Errorf("the hold of %s: %+v", ref, r)
+		}
+	}
+	if w.heldAtStop[w.self+"/"+config.SystemRef] {
+		t.Error("the system cluster was held")
+	}
 }
 
 // The leader's registry is the system cluster that the quiesce stops. A survivor that asks again
@@ -536,6 +549,12 @@ func TestAQuiesceThatFailsHalfwayReportsItAndResumeStartsEverythingAgain(t *test
 	}
 	w.assertOrder("local.start system", "services.start", "local.start "+refA, "fleet.ensure "+refA)
 	w.assertOrder("local.start system", "services.start", "local.start "+refB, "fleet.ensure "+refB)
+	// The projects start again with their holds released: the plane refuses to start a held primary.
+	for _, ref := range []string{refA, refB} {
+		if _, blocked := fenced.Blocks(w.cfg.Paths(), ref); blocked {
+			t.Errorf("%s is still held after the undo", ref)
+		}
+	}
 	cl, _ := w.reg.GetCluster(w.ctx)
 	if cl.Maintenance.Node != "" {
 		t.Fatalf("maintenance is still announced: %+v", cl.Maintenance)
