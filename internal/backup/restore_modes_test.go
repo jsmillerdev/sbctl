@@ -388,7 +388,11 @@ func TestRestoreInPlaceRefusesWhatIsNotADataDirectory(t *testing.T) {
 	writeFile(t, filepath.Join(dd, "pgdata", "PG_VERSION"), []byte("old")) // PGDATA one level down
 	fm := &fakeManager{e: e}
 	e.svc.opt.Manager = fm
-	if _, err := e.svc.RestoreWith(ctx, testRef, e.now, "", RestoreOptions{Force: true}); err == nil || !strings.Contains(err.Error(), "PG_VERSION") {
+	noHook := func(context.Context, string) error {
+		t.Error("BeforeReplace (the removal of the replicas) ran before the directory was checked")
+		return nil
+	}
+	if _, err := e.svc.RestoreWith(ctx, testRef, e.now, "", RestoreOptions{Force: true, BeforeReplace: noHook}); err == nil || !strings.Contains(err.Error(), "PG_VERSION") {
 		t.Fatalf("restore over a directory without PG_VERSION = %v", err)
 	}
 	if len(fm.paused) != 0 {

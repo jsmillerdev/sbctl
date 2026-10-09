@@ -268,6 +268,81 @@ func TestRemoveReplicasFirstMarksTheReplicasAndStopsWhileTheyRemain(t *testing.T
 	}
 }
 
+// readOnlyReplicas is a registry that refuses the writes of a replica's status, as the copy on a follower does.
+type readOnlyReplicas struct{ registry.Registry }
+
+func (readOnlyReplicas) SetReplicaStatus(context.Context, string, string, string, string) error {
+	return registry.ErrReadOnly
+}
+
+func (readOnlyReplicas) SetReplicaStatusUnlessGoingDown(context.Context, string, string, string, string) (bool, error) {
+	return false, registry.ErrReadOnly
+}
+
+// On a follower nothing can mark a replica GOING_DOWN, and no daemon here will finish the removal: the
+// command sends the operator to the leader and does not promise that running it again will help.
+func TestRemoveReplicasFirstOnAFollowerSendsYouToTheLeader(t *testing.T) {
+	reg, _ := replicaTestEnv(t)
+	ctx := context.Background()
+	id := registry.ReplicaIdentifier(replicaTestRef, "eu-west-1", "abc123")
+	if err := reg.CreateReplica(ctx, &registry.Replica{Identifier: id, Ref: replicaTestRef, NodeID: "n2", Origin: registry.ReplicaManual,
+		Status: "ACTIVE_HEALTHY"}); err != nil {
+		t.Fatal(err)
+	}
+	err := removeReplicasFirst(ctx, readOnlyReplicas{reg}, config.Default(), replicaTestRef)
+	if !errors.Is(err, registry.ErrReadOnly) {
+		t.Fatalf("removal on a follower: %v", err)
+	}
+	if strings.Contains(err.Error(), "run this command again") {
+		t.Errorf("a follower is told to wait for a removal that will not happen: %v", err)
+	}
+	if got := followerHint(err); got == nil || !strings.Contains(got.Error(), "run it on the leader") {
+		t.Errorf("main's explanation: %v", got)
+	}
+	if r, err := reg.GetReplica(ctx, id); err != nil || r.Status != "ACTIVE_HEALTHY" {
+		t.Errorf("the replica was changed: %+v, %v", r, err)
+	}
+}
+
+// An in-place restore checks the project before it touches its replicas: one that is not running is
+// refused with them untouched, as the API refuses it, and a project whose last restore failed may be
+// restored again.
+func TestPrepareInPlaceRestoreChecksTheProjectBeforeItsReplicas(t *testing.T) {
+	reg, _ := replicaTestEnv(t)
+	ctx := context.Background()
+	cfg := config.Default()
+	id := registry.ReplicaIdentifier(replicaTestRef, "eu-west-1", "abc123")
+	if err := reg.CreateReplica(ctx, &registry.Replica{Identifier: id, Ref: replicaTestRef, NodeID: "n2", Origin: registry.ReplicaManual,
+		Status: "ACTIVE_HEALTHY"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := prepareInPlaceRestore(ctx, reg, cfg, "zzzzzzzzzzzzzzzzzzzz"); !errors.Is(err, registry.ErrNotFound) {
+		t.Fatalf("an unknown project: %v", err)
+	}
+	for _, st := range []registry.Status{registry.StatusInactive, registry.StatusRestoring} {
+		if err := reg.SetProjectStatus(ctx, replicaTestRef, st); err != nil {
+			t.Fatal(err)
+		}
+		err := prepareInPlaceRestore(ctx, reg, cfg, replicaTestRef)
+		if err == nil || !strings.Contains(err.Error(), "while it is "+string(st)) {
+			t.Fatalf("a project that is %s: %v", st, err)
+		}
+		if r, err := reg.GetReplica(ctx, id); err != nil || r.Status != "ACTIVE_HEALTHY" {
+			t.Fatalf("a refused restore touched the replica (%s): %+v, %v", st, r, err)
+		}
+	}
+	if err := reg.SetProjectStatus(ctx, replicaTestRef, registry.StatusRestoreFailed); err != nil {
+		t.Fatal(err)
+	}
+	// Restorable: the replica is marked and the restore waits for the controller to remove it.
+	if err := prepareInPlaceRestore(ctx, reg, cfg, replicaTestRef); err == nil || !strings.Contains(err.Error(), "still being removed") {
+		t.Fatalf("a project whose restore failed: %v", err)
+	}
+	if r, err := reg.GetReplica(ctx, id); err != nil || r.Status != "GOING_DOWN" {
+		t.Fatalf("the replica after the restore started: %+v, %v", r, err)
+	}
+}
+
 // The delete never reaches the Engine while a replica remains (a nil Engine would stop the test).
 func TestDeleteProjectStopsWhileReplicasRemain(t *testing.T) {
 	reg, _ := replicaTestEnv(t)
