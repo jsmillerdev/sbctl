@@ -18,10 +18,10 @@ import (
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
-	"github.com/aws/smithy-go"
 	"golang.org/x/sync/errgroup"
 
 	"github.com/supavise/supavise/internal/awsapi"
+	"github.com/supavise/supavise/internal/s3util"
 )
 
 const (
@@ -33,7 +33,6 @@ const (
 	maxParts        = 9000
 	partsInFlight   = 3
 	deletesInFlight = 4
-	s3Attempts      = 5
 	// roleSession names the assumed-role session in CloudTrail.
 	roleSession = "supavise-storage-migrate"
 )
@@ -52,7 +51,7 @@ func (b *s3Bucket) pace(l *limiter) { b.tr.lim.Store(l) }
 // OpenS3 connects to the bucket with the AWS SDK. The credentials are the key of c, or the
 // temporary credentials of the role it names, renewed before they expire.
 func OpenS3(ctx context.Context, d Destination, c Credentials) (Bucket, error) {
-	return openS3(ctx, d, c, stallAfter, s3Attempts)
+	return openS3(ctx, d, c, stallAfter, s3util.Attempts)
 }
 
 func openS3(ctx context.Context, d Destination, c Credentials, stall time.Duration, attempts int) (Bucket, error) {
@@ -84,15 +83,7 @@ func openS3(ctx context.Context, d Destination, c Credentials, stall time.Durati
 	if err != nil {
 		return nil, fmt.Errorf("storagemigrate: s3 config: %w", err)
 	}
-	cl := s3.NewFromConfig(cfg, func(o *s3.Options) {
-		if d.Endpoint != "" {
-			o.BaseEndpoint = aws.String(d.Endpoint)
-		}
-		o.UsePathStyle = d.PathStyle
-		// Newer SDKs add CRC32 trailers by default, which many S3-compatible servers refuse.
-		o.RequestChecksumCalculation = aws.RequestChecksumCalculationWhenRequired
-		o.ResponseChecksumValidation = aws.ResponseChecksumValidationWhenRequired
-	})
+	cl := s3.NewFromConfig(cfg, s3util.ClientOptions(d.Endpoint, d.PathStyle))
 	return &s3Bucket{c: cl, tr: tr, bucket: d.Bucket, threshold: singlePutMax, partSize: partSizeMin}, nil
 }
 
@@ -132,26 +123,6 @@ func roleProvider(arn string) (aws.CredentialsProvider, error) {
 			CanExpire: !c.Expires.IsZero(), Expires: c.Expires, Source: "supavise-awsapi",
 		}, nil
 	})), nil
-}
-
-func isNotFound(err error) bool {
-	var nsk *types.NoSuchKey
-	var nf *types.NotFound
-	if errors.As(err, &nsk) || errors.As(err, &nf) {
-		return true
-	}
-	var re *awshttp.ResponseError
-	if errors.As(err, &re) && re.HTTPStatusCode() == http.StatusNotFound {
-		return true
-	}
-	var ae smithy.APIError
-	if errors.As(err, &ae) {
-		switch ae.ErrorCode() {
-		case "NoSuchKey", "NotFound":
-			return true
-		}
-	}
-	return false
 }
 
 // accessHint explains the usual cause of a 403: without s3:ListBucket, S3 answers 403 where it
@@ -252,7 +223,7 @@ func (b *s3Bucket) List(ctx context.Context, prefix string, fn func(Entry) error
 func (b *s3Bucket) Get(ctx context.Context, key string) (io.ReadCloser, FileMeta, error) {
 	out, err := b.c.GetObject(ctx, &s3.GetObjectInput{Bucket: &b.bucket, Key: &key})
 	if err != nil {
-		if isNotFound(err) {
+		if s3util.IsNotFound(err) {
 			return nil, FileMeta{}, ErrNotFound
 		}
 		return nil, FileMeta{}, fmt.Errorf("s3 get %s: %w%s", quote(key), err, accessHint(err))
@@ -267,7 +238,7 @@ func (b *s3Bucket) Delete(ctx context.Context, keys ...string) error {
 	g.SetLimit(deletesInFlight)
 	for _, k := range keys {
 		g.Go(func() error {
-			if _, err := b.c.DeleteObject(gctx, &s3.DeleteObjectInput{Bucket: &b.bucket, Key: &k}); err != nil && !isNotFound(err) {
+			if _, err := b.c.DeleteObject(gctx, &s3.DeleteObjectInput{Bucket: &b.bucket, Key: &k}); err != nil && !s3util.IsNotFound(err) {
 				return fmt.Errorf("s3 delete %s: %w%s", quote(k), err, accessHint(err))
 			}
 			return nil

@@ -21,6 +21,8 @@ import (
 	smithyhttp "github.com/aws/smithy-go/transport/http"
 	"github.com/johannesboyne/gofakes3"
 	"github.com/johannesboyne/gofakes3/backend/s3mem"
+
+	"github.com/supavise/supavise/internal/s3util"
 )
 
 // Environment of the real-S3 variant (CI runs it against a MinIO service container;
@@ -182,7 +184,7 @@ func TestAccessDeniedHintNamesListBucket(t *testing.T) {
 	if h := accessDeniedHint(forbidden); !strings.Contains(h, "s3:ListBucket") {
 		t.Errorf("hint = %q", h)
 	}
-	if isNotFound(forbidden) {
+	if s3util.IsNotFound(forbidden) {
 		t.Error("a 403 must not be taken for a missing key")
 	}
 	if h := accessDeniedHint(errors.New("boom")); h != "" {
