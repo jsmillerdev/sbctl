@@ -76,20 +76,14 @@ func authorizationServerMetadata(issuer string) oauthServerMetadata {
 // /.well-known/oauth-authorization-server on the mux, without credentials (authNone) and with the
 // open CORS policy of oauth_cors.go. They are not operations of the specs, so they are not in the
 // route table of implemented(). build calls it whether or not [api] disable_oauth is set; the
-// handlers answer 404 while it is.
+// handlers answer 404 while it is (oauthGuard).
 func (s *Server) oauthWellKnown(mux *muxSet) {
-	mux.handle("GET "+oauth.ProtectedResourceMetadataPath, s.wrap("", authNone, func(w http.ResponseWriter, r *http.Request) error {
-		if s.oauthDisabled() {
-			return errOAuthEndpointOff
-		}
+	mux.handle("GET "+oauth.ProtectedResourceMetadataPath, s.wrap("", authNone, s.oauthGuard(func(w http.ResponseWriter, r *http.Request) error {
 		return writeMetadata(w, protectedResourceMetadata(s.cfg.APIURL()))
-	}))
-	mux.handle("GET "+oauth.AuthorizationServerMetadataPath, s.wrap("", authNone, func(w http.ResponseWriter, r *http.Request) error {
-		if s.oauthDisabled() {
-			return errOAuthEndpointOff
-		}
+	})))
+	mux.handle("GET "+oauth.AuthorizationServerMetadataPath, s.wrap("", authNone, s.oauthGuard(func(w http.ResponseWriter, r *http.Request) error {
 		return writeMetadata(w, authorizationServerMetadata(s.cfg.APIURL()))
-	}))
+	})))
 }
 
 // writeMetadata answers 200 with a discovery document that clients may cache for an hour.

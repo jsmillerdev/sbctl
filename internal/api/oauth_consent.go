@@ -56,9 +56,6 @@ type oauthDescribeBody struct {
 // and the scopes the consent page shows. An expired or decided request is described too; Studio
 // works out "expired" from expires_at.
 func (s *Server) oauthDescribe(w http.ResponseWriter, r *http.Request) error {
-	if s.oauthDisabled() {
-		return errOAuthEndpointOff
-	}
 	// The route rule says the same (an Owner or Administrator somewhere). It is repeated here because
 	// this page names the application that asks for access and the scopes it asks for: the route
 	// table is the first line and this check the second. Owner decision 1 of the design (let any
@@ -107,9 +104,6 @@ func (s *Server) oauthDescribe(w http.ResponseWriter, r *http.Request) error {
 // below aal2, that the organization does not require MFA. skip_browser_redirect is accepted and
 // ignored: the answer is always JSON, and Studio sends the browser to the URL in it.
 func (s *Server) oauthApprove(w http.ResponseWriter, r *http.Request) error {
-	if s.oauthDisabled() {
-		return errOAuthEndpointOff
-	}
 	// An approval mints tokens that, like a personal access token, are exempt from the MFA
 	// requirement afterwards, so the session that approves has to meet it in every organization of
 	// the caller, not only the chosen one.
@@ -144,9 +138,6 @@ func (s *Server) oauthApprove(w http.ResponseWriter, r *http.Request) error {
 // oauthDecline answers DELETE /platform/organizations/{slug}/oauth/authorizations/{id}. Studio does
 // not tell the client; the client gives up at its own timeout.
 func (s *Server) oauthDecline(w http.ResponseWriter, r *http.Request) error {
-	if s.oauthDisabled() {
-		return errOAuthEndpointOff
-	}
 	p := principalFrom(r.Context())
 	if p == nil {
 		return errUnauthorized

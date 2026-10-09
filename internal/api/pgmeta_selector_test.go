@@ -6,7 +6,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/supavise/supavise/internal/placement"
 	"github.com/supavise/supavise/internal/registry"
 )
 
@@ -164,30 +163,30 @@ func TestConnHeaderHost(t *testing.T) {
 	}
 }
 
-// fakeResolver answers ReplicasOf from a canned list, so a test shows which code asks the placement
-// Resolver and not the registry.
-type fakeResolver struct {
-	placement.Resolver
+// cannedReplicas answers ListReplicas from a canned list, so a test shows which code asks the
+// registry for a project's replicas and what it makes of the answer.
+type cannedReplicas struct {
+	registry.Registry
 	byRef map[string][]registry.Replica
 	asked []string
 }
 
-func (r *fakeResolver) ReplicasOf(_ context.Context, ref string) ([]registry.Replica, error) {
+func (r *cannedReplicas) ListReplicas(_ context.Context, ref string) ([]registry.Replica, error) {
 	r.asked = append(r.asked, ref)
 	return r.byRef[ref], nil
 }
 
-// The replicas a project has come from the placement Resolver: the pg-meta selector and the cap on
-// adding one ask it.
-func TestReplicasComeFromThePlacementResolver(t *testing.T) {
+// The replicas a project has come from the registry the server reads: the pg-meta selector and the
+// cap on adding one ask it.
+func TestReplicasComeFromTheRegistry(t *testing.T) {
 	rf := newReplicaFixture(t)
 	known := registry.ReplicaIdentifier(testRef, "eu-west-1", "abcdef")
-	res := &fakeResolver{byRef: map[string][]registry.Replica{testRef: {{Identifier: known, Ref: testRef, NodeID: euNode, Status: "ACTIVE_HEALTHY"}}}}
-	rf.srv.placement = res
-	// The registry has no such row, the Resolver does.
+	res := &cannedReplicas{Registry: rf.reg, byRef: map[string][]registry.Replica{testRef: {{Identifier: known, Ref: testRef, NodeID: euNode, Status: "ACTIVE_HEALTHY"}}}}
+	// The fixture's registry has no such row, the one the server reads does.
 	if rs, _ := rf.reg.ListReplicas(t.Context(), testRef); len(rs) != 0 {
 		t.Fatalf("registry rows: %v", rs)
 	}
+	rf.srv.reg = res
 
 	if rec := rf.do("GET", "/platform/pg-meta/"+testRef+"/tables", nil, connHeader, connString("postgres", known)); rec.Code != 200 {
 		t.Fatalf("pg-meta: %d %s", rec.Code, rec.Body)
@@ -196,7 +195,7 @@ func TestReplicasComeFromThePlacementResolver(t *testing.T) {
 		t.Fatalf("port %s", port)
 	}
 	if rec := rf.do("GET", "/platform/pg-meta/"+testRef+"/tables", nil, connHeader, connString("postgres", registry.ReplicaIdentifier(testRef, "eu-west-1", "zzzzzz"))); rec.Code != 403 {
-		t.Fatalf("an identifier the Resolver does not know: %d %s", rec.Code, rec.Body)
+		t.Fatalf("an identifier the registry does not know: %d %s", rec.Code, rec.Body)
 	}
 
 	res.byRef[testRef] = make([]registry.Replica, 4) // a Small project's cap
@@ -204,7 +203,7 @@ func TestReplicasComeFromThePlacementResolver(t *testing.T) {
 		t.Fatalf("cap: %d %s", rec.Code, rec.Body)
 	}
 	if len(res.asked) == 0 {
-		t.Fatal("the Resolver was never asked")
+		t.Fatal("the registry was never asked for the replicas")
 	}
 }
 
@@ -227,21 +226,19 @@ func TestOrganizationProjectsReadReplicasOnce(t *testing.T) {
 	rf.mgr.addProject(t, "bcdefghijklmnopqrstu", "Second project", rf.org.ID, registry.StatusActiveHealthy)
 	reads := &replicaReads{Registry: rf.reg}
 	rf.srv.reg = reads
-	res := &fakeResolver{}
-	rf.srv.placement = res
 
 	rec := rf.do("GET", "/platform/organizations/default/projects", nil)
 	if rec.Code != 200 || !strings.Contains(rec.Body.String(), "READ_REPLICA") {
 		t.Fatalf("%d %s", rec.Code, rec.Body)
 	}
-	if len(reads.refs) != 1 || reads.refs[0] != "" || len(res.asked) != 0 {
-		t.Fatalf("replica reads %q, Resolver asked %q", reads.refs, res.asked)
+	if len(reads.refs) != 1 || reads.refs[0] != "" {
+		t.Fatalf("replica reads %q", reads.refs)
 	}
 
 	reads.refs = nil
 	rf.srv.replicas = nil
 	rec = rf.do("GET", "/platform/organizations/default/projects", nil)
-	if rec.Code != 200 || strings.Contains(rec.Body.String(), "READ_REPLICA") || len(reads.refs) != 0 || len(res.asked) != 0 {
-		t.Fatalf("without a controller: %d, replica reads %q, Resolver asked %q: %s", rec.Code, reads.refs, res.asked, rec.Body)
+	if rec.Code != 200 || strings.Contains(rec.Body.String(), "READ_REPLICA") || len(reads.refs) != 0 {
+		t.Fatalf("without a controller: %d, replica reads %q: %s", rec.Code, reads.refs, rec.Body)
 	}
 }

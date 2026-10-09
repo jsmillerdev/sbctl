@@ -2,6 +2,7 @@ package api
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -186,7 +187,7 @@ func (s *Server) createFunction(w http.ResponseWriter, r *http.Request) error {
 	if !slugRe.MatchString(in.Slug) {
 		return errf(http.StatusBadRequest, "Invalid function slug")
 	}
-	f := &Function{Ref: p.Ref, Slug: in.Slug, Name: firstNonEmpty(in.Name, in.Slug), Status: "ACTIVE", VerifyJWT: in.VerifyJWT == nil || *in.VerifyJWT,
+	f := &Function{Ref: p.Ref, Slug: in.Slug, Name: cmp.Or(in.Name, in.Slug), Status: "ACTIVE", VerifyJWT: in.VerifyJWT == nil || *in.VerifyJWT,
 		EntrypointPath: in.Entrypoint, ImportMapPath: in.ImportMap}
 	var files []FunctionFile
 	if isBundleUpload(r) {
@@ -205,15 +206,6 @@ func (s *Server) createFunction(w http.ResponseWriter, r *http.Request) error {
 	}
 	writeJSON(w, http.StatusCreated, fnJSON(f))
 	return nil
-}
-
-func firstNonEmpty(vs ...string) string {
-	for _, v := range vs {
-		if v != "" {
-			return v
-		}
-	}
-	return ""
 }
 
 // cleanFilePath makes a client file name safe to store: relative, no "..".
@@ -291,12 +283,12 @@ func (s *Server) deployFunction(w http.ResponseWriter, r *http.Request) error {
 	if len(files) == 0 {
 		return errf(http.StatusBadRequest, "At least one file is required")
 	}
-	slug := firstNonEmpty(r.URL.Query().Get("slug"), slugFromName(meta.Name))
+	slug := cmp.Or(r.URL.Query().Get("slug"), slugFromName(meta.Name))
 	if !slugRe.MatchString(slug) {
 		return errf(http.StatusBadRequest, "Invalid function slug")
 	}
 	entry, _ := cleanFilePath(meta.EntrypointPath)
-	f := &Function{Ref: p.Ref, Slug: slug, Name: firstNonEmpty(meta.Name, slug), Status: "ACTIVE",
+	f := &Function{Ref: p.Ref, Slug: slug, Name: cmp.Or(meta.Name, slug), Status: "ACTIVE",
 		VerifyJWT: meta.VerifyJWT == nil || *meta.VerifyJWT, EntrypointPath: entry}
 	if meta.ImportMapPath != "" {
 		f.ImportMapPath, _ = cleanFilePath(meta.ImportMapPath)

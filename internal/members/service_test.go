@@ -75,6 +75,7 @@ func testService(t *testing.T, mk func(*testing.T) *env) {
 	t.Run("remove user", func(t *testing.T) { testRemoveUser(t, mk(t)) })
 	t.Run("concurrent demotions", func(t *testing.T) { testConcurrentOwners(t, mk(t)) })
 	t.Run("legacy accounts", func(t *testing.T) { testLegacyAccounts(t, mk) })
+	t.Run("is member", func(t *testing.T) { testIsMember(t, mk) })
 	t.Run("scoped owner invitations", func(t *testing.T) { testScopedOwnerInvitations(t, mk(t)) })
 	t.Run("stand-in owner", func(t *testing.T) { testStandInOwner(t, mk(t)) })
 	t.Run("remove user except", func(t *testing.T) { testRemoveUserExcept(t, mk(t)) })
@@ -791,5 +792,46 @@ func testDeleteOrganization(t *testing.T, e *env) {
 	// Deleting again, or an organization that never existed, is not an error.
 	if ids, err := e.svc.DeleteOrganization(ctx, e.a.ID); err != nil || len(ids) != 0 {
 		t.Fatalf("second delete: %v, %v", ids, err)
+	}
+}
+
+// IsMember answers what Access(user).IsMember(org) answers, including for an account the legacy
+// rule makes Owner on the first look.
+func testIsMember(t *testing.T, mk func(*testing.T) *env) {
+	ctx := context.Background()
+	e := mk(t)
+	cutoff := time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC)
+	e.setCutoff(cutoff)
+	created := map[string]time.Time{}
+	e.svc.AccountCreatedAt = func(_ context.Context, u string) (time.Time, error) { return created[u], nil }
+	is := func(user string, org OrgRef) bool {
+		t.Helper()
+		got, err := e.svc.IsMember(ctx, user, org.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return got
+	}
+
+	owner := e.owner(t, e.a)
+	if !is(owner, e.a) || is(owner, e.b) {
+		t.Errorf("owner of acme: member of acme %v, of beta %v", is(owner, e.a), is(owner, e.b))
+	}
+	scoped := e.member(t, e.b, 0) // holds no organization-wide role
+	if !is(scoped, e.b) || is(scoped, e.a) {
+		t.Error("a member without an organization-wide role is a member of its organization only")
+	}
+	young := e.newUser()
+	created[young] = cutoff.Add(time.Hour)
+	if is(young, e.a) || is(young, e.b) {
+		t.Error("an account created after roles is a member of nothing")
+	}
+	old := e.newUser()
+	created[old] = cutoff.Add(-24 * time.Hour)
+	if !is(old, e.a) || !is(old, e.b) {
+		t.Error("an account from before roles is Owner everywhere on the first look, as Access has it")
+	}
+	if !e.access(t, old).IsMember(e.a.ID) {
+		t.Error("Access disagrees with IsMember")
 	}
 }

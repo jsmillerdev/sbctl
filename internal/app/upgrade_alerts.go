@@ -5,25 +5,19 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
-	"sync"
-	"time"
 
 	"github.com/supavise/supavise/internal/alerts"
 	"github.com/supavise/supavise/internal/lifecycle"
 )
 
-// upgradeAlertTimeout bounds one delivery: a webhook is retried once after two seconds and SMTP can
-// take 40 seconds.
-const upgradeAlertTimeout = 90 * time.Second
-
 // upgradeAlerter turns the events of project upgrades (lifecycle.Options.UpgradeNotify) into
 // alerts. lifecycle cannot import alerts (alerts reads the node's health through lifecycle), so the
-// daemon passes this hook in. Delivery runs on a goroutine of its own: a slow webhook must not hold
-// up the upgrade that raised the event, and a failure to send is logged, never the upgrade's.
+// daemon passes this hook in. Delivery is detached (alerts.Notifier.NotifyDetachedFunc): a slow
+// webhook must not hold up the upgrade that raised the event, and a failure to send is logged, never
+// the upgrade's.
 type upgradeAlerter struct {
 	notifier *alerts.Notifier
 	log      *slog.Logger
-	wg       sync.WaitGroup
 }
 
 func newUpgradeAlerter(n *alerts.Notifier, log *slog.Logger) *upgradeAlerter {
@@ -32,27 +26,13 @@ func newUpgradeAlerter(n *alerts.Notifier, log *slog.Logger) *upgradeAlerter {
 
 func (a *upgradeAlerter) notify(ctx context.Context, n lifecycle.UpgradeNotice) {
 	ev := upgradeEvent(n)
-	// The upgrade's context may end with the request that started it; the message still goes.
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), upgradeAlertTimeout)
-	a.wg.Add(1)
-	go func() {
-		defer a.wg.Done()
-		defer cancel()
-		if err := a.notifier.Notify(ctx, ev); err != nil {
-			a.log.Warn("could not send the upgrade alert", "kind", ev.Kind, "ref", ev.Ref, "error", err)
-		}
-	}()
+	a.notifier.NotifyDetachedFunc(ctx, ev, func(err error) {
+		a.log.Warn("could not send the upgrade alert", "kind", ev.Kind, "ref", ev.Ref, "error", err)
+	})
 }
 
-// wait lets the deliveries in flight finish, up to upgradeAlertTimeout, when the daemon stops.
-func (a *upgradeAlerter) wait() {
-	done := make(chan struct{})
-	go func() { a.wg.Wait(); close(done) }()
-	select {
-	case <-done:
-	case <-time.After(upgradeAlertTimeout):
-	}
-}
+// wait lets the deliveries in flight finish when the daemon stops.
+func (a *upgradeAlerter) wait() { a.notifier.Drain() }
 
 // upgradeEvent is the alert for one event of a project's upgrade. They are announcements: each is
 // sent when it happens, and neither an announced maintenance window nor a running node upgrade

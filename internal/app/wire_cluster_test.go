@@ -115,8 +115,8 @@ func TestEveryClusterPortIsProvidedOrOff(t *testing.T) {
 	// What the Management API needs to answer for a cluster. The controller does not run, so the API has it
 	// behind replicasOff: replicas are listed and removed (a project delete asks the Remover), and a setup
 	// is refused, because a controller that does not run would take a request and leave its row for nobody.
-	if _, off := w.API.Replicas.(replicasOff); !off || w.API.Placement == nil || !w.API.LoadBalancers || w.API.Failover == nil {
-		t.Fatalf("Deps: replicas %T, placement %v, load balancers %v, failover %v", w.API.Replicas, w.API.Placement, w.API.LoadBalancers, w.API.Failover)
+	if _, off := w.API.Replicas.(replicasOff); !off || !w.API.LoadBalancers || w.API.Failover == nil {
+		t.Fatalf("Deps: replicas %T, load balancers %v, failover %v", w.API.Replicas, w.API.LoadBalancers, w.API.Failover)
 	}
 	if _, ok := w.API.Replicas.(replicas.Remover); !ok {
 		t.Fatal("the Management API cannot remove the replicas of a project it deletes")
@@ -137,8 +137,8 @@ func TestAClusterNodeWithBackupsHasNothingOff(t *testing.T) {
 	withBackups(t, w)
 	runClusterWire(t, w)
 	wantOff(t, w)
-	if _, isController := w.API.Replicas.(*replicas.Controller); !isController || w.API.Placement == nil || !w.API.LoadBalancers || w.API.Failover == nil {
-		t.Fatalf("Deps: replicas %T, placement %v, load balancers %v, failover %v", w.API.Replicas, w.API.Placement, w.API.LoadBalancers, w.API.Failover)
+	if _, isController := w.API.Replicas.(*replicas.Controller); !isController || !w.API.LoadBalancers || w.API.Failover == nil {
+		t.Fatalf("Deps: replicas %T, load balancers %v, failover %v", w.API.Replicas, w.API.LoadBalancers, w.API.Failover)
 	}
 	for _, name := range []string{"replicas", "replica report intake", "failover monitor"} {
 		if !hasRunner(w, name) {
@@ -166,8 +166,8 @@ func TestAClusterNodeWhoseHostIsBehindTakesNoReplicaRequests(t *testing.T) {
 	if _, off := w.API.Replicas.(replicasOff); !off {
 		t.Fatalf("the Management API was given %T, which is not the controller behind replicasOff", w.API.Replicas)
 	}
-	if w.API.Placement == nil || w.API.Failover == nil || !w.API.LoadBalancers {
-		t.Fatalf("Deps: placement %v, load balancers %v, failover %v", w.API.Placement, w.API.LoadBalancers, w.API.Failover)
+	if w.API.Failover == nil || !w.API.LoadBalancers {
+		t.Fatalf("Deps: load balancers %v, failover %v", w.API.LoadBalancers, w.API.Failover)
 	}
 	for _, name := range []string{"replicas", "failover monitor"} {
 		if hasRunner(w, name) {
@@ -222,7 +222,7 @@ func TestASingleServerHasNoClusterPorts(t *testing.T) {
 	if w.clustered() || len(w.unaccounted()) != 0 {
 		t.Fatalf("clustered %v, unaccounted %v", w.clustered(), w.unaccounted())
 	}
-	if w.API.Replicas != nil || w.API.Placement != nil || w.API.LoadBalancers || w.API.Failover != nil {
+	if w.API.Replicas != nil || w.API.LoadBalancers || w.API.Failover != nil {
 		t.Fatal("a single server's Management API was given cluster collaborators")
 	}
 	if w.Proxy.Cluster != nil {

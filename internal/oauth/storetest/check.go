@@ -172,7 +172,7 @@ func eqIDs(t *testing.T, what string, got, want []int64) {
 // returns is not part of the contract.
 func sortedIDs(gs []oauth.Grant) []int64 {
 	out := ids(gs)
-	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	slices.Sort(out)
 	return out
 }
 

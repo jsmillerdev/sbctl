@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -854,7 +855,7 @@ func TestOAuthPrincipal(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if p.Via != "oauth" || p.UserID != x.userID || p.Email != "dev@example.test" || p.AAL != "" || p.TokenID != 0 {
+	if p.Via != "oauth" || p.UserID != x.userID || p.UserEmail() != "dev@example.test" || p.AAL != "" || p.TokenID != 0 {
 		t.Errorf("principal: %+v", p)
 	}
 	o := p.OAuth
@@ -879,6 +880,41 @@ func TestOAuthPrincipal(t *testing.T) {
 	if rec := x.doAs(x.jwt, "GET", "/v1/projects/"+testRef, nil); rec.Code != 403 {
 		t.Errorf("fixture: the session below aal2 should be refused by an MFA organization, got %d", rec.Code)
 	}
+}
+
+// An OAuth principal does not read its user from the store until a handler asks for the address.
+func TestOAuthPrincipalLoadsItsEmailWhenAsked(t *testing.T) {
+	x := newOAuthAuthzFixture(t)
+	x.doAs(x.jwt, "GET", "/platform/profile", nil) // the user is on record now
+	counter := &countingUserStore{Store: x.srv.auth.store}
+	x.srv.auth.store = counter
+	tok := x.token("owner", "projects:read")
+	r := httptest.NewRequest("GET", "/v1/projects", nil)
+	r.Header.Set("Authorization", "Bearer "+tok)
+	p, err := x.srv.auth.authenticate(r, authAny)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := counter.gets.Load(); n != 0 {
+		t.Fatalf("authenticate read the user %d times", n)
+	}
+	if got := p.UserEmail(); got != "dev@example.test" {
+		t.Errorf("UserEmail = %q", got)
+	}
+	if got := p.UserEmail(); got != "dev@example.test" || counter.gets.Load() != 1 {
+		t.Errorf("a second UserEmail = %q after %d reads, want the kept answer after one", got, counter.gets.Load())
+	}
+}
+
+// countingUserStore counts the reads of a user by GoTrue id.
+type countingUserStore struct {
+	Store
+	gets atomic.Int32
+}
+
+func (c *countingUserStore) GetUser(ctx context.Context, userID string) (*User, error) {
+	c.gets.Add(1)
+	return c.Store.GetUser(ctx, userID)
 }
 
 func TestOAuthLastUsedIsThrottled(t *testing.T) {
@@ -998,12 +1034,12 @@ func TestOnlyKnownCodeReadsMembershipsDirectly(t *testing.T) {
 	known := map[string]int{
 		"authz.go":          1, // accessOf: the one place a request loads Access (oauth tokens arrive with theirs)
 		"oauth_authn.go":    1, // loads the user's Access to restrict it to the grant's organization
-		"server.go":         1, // oauthAdmit: membership of one named organization, for the token endpoint
+		"server.go":         1, // oauthAdmit (members.IsMember): membership of one named organization, for the token endpoint
 		"sso_dashboard.go":  2, // dashboard single sign-on: other users' roles (a /platform route) and first sight
 		"members_wiring.go": 1, // `supavise users list`
 		"standin.go":        1, // the sweep of `functions dev`'s stand-in user, at daemon start
 	}
-	re := regexp.MustCompile(`MembershipsOf\(|\bmembers\.Access\(`)
+	re := regexp.MustCompile(`MembershipsOf\(|\bmembers\.Access\(|\bmembers\.IsMember\(`)
 	files, err := filepath.Glob("*.go")
 	if err != nil {
 		t.Fatal(err)

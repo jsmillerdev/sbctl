@@ -141,8 +141,13 @@ func (a *authenticator) authOAuth(ctx context.Context, token string) (*Principal
 			OrgID: info.OrgID, OrgSlug: info.OrgSlug, Scopes: slices.Clone(info.Scopes), Resource: info.Resource,
 		},
 	}
-	if u, err := a.store.GetUser(ctx, info.UserID); err == nil {
-		p.Email = u.Email
+	// The address is loaded when a handler asks for it (Principal.UserEmail): of the routes an OAuth token
+	// can reach (not /platform), only GET /v1/profile reads it, and only for a user the store lacks.
+	p.loadEmail = func() string {
+		if u, err := a.store.GetUser(ctx, info.UserID); err == nil {
+			return u.Email
+		}
+		return ""
 	}
 	return p, nil
 }

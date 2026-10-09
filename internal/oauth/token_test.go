@@ -455,7 +455,7 @@ func TestExchangeParameters(t *testing.T) {
 		{"client_credentials", TokenRequest{GrantType: "client_credentials", ClientID: ra.App.ID, ClientSecret: ra.ClientSecret}, CodeUnsupportedGrantType},
 		{"no client_id", TokenRequest{GrantType: GrantTypeAuthorizationCode, Code: "x"}, CodeInvalidRequest},
 		{"malformed client_id", TokenRequest{GrantType: GrantTypeAuthorizationCode, ClientID: "x", Code: "x"}, CodeInvalidClient},
-		{"unknown client_id", TokenRequest{GrantType: GrantTypeAuthorizationCode, ClientID: newUUID(), Code: "x", RedirectURI: "x"}, CodeInvalidClient},
+		{"unknown client_id", TokenRequest{GrantType: GrantTypeAuthorizationCode, ClientID: secrets.NewUUID(), Code: "x", RedirectURI: "x"}, CodeInvalidClient},
 		{"code flow without a code", TokenRequest{GrantType: GrantTypeAuthorizationCode, ClientID: ra.App.ID, RedirectURI: f.Req.RedirectURI}, CodeInvalidRequest},
 		{"code flow without a redirect_uri", TokenRequest{GrantType: GrantTypeAuthorizationCode, ClientID: ra.App.ID, Code: f.Code}, CodeInvalidRequest},
 		{"a code of the wrong shape", TokenRequest{GrantType: GrantTypeAuthorizationCode, ClientID: ra.App.ID, Code: "sbc_short", RedirectURI: f.Req.RedirectURI}, CodeInvalidGrant},

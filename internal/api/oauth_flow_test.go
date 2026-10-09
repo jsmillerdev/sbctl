@@ -5,7 +5,6 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
-	"errors"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -63,9 +62,6 @@ func newFlowFixture(t *testing.T) *flowFixture {
 	svc, ok := f.srv.oauth.(*oauth.Service)
 	if !ok {
 		t.Fatalf("Server.oauth is %T", f.srv.oauth)
-	}
-	if _, err := svc.Register(context.Background(), oauth.RegisterRequest{}); errors.Is(err, oauth.ErrNotImplemented) {
-		t.Skip("oauth.Service is not written yet")
 	}
 	ff := &flowFixture{fixture: f, svc: svc, clock: &flowClock{t: time.Now().Truncate(time.Second)}}
 	svc.Now = ff.clock.now

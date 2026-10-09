@@ -775,37 +775,37 @@ func TestClaimClientForwardedForNeedsTheProxySecretWhereFunctionsRun(t *testing.
 }
 
 func TestClaimLimiterMemoryIsBoundedAndFailsOpenWhenFull(t *testing.T) {
-	var l claimLimiter
+	l := newWindowLimiter(claimFailLimit, claimFailWindow)
 	now := time.Now()
-	for i := 0; i < claimMaxClients+500; i++ {
+	for i := 0; i < oauthLimiterMaxKeys+500; i++ {
 		l.fail(fmt.Sprintf("client-%d", i), now)
 	}
-	if len(l.clients) > claimMaxClients {
-		t.Fatalf("%d tracked clients", len(l.clients))
+	if len(l.keys) > oauthLimiterMaxKeys {
+		t.Fatalf("%d tracked clients", len(l.keys))
 	}
 	// A client the full table cannot track is never blocked, however often it fails: a flood of
 	// junk clients must not lock out the first administrator.
 	for i := 0; i < 3*claimFailLimit; i++ {
 		l.fail("fresh-admin", now)
 	}
-	if l.blocked("fresh-admin", now) {
+	if _, blocked := l.blocked("fresh-admin", now); blocked {
 		t.Fatal("an unknown client was blocked while the table was full")
 	}
-	if len(l.clients) > claimMaxClients {
-		t.Fatalf("%d tracked clients after the untracked failures", len(l.clients))
+	if len(l.keys) > oauthLimiterMaxKeys {
+		t.Fatalf("%d tracked clients after the untracked failures", len(l.keys))
 	}
 	// Tracked clients are still limited, and once the windows expire the table takes new clients.
 	for i := 0; i < claimFailLimit; i++ {
 		l.fail("client-0", now)
 	}
-	if !l.blocked("client-0", now) {
+	if _, blocked := l.blocked("client-0", now); !blocked {
 		t.Fatal("a tracked client was not blocked")
 	}
 	later := now.Add(2 * claimFailWindow)
 	for i := 0; i < claimFailLimit; i++ {
 		l.fail("fresh-admin", later)
 	}
-	if !l.blocked("fresh-admin", later) {
+	if _, blocked := l.blocked("fresh-admin", later); !blocked {
 		t.Fatal("a client is not tracked after the old windows expired")
 	}
 }

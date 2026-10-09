@@ -203,16 +203,6 @@ func pgCheckToken(what string, t Token) error {
 	return nil
 }
 
-// pgSubset reports whether every element of sub is in set.
-func pgSubset(sub, set []string) bool {
-	for _, s := range sub {
-		if !slices.Contains(set, s) {
-			return false
-		}
-	}
-	return true
-}
-
 // pgStrings is s, or an empty slice for nil: a nil slice would be written as NULL.
 func pgStrings(s []string) []string {
 	if s == nil {
@@ -226,20 +216,6 @@ func pgNullInt(v int64) any {
 		return nil
 	}
 	return v
-}
-
-func pgNullTime(t time.Time) any {
-	if t.IsZero() {
-		return nil
-	}
-	return t
-}
-
-func pgNullBytes(b []byte) any {
-	if len(b) == 0 {
-		return nil
-	}
-	return b
 }
 
 func pgCopyGrant(g Grant) Grant {
@@ -583,7 +559,7 @@ func (c *pgCodeTx) Complete(ctx context.Context, in NewGrant) (*CompleteResult, 
 	// scope beyond those of the request. The Service builds it from the locked row; this refuses a
 	// grant that was built from anything else.
 	if a := c.auth; !strings.EqualFold(g.AppID, a.AppID) || !strings.EqualFold(g.UserID, a.DecidedBy) || g.OrgID != a.OrgID ||
-		g.Resource != a.Resource || !pgSubset(g.Scopes, a.Scopes) {
+		g.Resource != a.Resource || !SubsetOf(g.Scopes, a.Scopes) {
 		return nil, fmt.Errorf("%w: the grant is not the one the authorization approved", ErrInvalid)
 	}
 

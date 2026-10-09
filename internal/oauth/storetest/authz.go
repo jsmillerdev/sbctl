@@ -8,14 +8,15 @@ import (
 	"time"
 
 	"github.com/supavise/supavise/internal/oauth"
+	"github.com/supavise/supavise/internal/secrets"
 )
 
 func testAuthorizationDecide(t *testing.T, e *env) {
 	app, other := e.createApp(), e.createApp()
 	mk := func(a oauth.App, ttl time.Duration) oauth.Authorization {
 		au := oauth.Authorization{
-			ID: uuid(), AppID: a.ID, RedirectURI: "http://127.0.0.1:8123/cb", Scopes: []string{"projects:read", "database:read"},
-			State: "state-" + uuid(), CodeChallenge: "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM", Resource: "https://api.example.com/mcp",
+			ID: secrets.NewUUID(), AppID: a.ID, RedirectURI: "http://127.0.0.1:8123/cb", Scopes: []string{"projects:read", "database:read"},
+			State: "state-" + secrets.NewUUID(), CodeChallenge: "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM", Resource: "https://api.example.com/mcp",
 			OrgHint: "acme", CreatedAt: e.t0, ExpiresAt: e.t0.Add(ttl), Status: oauth.StatusPending,
 		}
 		e.must(e.st.CreateAuthorization(e.ctx, au))
@@ -29,7 +30,7 @@ func testAuthorizationDecide(t *testing.T, e *env) {
 	checkAuth(t, got, a1)
 	eq(t, "pending OrgSlug", got.OrgSlug, "")
 	e.wantErr(e.st.CreateAuthorization(e.ctx, a1), oauth.ErrConflict)
-	for _, id := range []string{uuid(), "not-a-uuid"} {
+	for _, id := range []string{secrets.NewUUID(), "not-a-uuid"} {
 		_, err = e.st.GetAuthorization(e.ctx, id)
 		e.wantErr(err, oauth.ErrNotFound)
 	}
@@ -47,10 +48,10 @@ func testAuthorizationDecide(t *testing.T, e *env) {
 	eq(t, "pending of all", count("", at), 4)
 	eq(t, "pending after a4 expired", count(app.ID, e.t0.Add(time.Minute)), 2)
 	eq(t, "pending at the instant a1 expires", count(app.ID, e.t0.Add(10*time.Minute)), 0)
-	eq(t, "pending of an unknown app", count(uuid(), at), 0)
+	eq(t, "pending of an unknown app", count(secrets.NewUUID(), at), 0)
 
 	// Approval returns the updated row and changes nothing else.
-	user, code := uuid(), hash()
+	user, code := secrets.NewUUID(), hash()
 	decided, codeExp := e.t0.Add(time.Minute-time.Second), e.t0.Add(2*time.Minute)
 	won, err := e.st.DecideAuthorization(e.ctx, a1.ID, oauth.Decision{
 		Status: oauth.StatusApproved, DecidedBy: user, At: decided, OrgID: e.orgA, CodeHash: code, CodeExpiresAt: codeExp,
@@ -67,10 +68,10 @@ func testAuthorizationDecide(t *testing.T, e *env) {
 	eq(t, "pending of app after a1 was decided", count(app.ID, at), 2)
 
 	// A decided request cannot be decided again, either way, and keeps its first decision.
-	_, err = e.st.DecideAuthorization(e.ctx, a1.ID, oauth.Decision{Status: oauth.StatusDeclined, DecidedBy: uuid(), At: decided})
+	_, err = e.st.DecideAuthorization(e.ctx, a1.ID, oauth.Decision{Status: oauth.StatusDeclined, DecidedBy: secrets.NewUUID(), At: decided})
 	e.wantErr(err, oauth.ErrAlreadyDecided)
 	_, err = e.st.DecideAuthorization(e.ctx, a1.ID, oauth.Decision{
-		Status: oauth.StatusApproved, DecidedBy: uuid(), At: decided, OrgID: e.orgB, CodeHash: hash(), CodeExpiresAt: codeExp,
+		Status: oauth.StatusApproved, DecidedBy: secrets.NewUUID(), At: decided, OrgID: e.orgB, CodeHash: hash(), CodeExpiresAt: codeExp,
 	})
 	e.wantErr(err, oauth.ErrAlreadyDecided)
 	got, err = e.st.GetAuthorization(e.ctx, a1.ID)
@@ -100,7 +101,7 @@ func testAuthorizationDecide(t *testing.T, e *env) {
 	_, err = e.st.DecideAuthorization(e.ctx, a4.ID, oauth.Decision{Status: oauth.StatusDeclined, DecidedBy: user, At: a4.ExpiresAt.Add(-time.Second)})
 	e.must(err)
 
-	for _, id := range []string{uuid(), "not-a-uuid"} {
+	for _, id := range []string{secrets.NewUUID(), "not-a-uuid"} {
 		_, err = e.st.DecideAuthorization(e.ctx, id, oauth.Decision{Status: oauth.StatusDeclined, DecidedBy: user, At: decided})
 		e.wantErr(err, oauth.ErrNotFound)
 	}
@@ -113,13 +114,13 @@ func testAuthorizationDecide(t *testing.T, e *env) {
 func testDecideConcurrent(t *testing.T, e *env) {
 	app := e.createApp()
 	au := oauth.Authorization{
-		ID: uuid(), AppID: app.ID, RedirectURI: "http://127.0.0.1:8123/cb", Scopes: []string{"projects:read"},
+		ID: secrets.NewUUID(), AppID: app.ID, RedirectURI: "http://127.0.0.1:8123/cb", Scopes: []string{"projects:read"},
 		CreatedAt: e.t0, ExpiresAt: e.t0.Add(time.Hour), Status: oauth.StatusPending,
 	}
 	e.must(e.st.CreateAuthorization(e.ctx, au))
 
 	const n = 8
-	user, at := uuid(), e.t0.Add(time.Minute)
+	user, at := secrets.NewUUID(), e.t0.Add(time.Minute)
 	codes := make([][]byte, n)
 	for i := range codes {
 		codes[i] = hash()
@@ -169,7 +170,7 @@ func testDecideConcurrent(t *testing.T, e *env) {
 
 func testWithCode(t *testing.T, e *env) {
 	app, other := e.createApp(), e.createApp()
-	user, at := uuid(), e.t0.Add(time.Minute)
+	user, at := secrets.NewUUID(), e.t0.Add(time.Minute)
 	approved, code := e.approve(app, user, e.orgA, at)
 
 	// A code that is unknown, or belongs to another app, finds nothing and runs nothing.
@@ -235,7 +236,7 @@ func testWithCode(t *testing.T, e *env) {
 
 func testCompleteIssuesGrant(t *testing.T, e *env) {
 	app := e.createApp()
-	user, at := uuid(), e.t0.Add(time.Hour)
+	user, at := secrets.NewUUID(), e.t0.Add(time.Hour)
 	approved, code := e.approve(app, user, e.orgA, at.Add(-time.Minute))
 	ng := oauth.NewGrant{
 		Grant:   oauth.Grant{AppID: app.ID, UserID: user, OrgID: e.orgA, Scopes: []string{"projects:read", "database:read"}, Resource: "https://api.example.com/mcp", CreatedAt: at},
@@ -331,7 +332,7 @@ func testCompleteIssuesGrant(t *testing.T, e *env) {
 
 func testCompleteSupersedes(t *testing.T, e *env) {
 	a, b := e.createApp(), e.createApp()
-	u, u2 := uuid(), uuid()
+	u, u2 := secrets.NewUUID(), secrets.NewUUID()
 
 	// The same app, user and organization: the newer grant replaces the older.
 	at1, at2 := e.next(), e.next()
@@ -365,7 +366,7 @@ func testCompleteSupersedes(t *testing.T, e *env) {
 	for i := range c {
 		c[i] = e.createApp()
 	}
-	uc := uuid()
+	uc := secrets.NewUUID()
 	var made []granted
 	for i := 0; i < 3; i++ {
 		g := e.grant(flow{app: c[i], user: uc, org: e.orgA, maxLive: 3})
@@ -396,7 +397,7 @@ func testCompleteSupersedes(t *testing.T, e *env) {
 // testCodeSingleUseConcurrent is C2: many redemptions of one code at once, one winner.
 func testCodeSingleUseConcurrent(t *testing.T, e *env) {
 	app := e.createApp()
-	user, at := uuid(), e.t0.Add(time.Hour)
+	user, at := secrets.NewUUID(), e.t0.Add(time.Hour)
 	approved, code := e.approve(app, user, e.orgA, at.Add(-time.Minute))
 
 	const n = 16

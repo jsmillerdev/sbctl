@@ -49,6 +49,7 @@ type Notifier struct {
 	logMu  sync.Mutex
 	logged map[string]time.Time // when each condition was last logged
 	mailer func(ctx context.Context, to []string, subject, text string) error
+	wg     sync.WaitGroup // the deliveries NotifyDetached has in flight
 }
 
 // New returns a Notifier for the node cfg describes.
@@ -93,6 +94,61 @@ func Notify(ctx context.Context, ev Event) error {
 		return n.Notify(ctx, ev)
 	}
 	return nil
+}
+
+// detachedTimeout bounds one NotifyBounded or NotifyDetached delivery: a webhook is retried once
+// after two seconds and SMTP can take 40 seconds. A caller does not wait longer than this for an
+// alert, and a lost one is logged, never an error of the work that raised it.
+const detachedTimeout = 90 * time.Second
+
+// detach is a context that does not end with ctx and ends after detachedTimeout: the request or
+// the SIGTERM that is stopping the work does not also drop the message that tells the operator
+// about it.
+func detach(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(ctx), detachedTimeout)
+}
+
+// NotifyBounded is Notify on a context that outlives ctx's cancellation and ends after 90 seconds.
+// It returns what Notify returns.
+func (n *Notifier) NotifyBounded(ctx context.Context, ev Event) error {
+	ctx, cancel := detach(ctx)
+	defer cancel()
+	return n.Notify(ctx, ev)
+}
+
+// NotifyDetached delivers ev on a goroutine of its own, on NotifyBounded's kind of context, so that
+// a slow webhook does not hold up the request or the upgrade that raised the event. A failure to
+// send is logged ("could not send the alert") and never reaches the caller. Drain waits for the
+// deliveries still in flight.
+func (n *Notifier) NotifyDetached(ctx context.Context, ev Event) {
+	n.NotifyDetachedFunc(ctx, ev, func(err error) {
+		n.log.Warn("could not send the alert", "kind", ev.Kind, "ref", ev.Ref, "error", err)
+	})
+}
+
+// NotifyDetachedFunc is NotifyDetached for a caller that reports a failure to send in its own
+// words: failed is called, on the delivery's goroutine, with the error Notify returned.
+func (n *Notifier) NotifyDetachedFunc(ctx context.Context, ev Event, failed func(error)) {
+	ctx, cancel := detach(ctx)
+	n.wg.Add(1)
+	go func() {
+		defer n.wg.Done()
+		defer cancel()
+		if err := n.Notify(ctx, ev); err != nil {
+			failed(err)
+		}
+	}()
+}
+
+// Drain lets the deliveries of NotifyDetached that are in flight finish, up to 90 seconds, which is
+// what the daemon does when it stops.
+func (n *Notifier) Drain() {
+	done := make(chan struct{})
+	go func() { n.wg.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(detachedTimeout):
+	}
 }
 
 // Notify logs ev and sends it to every destination unless it is a duplicate of a problem

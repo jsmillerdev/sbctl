@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"net/http"
 	"regexp"
-	"sort"
 	"strconv"
 	"strings"
 
@@ -216,18 +215,4 @@ func stubHandler(op *Operation) http.HandlerFunc {
 		w.WriteHeader(status)
 		_, _ = w.Write(body)
 	}
-}
-
-// StubKeys lists the routes a server with the given implemented keys stubs, for the
-// README and the spec-diff job. Keys are "METHOD /path".
-func StubKeys(implemented map[string]bool) []string {
-	ops, _ := Operations()
-	var out []string
-	for _, o := range ops {
-		if !implemented[o.Key()] {
-			out = append(out, o.Key())
-		}
-	}
-	sort.Strings(out)
-	return out
 }

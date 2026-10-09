@@ -483,7 +483,7 @@ func (s *Server) v1Health(w http.ResponseWriter, r *http.Request) error {
 		}
 	}
 	reported := map[string]lifecycle.ServiceHealth{}
-	if p.Status == registry.StatusActiveHealthy || p.Status == registry.StatusActiveUnhealthy || p.Status == registry.StatusComingUp {
+	if p.Status.Running() || p.Status == registry.StatusComingUp {
 		hs, err := s.mgr.Health(r.Context(), p.Ref)
 		if err != nil {
 			s.log.Warn("health check failed", "ref", p.Ref, "err", err)

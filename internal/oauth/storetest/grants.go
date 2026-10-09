@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/supavise/supavise/internal/oauth"
+	"github.com/supavise/supavise/internal/secrets"
 )
 
 func testLookupAccess(t *testing.T, e *env) {
@@ -67,7 +68,7 @@ func testLookupAccess(t *testing.T, e *env) {
 
 func testGrants(t *testing.T, e *env) {
 	a, b := e.createApp(), e.createApp()
-	u1, u2 := uuid(), uuid()
+	u1, u2 := secrets.NewUUID(), secrets.NewUUID()
 	at := func(m int) time.Time { return e.t0.Add(time.Duration(m) * time.Minute) }
 	g1 := e.grant(flow{app: a, user: u1, org: e.orgA, at: at(1)})
 	g2 := e.grant(flow{app: a, user: u2, org: e.orgA, at: at(2)})
@@ -89,7 +90,7 @@ func testGrants(t *testing.T, e *env) {
 	eqIDs(t, "id g3", list(oauth.GrantFilter{ID: g3.grant.ID}), []int64{g3.grant.ID})
 	eqIDs(t, "app a and user u1", list(oauth.GrantFilter{AppID: a.ID, UserID: u1}), []int64{g4.grant.ID, g1.grant.ID})
 	eqIDs(t, "limit 2", list(oauth.GrantFilter{Limit: 2}), []int64{g5.grant.ID, g4.grant.ID})
-	eqIDs(t, "unknown app", list(oauth.GrantFilter{AppID: uuid()}), nil)
+	eqIDs(t, "unknown app", list(oauth.GrantFilter{AppID: secrets.NewUUID()}), nil)
 	eqIDs(t, "malformed app", list(oauth.GrantFilter{AppID: "not-a-uuid"}), nil)
 	eqIDs(t, "malformed user", list(oauth.GrantFilter{UserID: "not-a-uuid"}), nil)
 
@@ -124,7 +125,7 @@ func testGrants(t *testing.T, e *env) {
 	if got, err = e.st.RevokeGrants(e.ctx, oauth.GrantFilter{AppID: a.ID}, oauth.ReasonOperator, later); err != nil || len(got) != 0 {
 		t.Errorf("a second revocation = %v, %v; want nothing", ids(got), err)
 	}
-	if got, err = e.st.RevokeGrants(e.ctx, oauth.GrantFilter{AppID: uuid()}, oauth.ReasonOperator, later); err != nil || len(got) != 0 {
+	if got, err = e.st.RevokeGrants(e.ctx, oauth.GrantFilter{AppID: secrets.NewUUID()}, oauth.ReasonOperator, later); err != nil || len(got) != 0 {
 		t.Errorf("revocation for an unknown app = %v, %v; want nothing", ids(got), err)
 	}
 

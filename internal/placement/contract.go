@@ -19,26 +19,10 @@ import (
 	"github.com/supavise/supavise/internal/registry"
 )
 
-// Role is what a node is to a project.
-type Role string
-
-const (
-	// RolePrimary: the node is the project's home.
-	RolePrimary Role = "primary"
-	// RoleReplica: the node holds a replica row of the project.
-	RoleReplica Role = "replica"
-	// RoleNone: the node holds nothing of the project but its forwarders.
-	RoleNone Role = ""
-)
-
-// Resolver answers where things are, from the registry (the replicated copy on a follower).
+// Resolver answers where a project is, from the registry (the replicated copy on a follower).
 type Resolver interface {
 	// HomeOf is the id of the node that is the project's home. registry.ErrNotFound for an unknown ref.
 	HomeOf(ctx context.Context, ref string) (node string, err error)
-	// RoleOf is node's role for ref.
-	RoleOf(ctx context.Context, ref, node string) (Role, error)
-	// ReplicasOf are the replicas of ref, by creation time.
-	ReplicasOf(ctx context.Context, ref string) ([]registry.Replica, error)
 }
 
 // PlaneRouter is the lifecycle.Plane the leader's engine drives. It sends each call for a
@@ -98,28 +82,4 @@ func (r RegistryResolver) HomeOf(ctx context.Context, ref string) (string, error
 		return "", err
 	}
 	return p.NodeID, nil
-}
-
-func (r RegistryResolver) RoleOf(ctx context.Context, ref, node string) (Role, error) {
-	p, err := r.Reg.GetProject(ctx, ref)
-	if err != nil {
-		return RoleNone, err
-	}
-	if p.NodeID == node {
-		return RolePrimary, nil
-	}
-	rs, err := r.Reg.ListReplicas(ctx, ref)
-	if err != nil {
-		return RoleNone, err
-	}
-	for _, x := range rs {
-		if x.NodeID == node {
-			return RoleReplica, nil
-		}
-	}
-	return RoleNone, nil
-}
-
-func (r RegistryResolver) ReplicasOf(ctx context.Context, ref string) ([]registry.Replica, error) {
-	return r.Reg.ListReplicas(ctx, ref)
 }

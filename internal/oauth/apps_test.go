@@ -181,7 +181,7 @@ func TestUpdateAndDeleteApp(t *testing.T) {
 	for name, r := range map[string]UpdateAppRequest{
 		"another organization": {OrgID: testOrgOther, AppID: app.ID},
 		"a dynamic app":        {OrgID: testOrgAcme, AppID: dyn.App.ID},
-		"a missing id":         {OrgID: testOrgAcme, AppID: newUUID()},
+		"a missing id":         {OrgID: testOrgAcme, AppID: secrets.NewUUID()},
 		"a malformed id":       {OrgID: testOrgAcme, AppID: "x"},
 		"organization 0":       {OrgID: 0, AppID: app.ID},
 	} {

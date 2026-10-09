@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"log/slog"
 	"net/mail"
-	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -131,6 +130,22 @@ func (s *Service) Access(ctx context.Context, userID string) (*Access, error) {
 		}
 	}
 	return a, nil
+}
+
+// IsMember reports whether user belongs to org, which is all a gate that admits members needs to
+// know. A member costs one query. A user who has no row in org gets what Access gives, the legacy
+// rule included, so the answer is always Access(user).IsMember(org).
+func (s *Service) IsMember(ctx context.Context, user string, org int64) (bool, error) {
+	if _, err := s.Store.GetMember(ctx, org, user); err == nil {
+		return true, nil
+	} else if !errors.Is(err, ErrNotFound) {
+		return false, err
+	}
+	a, err := s.Access(ctx, user)
+	if err != nil {
+		return false, err
+	}
+	return a.IsMember(org), nil
 }
 
 // legacyOwner applies the legacy-account rule to a user without memberships.
@@ -972,11 +987,4 @@ func (s *Service) DomainDefaults(ctx context.Context) ([]DomainDefault, error) {
 // RemoveDomainDefault deletes a domain rule.
 func (s *Service) RemoveDomainDefault(ctx context.Context, domain string) error {
 	return s.Store.DeleteDomainDefault(ctx, strings.ToLower(strings.TrimSpace(strings.TrimPrefix(domain, "@"))))
-}
-
-// SortedRoleIDs returns ids ascending; a helper for stable output.
-func SortedRoleIDs(ids []int64) []int64 {
-	out := append([]int64(nil), ids...)
-	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
-	return out
 }

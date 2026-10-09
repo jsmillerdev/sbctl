@@ -720,7 +720,7 @@ func (s *Server) invitationByToken(w http.ResponseWriter, r *http.Request) error
 	}
 	st := members.InviteState{TokenNotFound: true}
 	if org != nil {
-		if st, err = s.members.InvitationState(r.Context(), orgRef(org), r.PathValue("token"), p.Email); err != nil {
+		if st, err = s.members.InvitationState(r.Context(), orgRef(org), r.PathValue("token"), p.UserEmail()); err != nil {
 			return err
 		}
 	}
@@ -751,7 +751,7 @@ func (s *Server) acceptInvitation(w http.ResponseWriter, r *http.Request) error 
 	}
 	p := principalFrom(r.Context())
 	token := r.PathValue("token")
-	st, err := s.members.InvitationState(r.Context(), orgRef(org), token, p.Email)
+	st, err := s.members.InvitationState(r.Context(), orgRef(org), token, p.UserEmail())
 	if err != nil {
 		return err
 	}
@@ -773,7 +773,7 @@ func (s *Server) acceptInvitation(w http.ResponseWriter, r *http.Request) error 
 			return errMFARequired
 		}
 	}
-	err = s.members.AcceptInvitation(r.Context(), orgRef(org), token, p.UserID, p.Email, func(refs []string) []string { return s.liveRefs(r.Context(), refs) })
+	err = s.members.AcceptInvitation(r.Context(), orgRef(org), token, p.UserID, p.UserEmail(), func(refs []string) []string { return s.liveRefs(r.Context(), refs) })
 	if err := memberErr(err); err != nil {
 		return err
 	}

@@ -2,7 +2,6 @@ package api
 
 import (
 	"context"
-	"crypto/rand"
 	"errors"
 	"fmt"
 	"net/http"
@@ -44,14 +43,6 @@ var keyNamePattern = regexp.MustCompile(`^[a-z_][a-z0-9_]{0,62}$`)
 
 // keyID is the stable uuid-shaped id of a legacy or default key of a project.
 func keyID(ref, name, typ string) string { return secrets.KeyID(ref, name, typ) }
-
-func newKeyID() string {
-	b := make([]byte, 16)
-	_, _ = rand.Read(b)
-	b[6] = b[6]&0x0f | 0x40
-	b[8] = b[8]&0x3f | 0x80
-	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:])
-}
 
 // keyEntry is one key as the API lists it: legacy, or opaque with its value resolved.
 type keyEntry struct {
@@ -268,7 +259,7 @@ func (s *Server) createAPIKey(w http.ResponseWriter, r *http.Request) error {
 		return errf(http.StatusBadRequest, "A project can have at most %d API keys; delete one first", maxAPIKeys)
 	}
 	now := s.now().UTC()
-	rec := secrets.APIKeyRecord{ID: newKeyID(), Name: in.Name, Type: typ, Template: tmpl, CreatedAt: now, UpdatedAt: now}
+	rec := secrets.APIKeyRecord{ID: secrets.NewUUID(), Name: in.Name, Type: typ, Template: tmpl, CreatedAt: now, UpdatedAt: now}
 	if in.Description != nil {
 		rec.Description = *in.Description
 	}

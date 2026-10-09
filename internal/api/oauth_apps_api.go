@@ -40,8 +40,9 @@ const oauthAppsNilUUID = "00000000-0000-0000-0000-000000000000"
 
 // routesOAuthApps registers the eight operations OAuthApps* and OAuthAppClientSecrets* of the
 // platform spec. It is called whether or not [api] disable_oauth is set; the handlers answer 404
-// while it is (oauthDisabled).
+// while it is (oauthRoutes).
 func (s *Server) routesOAuthApps(add func(string, handlerFunc)) {
+	add = s.oauthRoutes(add)
 	const apps = "/platform/organizations/{slug}/oauth/apps"
 	add("GET "+apps, s.listOAuthApps)
 	add("POST "+apps, s.createOAuthApp)
@@ -55,12 +56,10 @@ func (s *Server) routesOAuthApps(add func(string, handlerFunc)) {
 
 // ---- shared pieces ------------------------------------------------------------------------------
 
-// oauthAppsCaller is the start of every handler: OAuth is on, the organization of the path exists,
-// a dashboard user is signed in and that user may manage the organization's OAuth apps.
+// oauthAppsCaller is the start of every handler (OAuth is on by then, see oauthRoutes): the
+// organization of the path exists, a dashboard user is signed in and that user may manage the
+// organization's OAuth apps.
 func (s *Server) oauthAppsCaller(r *http.Request) (*registry.Organization, *Principal, error) {
-	if s.oauthDisabled() {
-		return nil, nil, errf(http.StatusNotFound, "Not Found")
-	}
 	org, err := s.orgBySlug(r.Context(), r.PathValue("slug"))
 	if err != nil {
 		return nil, nil, err
@@ -179,20 +178,12 @@ func oauthAppsIcon(a oauth.App) string {
 	return a.Icon
 }
 
-// oauthAppsStrings returns a non-nil slice so that an empty list encodes as [] and not null.
-func oauthAppsStrings(v []string) []string {
-	if v == nil {
-		return []string{}
-	}
-	return v
-}
-
 // oauthAppsItem is one app of either list.
 func oauthAppsItem(a oauth.App) map[string]any {
 	m := setAll(elem("GET /platform/organizations/{slug}/oauth/apps", ""), map[string]any{
 		"id": a.ID, "client_id": a.ID, "name": a.Name, "website": oauthAppsWebsite(a),
 		"registration_type": a.RegistrationType, "created_at": ts(a.CreatedAt),
-		"redirect_uris": oauthAppsStrings(a.RedirectURIs), "scopes": oauthAppsStrings(a.Scopes),
+		"redirect_uris": nonNil(a.RedirectURIs), "scopes": nonNil(a.Scopes),
 	})
 	if icon := oauthAppsIcon(a); icon != "" {
 		m["icon"] = icon
@@ -265,7 +256,7 @@ func (s *Server) listOAuthApps(w http.ResponseWriter, r *http.Request) error {
 			m := oauthAppsItem(it.App)
 			m["app_id"] = it.App.ID
 			m["authorized_at"] = ts(it.AuthorizedAt)
-			m["scopes"] = oauthAppsStrings(it.Scopes)
+			m["scopes"] = nonNil(it.Scopes)
 			if author := s.oauthAppsAuthor(r, it.App, orgs); author != "" {
 				m["created_by"] = author
 			}
@@ -314,7 +305,7 @@ func (s *Server) createOAuthApp(w http.ResponseWriter, r *http.Request) error {
 	w.Header().Set("Cache-Control", "no-store")
 	writeJSON(w, http.StatusCreated, setAll(base("POST /platform/organizations/{slug}/oauth/apps"), map[string]any{
 		"id": created.App.ID, "client_id": created.App.ID, "client_secret": created.ClientSecret,
-		"client_secret_expires_at": 0, "redirect_uris": oauthAppsStrings(created.App.RedirectURIs),
+		"client_secret_expires_at": 0, "redirect_uris": nonNil(created.App.RedirectURIs),
 	}))
 	return nil
 }
@@ -343,7 +334,7 @@ func (s *Server) updateOAuthApp(w http.ResponseWriter, r *http.Request) error {
 	}
 	m := setAll(base("PUT /platform/organizations/{slug}/oauth/apps/{id}"), map[string]any{
 		"id": app.ID, "client_id": app.ID, "created_at": ts(app.CreatedAt), "name": app.Name,
-		"website": oauthAppsWebsite(*app), "redirect_uris": oauthAppsStrings(app.RedirectURIs),
+		"website": oauthAppsWebsite(*app), "redirect_uris": nonNil(app.RedirectURIs),
 	})
 	if icon := oauthAppsIcon(*app); icon != "" {
 		m["icon"] = icon
@@ -369,7 +360,7 @@ func (s *Server) deleteOAuthApp(w http.ResponseWriter, r *http.Request) error {
 	}
 	m := setAll(base("DELETE /platform/organizations/{slug}/oauth/apps/{id}"), map[string]any{
 		"id": app.ID, "client_id": app.ID, "created_at": ts(app.CreatedAt), "name": app.Name,
-		"website": oauthAppsWebsite(*app), "redirect_uris": oauthAppsStrings(app.RedirectURIs),
+		"website": oauthAppsWebsite(*app), "redirect_uris": nonNil(app.RedirectURIs),
 	})
 	if icon := oauthAppsIcon(*app); icon != "" {
 		m["icon"] = icon

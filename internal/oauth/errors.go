@@ -9,10 +9,6 @@ import (
 // Sentinel errors. The Service and the Store return them as they are or wrapped with fmt.Errorf
 // ("%w"); test with errors.Is. doc.go lists the HTTP status the API layer gives each.
 var (
-	// ErrNotImplemented is what the stubs of a method that is not written yet return. No finished
-	// code returns it.
-	ErrNotImplemented = errors.New("oauth: not implemented")
-
 	// ErrNotFound: no such row, or the row is not visible to the caller (a deleted app, a grant of
 	// another organization, an unusable token).
 	ErrNotFound = errors.New("oauth: not found")

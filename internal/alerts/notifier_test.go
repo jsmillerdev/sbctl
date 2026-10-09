@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -956,5 +957,99 @@ func TestRootDoesNotFollowLinksInTheStateDirectory(t *testing.T) {
 	// With the links gone the same root run works.
 	if err := notify(); err != nil {
 		t.Errorf("a plain directory is refused: %v", err)
+	}
+}
+
+// NotifyDetached returns at once, delivers after the caller's context ended, and Drain waits for it.
+func TestNotifyDetachedDeliversAfterTheCallerIsGone(t *testing.T) {
+	release := make(chan struct{})
+	var got atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-release // a slow webhook
+		got.Add(1)
+	}))
+	defer srv.Close()
+	n := New(testCfg(t, config.AlertWebhook{URL: srv.URL}), Options{})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	returned := make(chan struct{})
+	go func() {
+		n.NotifyDetached(ctx, Event{Kind: KindUpgradeStarted, Title: "x"})
+		close(returned)
+	}()
+	select {
+	case <-returned:
+	case <-time.After(5 * time.Second):
+		t.Fatal("NotifyDetached waited for the delivery")
+	}
+	cancel() // the request that raised the event is gone
+	drained := make(chan struct{})
+	go func() { n.Drain(); close(drained) }()
+	select {
+	case <-drained:
+		t.Fatal("Drain returned while a delivery was in flight")
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(release)
+	select {
+	case <-drained:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Drain did not return after the delivery finished")
+	}
+	if got.Load() != 1 {
+		t.Errorf("delivered %d times, want once", got.Load())
+	}
+}
+
+// A failed detached delivery is logged and reaches nobody else; NotifyBounded returns it.
+func TestNotifyDetachedLogsAFailureAndNotifyBoundedReturnsIt(t *testing.T) {
+	s := newSink(t)
+	s.setStatus(400)
+	var buf strings.Builder
+	var mu sync.Mutex
+	log := slog.New(slog.NewTextHandler(writerFunc(func(p []byte) (int, error) { mu.Lock(); defer mu.Unlock(); return buf.Write(p) }), nil))
+	n := New(testCfg(t, config.AlertWebhook{URL: s.srv.URL}), Options{Log: log})
+
+	n.NotifyDetached(context.Background(), Event{Kind: KindUpgradeFailed, Ref: "aaaaaaaaaaaaaaaaaaaa", Title: "x"})
+	n.Drain()
+	mu.Lock()
+	logged := buf.String()
+	mu.Unlock()
+	if !strings.Contains(logged, "could not send the alert") || !strings.Contains(logged, "kind=upgrade_failed") || !strings.Contains(logged, "ref=aaaaaaaaaaaaaaaaaaaa") {
+		t.Errorf("log = %s", logged)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := n.NotifyBounded(ctx, Event{Kind: KindUpgradeFailed, Title: "y"}); err == nil {
+		t.Error("NotifyBounded hid a failed delivery")
+	}
+	s.setStatus(200)
+	if err := n.NotifyBounded(ctx, Event{Kind: KindUpgradeFailed, Title: "z"}); err != nil {
+		t.Errorf("NotifyBounded on a canceled context: %v", err)
+	}
+}
+
+// NotifyDetachedFunc hands a failed delivery to the caller's own report, and Drain waits for it.
+func TestNotifyDetachedFuncReportsAFailureToTheCaller(t *testing.T) {
+	s := newSink(t)
+	s.setStatus(400)
+	n := New(testCfg(t, config.AlertWebhook{URL: s.srv.URL}), Options{})
+
+	var failed atomic.Int32
+	n.NotifyDetachedFunc(context.Background(), Event{Kind: KindUpgradeFailed, Title: "x"}, func(err error) {
+		if err == nil {
+			t.Error("failed was called with no error")
+		}
+		failed.Add(1)
+	})
+	n.Drain()
+	if failed.Load() != 1 {
+		t.Errorf("failed called %d times, want once", failed.Load())
+	}
+	s.setStatus(200)
+	n.NotifyDetachedFunc(context.Background(), Event{Kind: KindUpgradeFailed, Title: "y"}, func(error) { failed.Add(1) })
+	n.Drain()
+	if failed.Load() != 1 {
+		t.Errorf("failed called for a delivery that worked: %d", failed.Load())
 	}
 }

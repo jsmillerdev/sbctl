@@ -3,6 +3,7 @@ package oauth
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strings"
 
 	"github.com/supavise/supavise/internal/secrets"
@@ -37,7 +38,7 @@ func (s *Service) Register(ctx context.Context, req RegisterRequest) (*Registere
 			if g != GrantTypeAuthorizationCode && g != GrantTypeRefreshToken {
 				return nil, bad(CodeInvalidClientMetadata, "grant_types may contain %s and %s only", GrantTypeAuthorizationCode, GrantTypeRefreshToken)
 			}
-			if !hasString(grantTypes, g) {
+			if !slices.Contains(grantTypes, g) {
 				grantTypes = append(grantTypes, g)
 			}
 		}
@@ -83,11 +84,11 @@ func (s *Service) Register(ctx context.Context, req RegisterRequest) (*Registere
 	now := s.now()
 	plain := secrets.NewClientSecret()
 	app := App{
-		ID: newUUID(), RegistrationType: RegistrationDynamic, Name: name,
+		ID: secrets.NewUUID(), RegistrationType: RegistrationDynamic, Name: name,
 		Website: req.ClientURI, Icon: req.LogoURI, RedirectURIs: uris, Scopes: scopes,
 		TokenEndpointAuthMethod: method, CreatedAt: now, UpdatedAt: now,
 	}
-	rec := AppSecret{ID: newUUID(), AppID: app.ID, Alias: secrets.ClientSecretAlias(plain), Hash: secrets.HashToken(plain), CreatedAt: now}
+	rec := AppSecret{ID: secrets.NewUUID(), AppID: app.ID, Alias: secrets.ClientSecretAlias(plain), Hash: secrets.HashToken(plain), CreatedAt: now}
 	if err := s.Store.CreateApp(ctx, app, &rec); err != nil {
 		return nil, s.serverError(ctx, "register: create app", err)
 	}
@@ -206,11 +207,11 @@ func (s *Service) CreateApp(ctx context.Context, req CreateAppRequest) (*Created
 	now := s.now()
 	plain := secrets.NewClientSecret()
 	app := App{
-		ID: newUUID(), RegistrationType: RegistrationManual, OrgID: req.OrgID, Name: f.name,
+		ID: secrets.NewUUID(), RegistrationType: RegistrationManual, OrgID: req.OrgID, Name: f.name,
 		Website: f.website, Icon: f.icon, RedirectURIs: f.redirectURIs, Scopes: f.scopes,
 		TokenEndpointAuthMethod: AuthMethodBasic, CreatedBy: req.CreatedBy, CreatedAt: now, UpdatedAt: now,
 	}
-	rec := AppSecret{ID: newUUID(), AppID: app.ID, Alias: secrets.ClientSecretAlias(plain), Hash: secrets.HashToken(plain), CreatedBy: req.CreatedBy, CreatedAt: now}
+	rec := AppSecret{ID: secrets.NewUUID(), AppID: app.ID, Alias: secrets.ClientSecretAlias(plain), Hash: secrets.HashToken(plain), CreatedBy: req.CreatedBy, CreatedAt: now}
 	if err := s.Store.CreateApp(ctx, app, &rec); err != nil {
 		return nil, fmt.Errorf("oauth: create app: %w", err)
 	}
@@ -290,7 +291,7 @@ func (s *Service) CreateClientSecret(ctx context.Context, req CreateSecretReques
 		return nil, limitf("an OAuth app may have at most %d client secrets; delete one first", maxSecretsPerApp)
 	}
 	plain := secrets.NewClientSecret()
-	rec := AppSecret{ID: newUUID(), AppID: app.ID, Alias: secrets.ClientSecretAlias(plain), Hash: secrets.HashToken(plain), CreatedBy: req.CreatedBy, CreatedAt: s.now()}
+	rec := AppSecret{ID: secrets.NewUUID(), AppID: app.ID, Alias: secrets.ClientSecretAlias(plain), Hash: secrets.HashToken(plain), CreatedBy: req.CreatedBy, CreatedAt: s.now()}
 	if err := s.Store.CreateSecret(ctx, rec); err != nil {
 		return nil, err
 	}

@@ -36,10 +36,29 @@ const oauthBodyMax = 64 << 10
 // errOAuthEndpointOff is what an OAuth route answers while [api] disable_oauth is set.
 var errOAuthEndpointOff = errf(http.StatusNotFound, "Not Found")
 
+// oauthGuard is h that answers errOAuthEndpointOff while [api] disable_oauth is set. It runs inside
+// the route's wrap, so a route that needs a credential or a route rule has asked for it first, and
+// h does not start (no body is read, no limiter is counted).
+func (s *Server) oauthGuard(h handlerFunc) handlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) error {
+		if s.oauthDisabled() {
+			return errOAuthEndpointOff
+		}
+		return h(w, r)
+	}
+}
+
+// oauthRoutes is add with every handler behind oauthGuard: the one place where the OAuth routes
+// check disable_oauth.
+func (s *Server) oauthRoutes(add func(string, handlerFunc)) func(string, handlerFunc) {
+	return func(key string, h handlerFunc) { add(key, s.oauthGuard(h)) }
+}
+
 // routesOAuth registers the OAuth routes of the specs: oauthPublicRoutes, and the consent routes
 // through routesOAuthConsent. It is called whether or not [api] disable_oauth is set; the handlers
-// answer 404 while it is (oauthDisabled).
+// answer 404 while it is (oauthRoutes).
 func (s *Server) routesOAuth(add func(string, handlerFunc)) {
+	add = s.oauthRoutes(add)
 	lim := newOAuthLimits()
 	add("POST /platform/oauth/apps/register", func(w http.ResponseWriter, r *http.Request) error {
 		return s.oauthRegister(w, r, lim)
@@ -249,9 +268,6 @@ type oauthRegisterResponse struct {
 }
 
 func (s *Server) oauthRegister(w http.ResponseWriter, r *http.Request, lim *oauthLimits) error {
-	if s.oauthDisabled() {
-		return errOAuthEndpointOff
-	}
 	if retry, ok := lim.register.allow(s.oauthClient(r), s.now()); !ok {
 		w.Header().Set("Retry-After", retryAfterSeconds(retry))
 		return errf(http.StatusTooManyRequests, "Too many registrations from this address; try again later")
@@ -354,9 +370,6 @@ func writeOAuthPage(w http.ResponseWriter, status int, p oauthPage) {
 }
 
 func (s *Server) oauthAuthorize(w http.ResponseWriter, r *http.Request, lim *oauthLimits) error {
-	if s.oauthDisabled() {
-		return errOAuthEndpointOff
-	}
 	if retry, ok := lim.authorize.allow(s.oauthClient(r), s.now()); !ok {
 		w.Header().Set("Retry-After", retryAfterSeconds(retry))
 		writeOAuthPage(w, http.StatusTooManyRequests, oauthPage{
@@ -495,9 +508,6 @@ type oauthTokenBody struct {
 }
 
 func (s *Server) oauthToken(w http.ResponseWriter, r *http.Request, lim *oauthLimits) error {
-	if s.oauthDisabled() {
-		return errOAuthEndpointOff
-	}
 	client, now := s.oauthClient(r), s.now()
 	if retry, blocked := lim.failures.blocked(client, now); blocked {
 		noStore(w)
@@ -567,9 +577,6 @@ type oauthRevokeBody struct {
 }
 
 func (s *Server) oauthRevoke(w http.ResponseWriter, r *http.Request, lim *oauthLimits) error {
-	if s.oauthDisabled() {
-		return errOAuthEndpointOff
-	}
 	client, now := s.oauthClient(r), s.now()
 	if retry, blocked := lim.failures.blocked(client, now); blocked {
 		noStore(w)
