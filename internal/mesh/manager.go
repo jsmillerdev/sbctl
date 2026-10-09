@@ -769,9 +769,21 @@ func (m *Manager) preferred(a, b *peerConn) bool {
 	return false // the same side dialed again: the newer one replaces a session that is probably dead
 }
 
-// retire closes a session that lost the tie-break once nothing runs on it.
+// retireGrace is how long a session that lost the tie-break is kept before it is closed for being idle. The far end
+// may not have registered the session that won yet (its handshake finishes a moment after ours does), and until it
+// has, it sends its calls on the session that lost; a session closed at once would end them without an answer.
+// A variable so that a test can shorten it.
+var retireGrace = 5 * time.Second
+
+// retire closes a session that lost the tie-break once nothing runs on it, after a grace period in which it still
+// serves what the far end sends on it.
 func (m *Manager) retire(pc *peerConn) {
 	pc.retiring.Store(true)
+	select {
+	case <-pc.sess.CloseChan():
+		return
+	case <-time.After(retireGrace):
+	}
 	deadline := time.Now().Add(time.Minute)
 	for time.Now().Before(deadline) && !pc.sess.IsClosed() && pc.sess.NumStreams() > 0 {
 		select {
