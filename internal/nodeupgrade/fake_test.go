@@ -105,6 +105,7 @@ type fakeHost struct {
 	convergeErr error        // Converge (a host layer without a swap) fails
 	stackErr    error        // UpdateStack fails
 	stackCmd    string       // UpdateStack could not run and returns this command
+	stackGuard  bool         // UpdateStack updated the stack and left its guard on
 	notices     []Event      // what Notify received
 	stackOpts   StackOptions // what UpdateStack was asked
 }
@@ -288,5 +289,5 @@ func (f *fakeHost) Converge(context.Context) error {
 func (f *fakeHost) UpdateStack(_ context.Context, c *Candidate, o StackOptions) (StackOutcome, error) {
 	f.rec("stack %s", c.Tag)
 	f.stackOpts = o
-	return StackOutcome{Command: f.stackCmd}, f.stackErr
+	return StackOutcome{Command: f.stackCmd, GuardLeftOn: f.stackGuard}, f.stackErr
 }

@@ -3,7 +3,7 @@
 #
 #   deploy/aws/rehearse.sh --region us-east-1 --email you@example.com [--profile NAME]
 #   deploy/aws/rehearse.sh --region us-east-1 --email you@example.com --purge --yes
-#   deploy/aws/rehearse.sh --region us-east-1 --email you@example.com --console-stack
+#   deploy/aws/rehearse.sh --region us-east-1 --email you@example.com --console-stack [--force-denial]
 #
 # What it does, in order:
 #   1. creates a stack from the template of v0.1.1 (deploy/cloudformation/testdata/supavise-v0.1.1.yaml,
@@ -31,7 +31,19 @@
 # runs whether that is a new image, and deploy.sh runs the change set under its guard (a temporary
 # stack policy). Step 4 also checks that the stack's AmiId is the instance's image afterwards and that
 # the stack policy allows every update again (the stack had none), and shows how the review called
-# the instance.
+# the instance. Before step 3 it makes the change set of that update itself, saves it as AWS gives it
+# (describe-change-set --include-property-values) to rehearsal-changeset-<stack>.json in the current
+# directory, and deletes it: that file is what the review's test fixture of a console-made stack
+# (testdata/changeset-console-stack.json) is modelled on, and can replace it.
+#
+# --force-denial (with --console-stack) also rehearses the path the guard exists for, before step 3:
+# it sets the guard by hand (deploy.sh builds it), runs an update to this checkout's template with
+# another Ubuntu image (--denial-ami AMI, or an older build of the same release), which adds the new
+# resources and needs a replacement of the instance, and checks that the update fails, that the stack
+# rolls back completely (UPDATE_ROLLBACK_COMPLETE, with the guard still on while it does), that an event
+# names the stack policy, and that the instance is the same. It prints the failure events, whose
+# wording the script's message relies on. Then the stack's policy is put back and the rehearsal goes
+# on. If the rollback stops (UPDATE_ROLLBACK_FAILED), the policy is put back and the rollback resumed.
 #
 # --keep leaves the stack; --purge also destroys the two buckets and the snapshots the rehearsal
 # made (otherwise it prints what remains and the commands); --yes skips the prompt before the deletion;
@@ -54,7 +66,7 @@ q() {
 }
 show() { local a out=""; for a in "$@"; do out="$out $(q "$a")"; done; printf '%s\n' "${out# }"; }
 
-REGION=${AWS_REGION:-${AWS_DEFAULT_REGION:-}} EMAIL="" PROFILE="" KEEP=0 PURGE=0 YES=0 DRY=0 CONSOLE=0
+REGION=${AWS_REGION:-${AWS_DEFAULT_REGION:-}} EMAIL="" PROFILE="" KEEP=0 PURGE=0 YES=0 DRY=0 CONSOLE=0 DENIAL=0 DENIAL_AMI=""
 while [[ $# -gt 0 ]]; do
   case $1 in
     --region) [[ $# -ge 2 ]] || die "--region needs a value"; REGION=$2; shift 2 ;;
@@ -62,6 +74,8 @@ while [[ $# -gt 0 ]]; do
     --profile) [[ $# -ge 2 ]] || die "--profile needs a value"; PROFILE=$2; shift 2 ;;
     --keep) KEEP=1; shift ;;
     --console-stack) CONSOLE=1; shift ;;
+    --force-denial) DENIAL=1; shift ;;
+    --denial-ami) [[ $# -ge 2 ]] || die "--denial-ami needs a value"; DENIAL_AMI=$2; shift 2 ;;
     --purge) PURGE=1; shift ;;
     --yes | -y) YES=1; shift ;;
     --dry-run) DRY=1; shift ;;
@@ -74,6 +88,8 @@ done
 [[ -n $EMAIL ]] || die "--email is required"
 [[ $EMAIL =~ ^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$ ]] || die "--email $EMAIL is not an email address"
 [[ $KEEP -eq 0 || $PURGE -eq 0 ]] || die "--keep and --purge contradict each other"
+[[ $DENIAL -eq 0 || $CONSOLE -eq 1 ]] || die "--force-denial needs --console-stack"
+[[ -z $DENIAL_AMI || $DENIAL_AMI =~ ^ami-[0-9a-f]{8,17}$ ]] || die "--denial-ami $DENIAL_AMI is not an image ID"
 [[ -f $OLD_TEMPLATE ]] || die "the v0.1.1 template is not at $OLD_TEMPLATE: run this from a checkout"
 [[ -f $NEW_TEMPLATE ]] || die "the template of this checkout is not at $NEW_TEMPLATE"
 
@@ -110,6 +126,23 @@ if [[ $DRY -eq 1 ]]; then
   say "# 2. the instance, before:"
   show "${AWS[@]}" cloudformation describe-stacks --stack-name "$STACK" --query "Stacks[0].Outputs[?OutputKey=='InstanceId'].OutputValue" --output text
   show "${AWS[@]}" ec2 describe-instances --instance-ids "<InstanceId>" --query 'Reservations[0].Instances[0].[LaunchTime,State.Name]' --output text
+  if [[ $CONSOLE -eq 1 ]]; then
+    say "# the change set of the update, as AWS gives it, saved to rehearsal-changeset-$STACK.json, then deleted (the template goes through the backup bucket):"
+    show "$DEPLOY" __params "<the stack.json>" "$NEW_TEMPLATE" "AmiId=<the instance's image>" Failover=on PeerCidr1=198.51.100.0/24
+    show "${AWS[@]}" s3 cp "$NEW_TEMPLATE" "s3://<BackupBucket>/_rehearsal/supavise.yaml"
+    show "${AWS[@]}" cloudformation create-change-set --stack-name "$STACK" --change-set-name rehearsal-capture --change-set-type UPDATE --capabilities CAPABILITY_IAM --template-url "<the staged template>" --parameters "file://<params.json>"
+    show "${AWS[@]}" cloudformation describe-change-set --stack-name "$STACK" --change-set-name rehearsal-capture --include-property-values --output json
+    show "${AWS[@]}" cloudformation delete-change-set --stack-name "$STACK" --change-set-name rehearsal-capture
+  fi
+  if [[ $DENIAL -eq 1 ]]; then
+    say "# the denial: the guard set by hand, then an update to this template with another image, which must fail and roll back:"
+    show "$DEPLOY" __guard "<the stack's own policy>" "$NEW_TEMPLATE" "<no change set>" "<the policy to put back>"
+    show "${AWS[@]}" cloudformation set-stack-policy --stack-name "$STACK" --stack-policy-body "file://<the guard>"
+    show "${AWS[@]}" cloudformation update-stack --stack-name "$STACK" --template-url "<the staged template>" --capabilities CAPABILITY_IAM --parameters "file://<params with AmiId=${DENIAL_AMI:-<an older image>}>"
+    show "${AWS[@]}" cloudformation wait stack-update-complete --stack-name "$STACK"
+    show "${AWS[@]}" cloudformation describe-stack-events --stack-name "$STACK" --query "StackEvents[?ResourceStatus=='UPDATE_FAILED'].[LogicalResourceId,ResourceStatusReason]" --output text
+    show "${AWS[@]}" cloudformation set-stack-policy --stack-name "$STACK" --stack-policy-body "file://<the policy to put back>"
+  fi
   say "# 3. the update to this checkout's template, with the failover permissions and a peer rule on:"
   show "$DEPLOY" update "${DEPLOY_ARGS[@]}" --stack "$STACK" --template "$NEW_TEMPLATE" --set Failover=on --set PeerCidr1=198.51.100.0/24 --yes
   say "# 4. the checks: same instance, same launch time, running; no create or delete event for the Instance; revision 2; a second update changes nothing:"
@@ -201,6 +234,92 @@ leftovers() {
 
 OBJECTS="" ALLOCATION=""
 trap cleanup EXIT
+
+stack_status() {
+  "${AWS[@]}" cloudformation describe-stacks --stack-name "$STACK" --query 'Stacks[0].StackStatus' --output text
+}
+settled_status() { # waits up to 30 minutes for the stack to stop changing and prints its status
+  local st="" i
+  for i in $(seq 1 120); do
+    st=$(stack_status || true)
+    case $st in
+      *_IN_PROGRESS) sleep 15 ;;
+      *) break ;;
+    esac
+  done
+  printf '%s' "$st"
+}
+# This checkout's template, staged in the stack's backup bucket (it is over the size the API takes inline).
+stage_new_template() {
+  "${AWS[@]}" s3 cp "$NEW_TEMPLATE" "s3://$BACKUP/_rehearsal/supavise.yaml" >/dev/null || return 1
+  printf 'https://%s.s3.%s.amazonaws.com/_rehearsal/supavise.yaml\n' "$BACKUP" "$REGION"
+}
+
+if [[ $CONSOLE -eq 1 ]]; then
+  SAVED=$PWD/rehearsal-changeset-$STACK.json
+  say "== 2b. the change set of the update, as AWS gives it for a stack made in the console"
+  "${AWS[@]}" cloudformation describe-stacks --stack-name "$STACK" --output json >"$WORK/stack.json"
+  IMAGE_BEFORE=$("${AWS[@]}" ec2 describe-instances --instance-ids "$INSTANCE" --query 'Reservations[0].Instances[0].ImageId' --output text)
+  URL=$(stage_new_template) || die "cannot stage the template in s3://$BACKUP"
+  "$DEPLOY" __params "$WORK/stack.json" "$NEW_TEMPLATE" "AmiId=$IMAGE_BEFORE" Failover=on PeerCidr1=198.51.100.0/24 >"$WORK/params-capture.json" \
+    || die "deploy.sh could not build the parameters of the update"
+  if "${AWS[@]}" cloudformation create-change-set --stack-name "$STACK" --change-set-name rehearsal-capture --change-set-type UPDATE \
+      --capabilities CAPABILITY_IAM --template-url "$URL" --parameters "file://$WORK/params-capture.json" >/dev/null \
+    && "${AWS[@]}" cloudformation wait change-set-create-complete --stack-name "$STACK" --change-set-name rehearsal-capture; then
+    if "${AWS[@]}" cloudformation describe-change-set --stack-name "$STACK" --change-set-name rehearsal-capture --include-property-values --output json >"$SAVED" \
+      || "${AWS[@]}" cloudformation describe-change-set --stack-name "$STACK" --change-set-name rehearsal-capture --output json >"$SAVED"; then
+      say "INFO  the change set is saved in $SAVED"
+    else
+      say "WARN  the change set could not be read, so none was saved"
+    fi
+  else
+    say "WARN  the change set could not be made, so none was saved"
+  fi
+  "${AWS[@]}" cloudformation delete-change-set --stack-name "$STACK" --change-set-name rehearsal-capture >/dev/null 2>&1 || true
+fi
+
+if [[ $DENIAL -eq 1 ]]; then
+  say "== 2c. a replacement the guard denies: an update to this template with another image (about 10 minutes)"
+  other=$DENIAL_AMI
+  if [[ -z $other ]]; then
+    # An older build of the image the template uses: neither the instance's nor the current one.
+    latest=$("${AWS[@]}" ssm get-parameter --name /aws/service/canonical/ubuntu/server/24.04/stable/current/arm64/hvm/ebs-gp3/ami-id --query Parameter.Value --output text || true)
+    other=$("${AWS[@]}" ec2 describe-images --owners 099720109477 --filters "Name=name,Values=ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-arm64-server-*" \
+      --query 'reverse(sort_by(Images,&CreationDate))[].ImageId' --output text | tr '\t' '\n' | grep -v -x -e "$IMAGE_BEFORE" -e "${latest:-none}" | head -n 1 || true)
+  fi
+  [[ $other =~ ^ami-[0-9a-f]{8,17}$ ]] || die "found no other Ubuntu 24.04 arm64 image for the denial; pass --denial-ami"
+  "${AWS[@]}" cloudformation get-stack-policy --stack-name "$STACK" --output json >"$WORK/policy-own.json"
+  echo '{}' >"$WORK/no-changes.json"
+  "$DEPLOY" __guard "$WORK/policy-own.json" "$NEW_TEMPLATE" "$WORK/no-changes.json" "$WORK/policy-back.json" >"$WORK/policy-guard.json" \
+    || die "deploy.sh could not build the guard"
+  "$DEPLOY" __params "$WORK/stack.json" "$NEW_TEMPLATE" "AmiId=$other" Failover=on PeerCidr1=198.51.100.0/24 >"$WORK/params-denial.json" \
+    || die "deploy.sh could not build the parameters of the update"
+  "${AWS[@]}" cloudformation set-stack-policy --stack-name "$STACK" --stack-policy-body "file://$WORK/policy-guard.json"
+  say "The guard is set. Updating to this template with image $other (the instance runs $IMAGE_BEFORE) ..."
+  rc=0
+  "${AWS[@]}" cloudformation update-stack --stack-name "$STACK" --template-url "$URL" --capabilities CAPABILITY_IAM \
+    --parameters "file://$WORK/params-denial.json" >/dev/null || rc=1
+  report "CloudFormation took the update that needs another image" "$rc"
+  DSTATUS=$(settled_status)
+  rc=0; [[ $DSTATUS == UPDATE_ROLLBACK_COMPLETE ]] || rc=1
+  report "the update failed and rolled back completely with the guard on (UPDATE_ROLLBACK_COMPLETE; got: $DSTATUS)" "$rc"
+  "${AWS[@]}" cloudformation describe-stack-events --stack-name "$STACK" --max-items 100 \
+    --query "StackEvents[?ResourceStatus=='UPDATE_FAILED' || ResourceStatus=='DELETE_FAILED'].[LogicalResourceId,ResourceStatus,ResourceStatusReason]" --output text >"$WORK/denial-events" || true
+  rc=0; grep -qi 'stack policy' "$WORK/denial-events" || rc=1
+  report "an event of the update names the stack policy" "$rc"
+  say "INFO  what failed in the update (the script's message relies on its wording):"
+  sed 's/^/        /' "$WORK/denial-events"
+  if [[ $DSTATUS == UPDATE_ROLLBACK_FAILED ]]; then
+    say "The rollback stopped with the guard on: putting the policy back and resuming the rollback ..."
+    "${AWS[@]}" cloudformation set-stack-policy --stack-name "$STACK" --stack-policy-body "file://$WORK/policy-back.json" || true
+    "${AWS[@]}" cloudformation continue-update-rollback --stack-name "$STACK" || true
+    say "INFO  after the rollback was resumed without the guard: $(settled_status)"
+  fi
+  rc=0; [[ $(out_of InstanceId) == "$INSTANCE" && $(instance_facts "$INSTANCE" || true) == "$BEFORE" ]] || rc=1
+  report "the instance is the same after the denial (same id and launch time, running)" "$rc"
+  rc=0; "${AWS[@]}" cloudformation set-stack-policy --stack-name "$STACK" --stack-policy-body "file://$WORK/policy-back.json" || rc=1
+  report "the stack's policy is put back after the denial" "$rc"
+fi
 
 START=$(date -u +%Y-%m-%dT%H:%M:%S)
 say "== 3. updating to the template of this checkout (failover permissions and one peer rule on)"

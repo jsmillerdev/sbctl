@@ -221,6 +221,8 @@ type run struct {
 	announced bool
 	// sharedFailed is set when a shared service did not come up on the release this run moved it to.
 	sharedFailed bool
+	// stackWarn is said again at the end of the run: the stack update left something to do.
+	stackWarn string
 }
 
 func (r *run) run(ctx context.Context) error {
@@ -321,6 +323,9 @@ func (r *run) run(ctx context.Context) error {
 	}
 	if stackCmd != "" {
 		o.say("The AWS stack was not updated. To update it, run:\n\n  %s", stackCmd)
+	}
+	if r.stackWarn != "" {
+		o.say("%s", r.stackWarn)
 	}
 	r.notifyInfraBehind(ctx)
 	return nil

@@ -277,17 +277,37 @@ func TestStackStepRunsFirst(t *testing.T) {
 	mustContain(t, h.out.String(), "Supavise v1.1.0 is running")
 }
 
+// The stack was updated but its guard is still on: the upgrade goes on, and says so again at the end.
+func TestStackStepGuardLeftOn(t *testing.T) {
+	h := newFakeHost()
+	h.stackGuard = true
+	o := runOpts(h)
+	o.AWS = true
+	if err := Run(context.Background(), h, o); err != nil {
+		t.Fatalf("%v\n%s", err, h.out)
+	}
+	out := h.out.String()
+	const warn = "The AWS stack was updated, but the script could not take its guard (a temporary stack policy) off"
+	if strings.Count(out, warn) != 2 || strings.LastIndex(out, warn) < strings.Index(out, "Supavise v1.1.0 is running") {
+		t.Errorf("the warning is not said at the stack step and again at the end:\n%s", out)
+	}
+	if strings.Contains(out, "The AWS stack is up to date") || !h.has("install") {
+		t.Errorf("order %s\n%s", h.order(), out)
+	}
+}
+
 func TestStackStepRefusalLeavesTheNodeAlone(t *testing.T) {
 	for _, c := range []struct {
 		code int
 		word string
-	}{{2, "was refused"}, {3, "failed"}} {
+	}{{2, "was refused"}, {3, "failed"}, {130, "was interrupted"}, {143, "was interrupted"}, {-1, "was interrupted"}} {
 		h := newFakeHost()
 		h.stackErr = &StackError{Code: c.code, Err: errors.New("the change set would replace the instance")}
 		o := runOpts(h)
 		o.AWS = true
 		err := Run(context.Background(), h, o)
-		if code(t, err) != ExitRefused || !strings.Contains(err.Error(), "the AWS stack update "+c.word) || !strings.Contains(err.Error(), "the node was not changed") {
+		if code(t, err) != ExitRefused || !strings.Contains(err.Error(), "the AWS stack update "+c.word) || !strings.Contains(err.Error(), "the node was not changed") ||
+			(c.word == "was interrupted") != strings.Contains(err.Error(), "may still be running in CloudFormation") {
 			t.Errorf("script exit %d: %v (exit %d)", c.code, err, ExitCode(err))
 		}
 		for _, call := range []string{"prefetch", "backup", "install"} {

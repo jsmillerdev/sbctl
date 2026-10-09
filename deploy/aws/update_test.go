@@ -52,9 +52,19 @@ case "$*" in
     u=$(arg --template-url "$@"); if [ -n "$u" ]; then cp "$DIR/s3-$(basename "$u")" "$DIR/template-$n.yaml"; fi
     if [ -n "$CREATE_FAILS" ]; then echo "An error occurred (ValidationError) when calling the CreateChangeSet operation: bad" >&2; exit 254; fi ;;
   *"cloudformation wait change-set-create-complete"*) exit "${CS_WAIT_RC-0}" ;;
+  *"cloudformation execute-change-set"*)
+    case "$*" in *--no-disable-rollback*) if [ "$OLD_CLI" = 2 ]; then
+      printf '\nusage: aws [options] <command> <subcommand> [<subcommand> ...] [parameters]\nTo see help text, you can run:\n\n  aws help\n\nUnknown options: --no-disable-rollback\n' >&2; exit 252
+    fi ;; esac ;;
   *"cloudformation describe-change-set"*"StatusReason"*) echo "${CS_REASON-}" ;;
+  *"cloudformation describe-change-set"*"ExecutionStatus"*)
+    # EXEC_STATUS_SEQ: the ExecutionStatus each look returns in turn (the last one repeats).
+    i=$(grep -c 'ExecutionStatus' "$DIR/calls.log"); set -- ${EXEC_STATUS_SEQ-EXECUTE_COMPLETE}
+    while [ "$i" -gt 1 ] && [ $# -gt 1 ]; do shift; i=$((i - 1)); done
+    echo "$1" ;;
   *"cloudformation describe-change-set"*)
-    # OLD_CLI: an AWS CLI from before --include-property-values, which refuses it as the CLI does.
+    # OLD_CLI: an AWS CLI from before --include-property-values, which refuses it as the CLI does
+    # (OLD_CLI=2: one from before --no-disable-rollback too).
     case "$*" in *--include-property-values*) if [ -n "$OLD_CLI" ]; then
       printf '\nusage: aws [options] <command> <subcommand> [<subcommand> ...] [parameters]\nTo see help text, you can run:\n\n  aws help\n\nUnknown options: --include-property-values\n' >&2; exit 252
     fi ;; esac
@@ -64,19 +74,24 @@ case "$*" in
     # stack-policy.json: the stack's own policy; without it the stack has none, and the CLI prints {}.
     if [ -f "$DIR/stack-policy.json" ]; then python3 -c 'import json, sys; print(json.dumps({"StackPolicyBody": open(sys.argv[1]).read()}))' "$DIR/stack-policy.json"; else echo '{}'; fi ;;
   *"cloudformation set-stack-policy"*)
-    # Each policy set is kept as policy-<k>.json; SET_POLICY_FAILS_AT=k makes the k-th call fail.
+    # Each policy set is kept as policy-<k>.json and becomes the stack's (stack-policy.json).
+    # SET_POLICY_FAILS_AT=k makes the k-th call fail; SET_POLICY_TIMEOUT_AT=k makes it fail after
+    # the policy was set, as a request does whose answer is lost.
     k=$(grep -c 'cloudformation set-stack-policy' "$DIR/calls.log")
     b=$(arg --stack-policy-body "$@"); cp "${b#file://}" "$DIR/policy-$k.json"
-    if [ "${SET_POLICY_FAILS_AT-0}" = "$k" ]; then echo "An error occurred (AccessDenied) when calling the SetStackPolicy operation: not allowed" >&2; exit 254; fi ;;
+    if [ "${SET_POLICY_FAILS_AT-0}" = "$k" ]; then echo "An error occurred (AccessDenied) when calling the SetStackPolicy operation: not allowed" >&2; exit 254; fi
+    cp "$DIR/policy-$k.json" "$DIR/stack-policy.json"
+    if [ "${SET_POLICY_TIMEOUT_AT-0}" = "$k" ]; then echo "Read timeout on endpoint URL" >&2; exit 255; fi ;;
   *"cloudformation describe-stack-events"*)
     if [ -f "$DIR/events.json" ]; then cat "$DIR/events.json"; else echo '{"StackEvents": []}'; fi ;;
   *"cloudformation get-template"*)
     if [ -n "$GET_TEMPLATE_FAILS" ]; then echo "An error occurred (AccessDenied) when calling the GetTemplate operation" >&2; exit 254; fi
     python3 -c 'import json, sys; print(json.dumps(open(sys.argv[1]).read()))' "$DIR/template-$n.yaml" ;;
   *"cloudformation wait stack-update-complete"*)
-    # WAIT_HANGS=n: the first n waits hang (until a signal ends them), each leaving waiting-<k> behind.
+    # WAIT_HANGS=n: the first n waits hang (HANG_SECONDS, or until a signal ends them), each leaving
+    # waiting-<k> behind.
     k=$(grep -c 'wait stack-update-complete' "$DIR/calls.log")
-    if [ "$k" -le "${WAIT_HANGS-0}" ]; then touch "$DIR/waiting-$k"; sleep 30; fi
+    if [ "$k" -le "${WAIT_HANGS-0}" ]; then touch "$DIR/waiting-$k"; sleep "${HANG_SECONDS-30}"; fi
     exit "${STACK_WAIT_RC-0}" ;;
   *"cloudformation wait stack-create-complete"*) exit "${CREATE_WAIT_RC-${STACK_WAIT_RC-0}}" ;;
   *"ec2 describe-addresses"*)
@@ -1502,7 +1517,7 @@ func TestClassifier(t *testing.T) {
 			"guarded  Instance (AWS::EC2::Instance) may be replaced: Tags, ImageId, MetadataOptions; ImageId is resolved when the change set runs",
 			"guarded  DataVolumeAttachment (AWS::EC2::VolumeAttachment) may be replaced: InstanceId; InstanceId follows Instance",
 			"guarded  DataVolume (AWS::EC2::Volume): AvailabilityZone; AvailabilityZone follows Instance",
-			"guarded  ElasticIpAssociation (AWS::EC2::EIPAssociation) may be replaced: AllocationId, InstanceId; AllocationId follows ElasticIp, InstanceId follows Instance",
+			"guarded  ElasticIpAssociation (AWS::EC2::EIPAssociation) may be replaced: AllocationId, InstanceId; AllocationId is resolved when the change set runs, InstanceId follows Instance",
 			"modify   ElasticIp (AWS::EC2::EIP): Tags (no interruption)", "add      ObjectsBucketPolicy (AWS::S3::BucketPolicy)",
 			"10 change(s): 6 allowed, 0 refused, 0 blocked, 4 guarded"}, []string{"REPLACE", "MODIFY", "REMOVE"}},
 		{"with the values of the properties, the same image is shown", "changeset-console-stack-values.json", nil, 12, []string{

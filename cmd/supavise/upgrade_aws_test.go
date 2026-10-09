@@ -9,9 +9,12 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 
 	"github.com/supavise/supavise/internal/awsapi/awsfake"
 	"github.com/supavise/supavise/internal/config"
@@ -173,8 +176,13 @@ type awsRelease struct {
 
 func newAWSRelease(t *testing.T) *awsRelease {
 	t.Helper()
+	return newAWSReleaseWith(t, []byte("#!/usr/bin/env bash\nprintf '%s\\n' \"$@\" >\"$RECORD\"\nprintf 'pubkey=%s base=%s imds=%s\\n' \"${SUPAVISE_DEPLOY_PUBKEY_B64-unset}\" \"${SUPAVISE_DEPLOY_BASE_URL-unset}\" \"${SUPAVISE_IMDS_ENDPOINT-unset}\" >\"$RECORD.seen\"\ncat \"${5:-/dev/null}\" >>\"$RECORD\"\nexit \"${EXIT_CODE:-0}\"\n"))
+}
+
+// newAWSReleaseWith is newAWSRelease with another script.
+func newAWSReleaseWith(t *testing.T, script []byte) *awsRelease {
+	t.Helper()
 	r := &awsRelease{record: filepath.Join(t.TempDir(), "args")}
-	script := []byte("#!/usr/bin/env bash\nprintf '%s\\n' \"$@\" >\"$RECORD\"\nprintf 'pubkey=%s base=%s imds=%s\\n' \"${SUPAVISE_DEPLOY_PUBKEY_B64-unset}\" \"${SUPAVISE_DEPLOY_BASE_URL-unset}\" \"${SUPAVISE_IMDS_ENDPOINT-unset}\" >\"$RECORD.seen\"\ncat \"${5:-/dev/null}\" >>\"$RECORD\"\nexit \"${EXIT_CODE:-0}\"\n")
 	tmpl := []byte("AWSTemplateFormatVersion: 2010-09-09\n")
 	r.files = map[string][]byte{selfupdate.AWSDeployAsset: script, "supavise.yaml": tmpl}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
@@ -374,7 +382,17 @@ func TestUpdateStackMapsTheScriptsExitStatus(t *testing.T) {
 	rel := newAWSRelease(t)
 	t.Setenv("AWS_ACCESS_KEY_ID", "AKIAOPERATOR")
 	t.Setenv("AWS_SECRET_ACCESS_KEY", "secret")
-	for _, code := range []string{"2", "3"} {
+	// 4: the stack was updated, and the guard is still on.
+	h, dir, _ := awsHost(t)
+	t.Setenv("EXIT_CODE", "4")
+	out, err := h.UpdateStack(context.Background(), rel.cand, nodeupgrade.StackOptions{Name: "supavise"})
+	if err != nil || !out.GuardLeftOn {
+		t.Errorf("exit 4: %+v, %v", out, err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "config.d", "20-aws.toml")); err != nil {
+		t.Errorf("exit 4: the stack name of an updated stack was not recorded: %v", err)
+	}
+	for _, code := range []string{"2", "3", "130", "143"} {
 		h, dir, _ := awsHost(t)
 		t.Setenv("EXIT_CODE", code)
 		_, err := h.UpdateStack(context.Background(), rel.cand, nodeupgrade.StackOptions{Name: "supavise"})
@@ -460,5 +478,62 @@ func TestStackNameResolution(t *testing.T) {
 	}
 	if _, err := h.stackName(ctx, "not a name"); err == nil {
 		t.Error("a bad name was accepted")
+	}
+}
+
+// A cancelled upgrade does not kill the script: it may be waiting for an update to end before it
+// takes its temporary stack policy off.
+func TestUpdateStackLetsTheScriptFinishWhenTheUpgradeIsCancelled(t *testing.T) {
+	rel := newAWSReleaseWith(t, []byte("#!/usr/bin/env bash\ntrap 'echo trapped >>\"$RECORD.trap\"; exit 143' TERM\ntouch \"$RECORD.started\"\nsleep 1\necho finished >>\"$RECORD.trap\"\n"))
+	h, _, _ := awsHost(t)
+	t.Setenv("AWS_ACCESS_KEY_ID", "AKIAOPERATOR")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "secret")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		for i := 0; i < 200; i++ {
+			if _, err := os.Stat(rel.record + ".started"); err == nil {
+				break
+			}
+			time.Sleep(25 * time.Millisecond)
+		}
+		cancel()
+	}()
+	if _, err := h.UpdateStack(ctx, rel.cand, nodeupgrade.StackOptions{Name: "supavise"}); err != nil {
+		t.Fatal(err)
+	}
+	if b, _ := os.ReadFile(rel.record + ".trap"); string(b) != "finished\n" {
+		t.Errorf("the script was stopped: %q", b)
+	}
+	// A cancelled context before the start runs nothing.
+	rel = newAWSRelease(t)
+	t.Setenv("EXIT_CODE", "0")
+	if _, err := h.UpdateStack(ctx, rel.cand, nodeupgrade.StackOptions{Name: "supavise"}); err == nil {
+		t.Error("a cancelled upgrade ran the script")
+	}
+}
+
+// A signal to the upgrade reaches the script, whose trap decides.
+func TestRunStackScriptPassesSignalsOn(t *testing.T) {
+	dir := t.TempDir()
+	cmd := exec.Command("bash", "-c", "trap 'echo trapped >\""+dir+"/trap\"; exit 143' TERM; touch \""+dir+"/started\"; sleep 10 & wait $!")
+	sigs := make(chan os.Signal, 1)
+	go func() {
+		for i := 0; i < 200; i++ {
+			if _, err := os.Stat(filepath.Join(dir, "started")); err == nil {
+				break
+			}
+			time.Sleep(25 * time.Millisecond)
+		}
+		sigs <- syscall.SIGTERM
+	}()
+	start := time.Now()
+	err := runStackScript(cmd, sigs)
+	var ee *exec.ExitError
+	if !errors.As(err, &ee) || ee.ExitCode() != 143 {
+		t.Fatalf("runStackScript: %v", err)
+	}
+	if b, _ := os.ReadFile(filepath.Join(dir, "trap")); string(b) != "trapped\n" || time.Since(start) > 8*time.Second {
+		t.Errorf("trap %q after %v", b, time.Since(start))
 	}
 }

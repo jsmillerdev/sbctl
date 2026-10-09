@@ -1,0 +1,243 @@
+{
+  "ChangeSetName": "supavise-update-20261009T120000Z",
+  "StackName": "supavise-stack",
+  "Status": "CREATE_COMPLETE",
+  "ExecutionStatus": "AVAILABLE",
+  "Changes": [
+    {
+      "Type": "Resource",
+      "ResourceChange": {
+        "Action": "Add",
+        "LogicalResourceId": "ObjectsBucket",
+        "ResourceType": "AWS::S3::Bucket",
+        "Scope": [],
+        "Details": []
+      }
+    },
+    {
+      "Type": "Resource",
+      "ResourceChange": {
+        "Action": "Add",
+        "LogicalResourceId": "ObjectsBucketPolicy",
+        "ResourceType": "AWS::S3::BucketPolicy",
+        "Scope": [],
+        "Details": []
+      }
+    },
+    {
+      "Type": "Resource",
+      "ResourceChange": {
+        "Action": "Add",
+        "LogicalResourceId": "StorageRole",
+        "ResourceType": "AWS::IAM::Role",
+        "Scope": [],
+        "Details": []
+      }
+    },
+    {
+      "Type": "Resource",
+      "ResourceChange": {
+        "Action": "Add",
+        "LogicalResourceId": "StorageAssumePolicy",
+        "ResourceType": "AWS::IAM::Policy",
+        "Scope": [],
+        "Details": []
+      }
+    },
+    {
+      "Type": "Resource",
+      "ResourceChange": {
+        "Action": "Modify",
+        "LogicalResourceId": "Instance",
+        "PhysicalResourceId": "x-Instance",
+        "ResourceType": "AWS::EC2::Instance",
+        "Replacement": "Conditional",
+        "Scope": [
+          "Tags",
+          "Properties"
+        ],
+        "Details": [
+          {
+            "Target": {
+              "Attribute": "Tags",
+              "RequiresRecreation": "Never"
+            },
+            "Evaluation": "Static",
+            "ChangeSource": "DirectModification"
+          },
+          {
+            "Target": {
+              "Attribute": "Properties",
+              "Name": "ImageId",
+              "RequiresRecreation": "Conditionally"
+            },
+            "Evaluation": "Dynamic",
+            "ChangeSource": "DirectModification"
+          },
+          {
+            "Target": {
+              "Attribute": "Properties",
+              "Name": "ImageId",
+              "RequiresRecreation": "Conditionally"
+            },
+            "Evaluation": "Dynamic",
+            "ChangeSource": "ParameterReference",
+            "CausingEntity": "AmiId"
+          },
+          {
+            "Target": {
+              "Attribute": "Properties",
+              "Name": "MetadataOptions",
+              "RequiresRecreation": "Never"
+            },
+            "Evaluation": "Static",
+            "ChangeSource": "DirectModification"
+          }
+        ]
+      }
+    },
+    {
+      "Type": "Resource",
+      "ResourceChange": {
+        "Action": "Modify",
+        "LogicalResourceId": "DataVolume",
+        "PhysicalResourceId": "x-DataVolume",
+        "ResourceType": "AWS::EC2::Volume",
+        "Replacement": "False",
+        "Scope": [
+          "Properties"
+        ],
+        "Details": [
+          {
+            "Target": {
+              "Attribute": "Properties",
+              "Name": "AvailabilityZone",
+              "RequiresRecreation": "Never"
+            },
+            "Evaluation": "Dynamic",
+            "ChangeSource": "ResourceAttribute",
+            "CausingEntity": "Instance.AvailabilityZone"
+          }
+        ]
+      }
+    },
+    {
+      "Type": "Resource",
+      "ResourceChange": {
+        "Action": "Modify",
+        "LogicalResourceId": "DataVolumeAttachment",
+        "PhysicalResourceId": "x-DataVolumeAttachment",
+        "ResourceType": "AWS::EC2::VolumeAttachment",
+        "Replacement": "Conditional",
+        "Scope": [
+          "Properties"
+        ],
+        "Details": [
+          {
+            "Target": {
+              "Attribute": "Properties",
+              "Name": "InstanceId",
+              "RequiresRecreation": "Conditionally"
+            },
+            "Evaluation": "Dynamic",
+            "ChangeSource": "ResourceReference",
+            "CausingEntity": "Instance"
+          }
+        ]
+      }
+    },
+    {
+      "Type": "Resource",
+      "ResourceChange": {
+        "Action": "Modify",
+        "LogicalResourceId": "ElasticIp",
+        "PhysicalResourceId": "x-ElasticIp",
+        "ResourceType": "AWS::EC2::EIP",
+        "Replacement": "False",
+        "Scope": [
+          "Tags"
+        ],
+        "Details": [
+          {
+            "Target": {
+              "Attribute": "Tags",
+              "RequiresRecreation": "Never"
+            },
+            "Evaluation": "Static",
+            "ChangeSource": "DirectModification"
+          }
+        ]
+      }
+    },
+    {
+      "Type": "Resource",
+      "ResourceChange": {
+        "Action": "Modify",
+        "LogicalResourceId": "ElasticIpAssociation",
+        "PhysicalResourceId": "x-ElasticIpAssociation",
+        "ResourceType": "AWS::EC2::EIPAssociation",
+        "Replacement": "Conditional",
+        "Scope": [
+          "Properties"
+        ],
+        "Details": [
+          {
+            "Target": {
+              "Attribute": "Properties",
+              "Name": "AllocationId",
+              "RequiresRecreation": "Conditionally"
+            },
+            "Evaluation": "Dynamic",
+            "ChangeSource": "ResourceAttribute",
+            "CausingEntity": "ElasticIp.AllocationId"
+          },
+          {
+            "Target": {
+              "Attribute": "Properties",
+              "Name": "InstanceId",
+              "RequiresRecreation": "Conditionally"
+            },
+            "Evaluation": "Dynamic",
+            "ChangeSource": "ResourceReference",
+            "CausingEntity": "Instance"
+          }
+        ]
+      }
+    },
+    {
+      "Type": "Resource",
+      "ResourceChange": {
+        "Action": "Modify",
+        "LogicalResourceId": "InstanceRole",
+        "PhysicalResourceId": "x-InstanceRole",
+        "ResourceType": "AWS::IAM::Role",
+        "Replacement": "False",
+        "Scope": [
+          "Metadata",
+          "Tags"
+        ],
+        "Details": [
+          {
+            "Target": {
+              "Attribute": "Metadata",
+              "RequiresRecreation": "Never"
+            },
+            "Evaluation": "Static",
+            "ChangeSource": "DirectModification"
+          },
+          {
+            "Target": {
+              "Attribute": "Tags",
+              "RequiresRecreation": "Never"
+            },
+            "Evaluation": "Static",
+            "ChangeSource": "DirectModification"
+          }
+        ]
+      }
+    }
+  ],
+  "Capabilities": [
+    "CAPABILITY_IAM"
+  ]
+}
