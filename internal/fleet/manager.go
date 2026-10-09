@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -81,14 +82,7 @@ func (d *Deps) log() *slog.Logger {
 	return d.Log
 }
 
-func (d *Deps) skipped(svc string) bool {
-	for _, s := range d.Skip {
-		if s == svc {
-			return true
-		}
-	}
-	return false
-}
+func (d *Deps) skipped(svc string) bool { return slices.Contains(d.Skip, svc) }
 
 // Health is the state of one shared service.
 type Health struct {
