@@ -463,7 +463,8 @@ func startCluster(ctx context.Context, w *Wire, boot cluster.BootDecision, dir s
 	})
 	ping := func() peerapi.Ping {
 		leader := ""
-		if l, ok := live.Leader(); ok {
+		l, ok, epoch := live.LeaderAndEpoch() // one snapshot: a leader and an epoch from two would name a node that leads at an epoch it never did
+		if ok {
 			leader = l.ID
 		}
 		verdict := string(health.Healthy)
@@ -476,7 +477,7 @@ func startCluster(ctx context.Context, w *Wire, boot cluster.BootDecision, dir s
 				verdict = string(r.Verdict)
 			}
 		}
-		return peerapi.Ping{Node: selfID, Epoch: live.Epoch(), Leader: leader, Version: w.Options.Version, Schema: schema.get(), Health: verdict}
+		return peerapi.Ping{Node: selfID, Epoch: epoch, Leader: leader, Version: w.Options.Version, Schema: schema.get(), Health: verdict}
 	}
 	registerPeerAPI(&cluster.PeerAPI{Authority: auth, Topology: live, Cfg: cfg, Reports: reports, Ping: ping}, mesh.Handle, peerAPIServedByOthers...)
 

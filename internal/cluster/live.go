@@ -320,6 +320,10 @@ func (l *Live) Refresh(ctx context.Context) {
 		}
 	}
 	if !reflect.DeepEqual(prev, snap) {
+		if prev.Leader != snap.Leader || prev.Epoch != snap.Epoch || prev.Role != snap.Role {
+			l.o.Log.Info("membership: the leader, the epoch or the role changed", "leader", snap.Leader, "epoch", snap.Epoch, "role", string(snap.Role),
+				"was_leader", prev.Leader, "was_epoch", prev.Epoch, "was_role", string(prev.Role))
+		}
 		l.Set(snap)
 	}
 	l.watchRole(role)
@@ -349,22 +353,28 @@ func (l *Live) probeRole(ctx context.Context) {
 	}
 }
 
-// followSuccessor makes the node it stopped for the leader the membership reports, at the epoch it holds
-// it: this node's system cluster is stopped for a planned switchover or already a standby, and a peer says
-// that node leads at a higher epoch. The registry cannot say so yet (the database is stopped, or the copy
-// has not replayed the move); a registry that is behind never takes it back (Refresh keeps the epoch).
-func (l *Live) followSuccessor(leader string, epoch int64) {
+// followSuccessor makes the node it stopped for the leader the membership reports: this node's system
+// cluster is stopped for a planned switchover or already a standby, and a peer says that node leads at a
+// higher epoch. The registry cannot say so yet (the database is stopped, or the copy has not replayed the
+// move). A follower takes the epoch too, so that a copy that is behind never takes the leader back
+// (Refresh keeps the epoch). A leader whose database is stopped keeps its epoch: its record of the
+// switchover ends when the epoch is reached, and the record is what the daemon that starts as the
+// follower believes.
+func (l *Live) followSuccessor(leader string, epoch int64, takeEpoch bool) {
 	if l.o.Successor == nil {
 		return
 	}
-	if snap := l.get(); snap.Leader == leader && snap.Epoch >= epoch {
+	if snap := l.get(); snap.Leader == leader && (!takeEpoch || snap.Epoch >= epoch) {
 		return
 	}
 	if !l.o.Successor(leader, epoch) {
 		return
 	}
 	snap := l.get()
-	snap.Leader, snap.Epoch = leader, epoch
+	snap.Leader = leader
+	if takeEpoch {
+		snap.Epoch = epoch
+	}
 	l.Set(snap)
 	l.o.Log.Info("membership: the node this one stopped for leads; its requests are the leader's", "leader", leader, "epoch", epoch)
 }
@@ -404,12 +414,16 @@ func (l *Live) observe(source string, epoch int64, leader string) {
 	if leader == "" || leader == l.o.SelfID {
 		return
 	}
+	if epoch > snap.Epoch || (epoch == snap.Epoch && leader != snap.Leader) {
+		l.o.Log.Info("membership: a peer names another leader than this node's snapshot", "source", source, "leader", leader, "epoch", epoch,
+			"mine", snap.Leader, "my_epoch", snap.Epoch, "role", string(snap.Role))
+	}
 	if snap.Role == RoleFollower {
 		// The old leader of a planned switchover restarts as a follower with a copy of the registry that has not
 		// replayed the move: its standby streams through the forwarders to the leader the membership names, so it
 		// has to hear who leads from its peers, and believes only the node its record says it stopped for.
 		if epoch > snap.Epoch {
-			l.followSuccessor(leader, epoch)
+			l.followSuccessor(leader, epoch, true)
 		}
 		return
 	}
@@ -423,7 +437,7 @@ func (l *Live) observe(source string, epoch int64, leader string) {
 	}
 	if l.o.InRecovery != nil && !l.primary {
 		l.mu.Unlock()
-		l.followSuccessor(leader, epoch)
+		l.followSuccessor(leader, epoch, false)
 		return
 	}
 	l.fencing = true

@@ -1165,8 +1165,8 @@ func TestLiveFollowsTheSuccessorItStoppedFor(t *testing.T) {
 	if lead, ok := l.Leader(); !ok || lead.ID != "n2" {
 		t.Fatalf("the successor does not lead: %+v %v", lead, ok)
 	}
-	if l.Epoch() != 2 || l.Role() != RoleLeader || l.Fenced() != nil {
-		t.Fatalf("epoch %d, role %s, fenced %v: the snapshot takes the leader and its epoch and keeps the role", l.Epoch(), l.Role(), l.Fenced())
+	if l.Epoch() != 1 || l.Role() != RoleLeader || l.Fenced() != nil {
+		t.Fatalf("epoch %d, role %s, fenced %v: the snapshot takes the leader and keeps the epoch and the role", l.Epoch(), l.Role(), l.Fenced())
 	}
 	// A refresh with an unreadable registry (the database is still stopped) leaves it so.
 	l.o.Reg = unreadable{l.o.Reg}
@@ -1234,5 +1234,22 @@ func TestAFollowerWithAStaleCopyFollowsTheSuccessorItStoppedFor(t *testing.T) {
 	l.Refresh(ctx) // the copy is still behind: it does not take the leader back
 	if lead, _ := l.Leader(); lead.ID != "n2" || l.Epoch() != 2 {
 		t.Fatalf("a refresh took the leadership back: %s at %d", lead.ID, l.Epoch())
+	}
+}
+
+// A ping names the leader and the epoch of one snapshot: read separately they can come from two, and "node
+// X leads at epoch E" with a pair that never was makes the node that leads at E fence itself.
+func TestLeaderAndEpochComeFromOneSnapshot(t *testing.T) {
+	s := NewStatic(Snapshot{Nodes: []registry.Node{{ID: "n1"}, {ID: "n2"}}, Leader: "n1", Epoch: 1, Role: RoleFollower})
+	if lead, ok, epoch := s.LeaderAndEpoch(); !ok || lead.ID != "n1" || epoch != 1 {
+		t.Fatalf("%v %v %d", lead.ID, ok, epoch)
+	}
+	s.Set(Snapshot{Nodes: []registry.Node{{ID: "n1"}, {ID: "n2"}}, Leader: "n2", Epoch: 2, Role: RoleFollower})
+	if lead, ok, epoch := s.LeaderAndEpoch(); !ok || lead.ID != "n2" || epoch != 2 {
+		t.Fatalf("%v %v %d", lead.ID, ok, epoch)
+	}
+	s.Set(Snapshot{Leader: "n9", Epoch: 3})
+	if _, ok, epoch := s.LeaderAndEpoch(); ok || epoch != 3 {
+		t.Fatalf("a leader that is not among the nodes: %v, epoch %d", ok, epoch)
 	}
 }
