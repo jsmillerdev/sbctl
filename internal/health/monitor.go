@@ -68,6 +68,18 @@ func (m *Monitor) Fresh(ctx context.Context) (*Report, error) {
 	}
 }
 
+// Last returns the report of the latest check without starting one, and false when there is none
+// or it is older than maxStale. The peer ping answers from it: a node's neighbors ping it every few
+// seconds, and the alert checker keeps the report fresh.
+func (m *Monitor) Last() (*Report, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.last == nil || m.now().Sub(m.lastAt) >= maxStale {
+		return nil, false
+	}
+	return m.last, true
+}
+
 func (m *Monitor) fallback(err error) (*Report, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()

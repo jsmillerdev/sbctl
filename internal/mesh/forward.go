@@ -7,7 +7,9 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -32,9 +34,14 @@ type Forwarders struct {
 	Log      *slog.Logger
 	// Fenced reports whether this node is fenced; nil means it is not.
 	Fenced func() bool
-	// Interval is how often the desired set is recomputed even when nothing announced a change
-	// (retry of a port still in use, a new leader). Zero means 2 s.
+	// Interval is how often Run looks at what the registry's change stream does not say: the
+	// membership (the leader and the active nodes, which the topology learns on its own schedule), a
+	// port that could not be bound or a suspension that is on, which are retried at every look. Without
+	// a change stream the desired set is recomputed at every look. Zero means 2 s.
 	Interval time.Duration
+	// Safety is how long the desired set may go without being recomputed when the change stream is
+	// working and nothing changed: the stream is best effort. Zero means 30 s.
+	Safety time.Duration
 	// Listen binds a loopback port; nil binds 127.0.0.1:<port>.
 	Listen func(port int) (net.Listener, error)
 
@@ -43,6 +50,12 @@ type Forwarders struct {
 	suspended map[string]time.Time
 	failures  map[int]int
 	kick      chan struct{}
+
+	// The last reconcile: the membership it saw, when it ran, and whether the next look must run it
+	// again (the registry could not be read, a port is not bound yet, a suspension is on).
+	lastKey string
+	lastAt  time.Time
+	retry   bool
 }
 
 // target is where the connections of one listener go.
@@ -71,6 +84,10 @@ func (f *Forwarders) Run(ctx context.Context) error {
 	if every <= 0 {
 		every = 2 * time.Second
 	}
+	safety := f.Safety
+	if safety <= 0 {
+		safety = 30 * time.Second
+	}
 	tick := time.NewTicker(every)
 	defer tick.Stop()
 	var debounce <-chan time.Time
@@ -93,9 +110,48 @@ func (f *Forwarders) Run(ctx context.Context) error {
 			debounce = nil
 			f.Reconcile(ctx)
 		case <-tick.C:
-			f.Reconcile(ctx)
+			if changes == nil || f.due(safety) {
+				f.Reconcile(ctx)
+			}
 		}
 	}
+}
+
+// due reports whether the look at a tick has anything to do while the change stream works: a retry
+// is pending, the membership moved since the last reconcile, or safety has passed.
+func (f *Forwarders) due(safety time.Duration) bool {
+	f.mu.Lock()
+	retry, key, at := f.retry, f.lastKey, f.lastAt
+	f.mu.Unlock()
+	return retry || time.Since(at) >= safety || f.membershipKey() != key
+}
+
+// membershipKey is what desired reads from the topology and the fence: who leads, whether this node
+// does, whether it is fenced and which nodes are active.
+func (f *Forwarders) membershipKey() string {
+	var b strings.Builder
+	if lead, ok := f.Topology.Leader(); ok {
+		b.WriteString(lead.ID)
+	}
+	b.WriteByte('|')
+	if f.Topology.IsLeader() {
+		b.WriteByte('L')
+	}
+	if f.Fenced != nil && f.Fenced() {
+		b.WriteByte('F')
+	}
+	var active []string
+	for _, n := range f.Topology.Nodes() {
+		if n.State == registry.NodeActive {
+			active = append(active, n.ID)
+		}
+	}
+	slices.Sort(active)
+	for _, id := range active {
+		b.WriteByte('|')
+		b.WriteString(id)
+	}
+	return b.String()
 }
 
 func (f *Forwarders) init() {
@@ -237,14 +293,22 @@ func (f *Forwarders) desired(ctx context.Context) (map[int]target, error) {
 // cannot be bound is tried again by the next call.
 func (f *Forwarders) Reconcile(ctx context.Context) {
 	f.init()
+	key := f.membershipKey() // before the look, so that a change during it is seen at the next one
 	want, err := f.desired(ctx)
 	if err != nil {
 		f.log().Warn("mesh: forwarders cannot read the registry", "error", err)
+		f.mu.Lock()
+		f.retry = true
+		f.mu.Unlock()
 		return
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	now := time.Now()
+	defer func() {
+		f.lastKey, f.lastAt = key, now
+		f.retry = len(f.failures) > 0 || len(f.suspended) > 0
+	}()
 	for ref, until := range f.suspended {
 		if now.After(until) {
 			delete(f.suspended, ref)
@@ -322,6 +386,7 @@ func (f *Forwarders) accept(l *fwdListener) error {
 			f.mu.Lock()
 			if f.ls[l.port] == l {
 				delete(f.ls, l.port)
+				f.retry = true // bind it again at the next look, not at the next safety look
 			}
 			f.mu.Unlock()
 			_ = l.ln.Close()

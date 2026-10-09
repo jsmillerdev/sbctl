@@ -108,3 +108,24 @@ func TestMonitorWaiterThatGivesUpDoesNotCancelTheCheck(t *testing.T) {
 		t.Errorf("the finished check was not cached: %v %v", r, err)
 	}
 }
+
+// The peer ping answers from Last: it never starts a check, and it does not vouch for a report
+// that is too old.
+func TestMonitorLastNeverStartsACheck(t *testing.T) {
+	var n atomic.Int32
+	m := NewMonitor(func(context.Context) (*Report, error) { n.Add(1); return &Report{Verdict: Degraded}, nil }, time.Minute)
+	if r, ok := m.Last(); ok || r != nil || n.Load() != 0 {
+		t.Fatalf("before any check: %v %v, %d checks", r, ok, n.Load())
+	}
+	if _, err := m.Fresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if r, ok := m.Last(); !ok || r.Verdict != Degraded || n.Load() != 1 {
+		t.Fatalf("after a check: %v %v, %d checks", r, ok, n.Load())
+	}
+	now := time.Now()
+	m.now = func() time.Time { return now.Add(maxStale) }
+	if r, ok := m.Last(); ok || r != nil || n.Load() != 1 {
+		t.Fatalf("a report as old as maxStale: %v %v, %d checks", r, ok, n.Load())
+	}
+}

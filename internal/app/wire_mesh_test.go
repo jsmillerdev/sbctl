@@ -478,3 +478,56 @@ func TestSystemInRecoveryWaitsForThePromotionToReachTheSystemPort(t *testing.T) 
 		}
 	}
 }
+
+// countingNodes counts the node reads and writes the leader makes for a ping.
+type countingNodes struct {
+	registry.Registry
+	gets, updates int
+}
+
+func (c *countingNodes) GetNode(ctx context.Context, id string) (*registry.Node, error) {
+	c.gets++
+	return c.Registry.GetNode(ctx, id)
+}
+
+func (c *countingNodes) UpdateNode(ctx context.Context, n *registry.Node) error {
+	c.updates++
+	return c.Registry.UpdateNode(ctx, n)
+}
+
+// A ping that repeats the version the membership already holds costs no registry read; one that
+// differs reads the row and writes it once.
+func TestPeerSeenReadsTheRegistryOnlyWhenTheVersionDiffers(t *testing.T) {
+	ctx := context.Background()
+	mem := registry.NewMemory()
+	n2 := &registry.Node{ID: "n2", Name: "node-n2", State: registry.NodeActive, Version: "v0.2.0"}
+	if err := mem.CreateNode(ctx, n2); err != nil {
+		t.Fatal(err)
+	}
+	reg := &countingNodes{Registry: mem}
+	row := nodeRow("n2", registry.NodeActive)
+	row.Version = "v0.2.0"
+	live := clusterOf("n1", cluster.RoleLeader, "n1", nodeRow("n1", registry.NodeActive), row)
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	seen := func(version string) {
+		peerSeen(ctx, reg, live, &skewState{}, "v0.2.0", "n2", peerapi.Ping{Node: "n2", Version: version}, log)
+	}
+
+	seen("v0.2.0")
+	if reg.gets != 0 || reg.updates != 0 {
+		t.Fatalf("a repeated version: %d reads, %d writes", reg.gets, reg.updates)
+	}
+	seen("v0.2.1")
+	if reg.gets != 1 || reg.updates != 1 {
+		t.Fatalf("a new version: %d reads, %d writes", reg.gets, reg.updates)
+	}
+	if got, _ := mem.GetNode(ctx, "n2"); got.Version != "v0.2.1" {
+		t.Fatalf("the row holds %q", got.Version)
+	}
+	// A follower records nothing.
+	follower := clusterOf("n2", cluster.RoleFollower, "n1", nodeRow("n1", registry.NodeActive), row)
+	peerSeen(ctx, reg, follower, &skewState{}, "v0.2.0", "n1", peerapi.Ping{Node: "n1", Version: "v0.2.9"}, log)
+	if reg.gets != 1 || reg.updates != 1 {
+		t.Fatalf("a follower: %d reads, %d writes", reg.gets, reg.updates)
+	}
+}
