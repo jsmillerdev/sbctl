@@ -910,6 +910,64 @@ func TestRunSchemaReloadTicks(t *testing.T) {
 	<-done
 }
 
+// stampSup records when each unit's status was asked for.
+type stampSup struct {
+	*replicaSup
+	mu    *sync.Mutex
+	times map[string][]time.Time
+}
+
+func (p stampSup) Status(ctx context.Context, u string) (units.Status, error) {
+	p.mu.Lock()
+	p.times[u] = append(p.times[u], time.Now())
+	p.mu.Unlock()
+	return p.replicaSup.Status(ctx, u)
+}
+
+func TestRunSchemaReloadSpreadsTheRefsAcrossTheInterval(t *testing.T) {
+	f := newReplicaFixture(t)
+	refs := []string{"aaaaaaaaaaaaaaaaaaaa", "bbbbbbbbbbbbbbbbbbbb", "cccccccccccccccccccc"}
+	every := 300 * time.Millisecond
+	sup := stampSup{replicaSup: f.sup, mu: &sync.Mutex{}, times: map[string][]time.Time{}}
+	f.pl.sup = sup
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		f.pl.RunSchemaReload(ctx, every, func(context.Context) ([]string, error) { return refs, nil })
+		close(done)
+	}()
+	var at [3]time.Time
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		sup.mu.Lock()
+		ok := true
+		for i, ref := range refs {
+			ts := sup.times[config.UnitName(config.SvcPostgREST, ref)]
+			if len(ts) == 0 {
+				ok = false
+				break
+			}
+			at[i] = ts[0]
+		}
+		sup.mu.Unlock()
+		if ok {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the reload did not reach every ref")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	cancel()
+	<-done
+	gap := every / time.Duration(len(refs))
+	for i := 1; i < len(at); i++ {
+		if d := at[i].Sub(at[i-1]); d < gap-gap/10 {
+			t.Errorf("ref %d was reloaded %s after ref %d, want about %s", i, d, i-1, gap)
+		}
+	}
+}
+
 func signalsAvailable() bool {
 	_, err := exec.LookPath("sh")
 	return err == nil
