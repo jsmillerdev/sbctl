@@ -7,6 +7,8 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -51,6 +53,36 @@ var registryWait = 2 * time.Minute
 // Project units are systemd's, not the daemon's: stopping Serve leaves them running.
 func Serve(ctx context.Context, cfg *config.Config, o Options) error {
 	log := o.log()
+	// The WAL relay is the only holder of the backup credentials that clusters archive
+	// through (backup.Relay). It starts before the node opens, because the system cluster
+	// archives too and the daemon may wait for it to be reachable, and it stops after the
+	// drain: a delete's final base backup needs WAL archived until the very end.
+	var stopRelay func()
+	defer func() {
+		if stopRelay != nil {
+			stopRelay()
+		}
+	}()
+	startRelay := func() {
+		if stopRelay != nil {
+			return
+		}
+		if relay, stop := StartWALRelayAt(ctx, cfg, o.ConfigPath, log, false); relay != nil {
+			stopRelay = stop
+			o.ArchiveReady = func(ref string) {
+				if err := relay.Ensure(ref); err != nil {
+					log.Warn("wal relay: cannot serve project", "ref", ref, "error", err)
+				}
+			}
+		}
+	}
+	// A standby of the system cluster (a follower's) asks the relay for the archive's timeline history
+	// files whenever it starts, and the start ends if there is no relay to ask. The decision below waits
+	// for that standby to answer, so on such a node the relay is up before it. Any other node keeps the
+	// order it had: a node that may have to fence itself archives nothing until it has decided.
+	if systemIsStandby(cfg) {
+		startRelay()
+	}
 	// The node's role in its cluster is decided before anything opens (design 2.10.8): a server that
 	// never joined one is the leader without a look at anything, a standby opens its registry
 	// read-only, and a node that was replaced as leader starts no primary at all.
@@ -61,18 +93,7 @@ func Serve(ctx context.Context, cfg *config.Config, o Options) error {
 	if boot.Role == cluster.RoleFenced {
 		return serveFenced(ctx, cfg, o, log, boot)
 	}
-	// The WAL relay is the only holder of the backup credentials that clusters archive
-	// through (backup.Relay). It starts before the node opens, because the system cluster
-	// archives too and the daemon may wait for it to be reachable, and it stops after the
-	// drain: a delete's final base backup needs WAL archived until the very end.
-	if relay, stop := StartWALRelayAt(ctx, cfg, o.ConfigPath, log, false); relay != nil {
-		defer stop()
-		o.ArchiveReady = func(ref string) {
-			if err := relay.Ensure(ref); err != nil {
-				log.Warn("wal relay: cannot serve project", "ref", ref, "error", err)
-			}
-		}
-	}
+	startRelay()
 	lo := LifecycleOptions(cfg, o)
 	if boot.DSN != "" {
 		lo.RegistryDSN = boot.DSN // the socket that answered the role probe
@@ -676,4 +697,11 @@ func memoizeBackups(lo *lifecycle.OpenOptions) func(*lifecycle.Node) *backup.Ser
 		}
 		return svc
 	}
+}
+
+// systemIsStandby reports whether the system cluster's data directory on this node is a standby's: it
+// carries standby.signal, as a follower's does from its join.
+func systemIsStandby(cfg *config.Config) bool {
+	_, err := os.Stat(filepath.Join(cfg.Paths().PostgresData(config.SystemRef), "standby.signal"))
+	return err == nil
 }
