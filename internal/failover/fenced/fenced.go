@@ -8,8 +8,8 @@
 // record covers every project and the system cluster. A project record covers one project whose
 // primary was fenced on its own (a project failover): the rest of the node carries on.
 //
-// The package imports only config, so that the lifecycle plane, the cluster membership and the
-// failover orchestrator can all read it without a cycle.
+// The package imports only config, fsutil and secrets, which import nothing of the daemon, so that the
+// lifecycle plane, the cluster membership and the failover orchestrator can all read it without a cycle.
 package fenced
 
 import (
@@ -19,10 +19,11 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
-	"regexp"
 	"time"
 
 	"github.com/supavise/supavise/internal/config"
+	"github.com/supavise/supavise/internal/fsutil"
+	"github.com/supavise/supavise/internal/secrets"
 )
 
 // Record says who fenced the node or the project and why.
@@ -51,11 +52,9 @@ type Record struct {
 	Peers   map[string]string `json:"peers,omitempty"`
 }
 
-var refRe = regexp.MustCompile(`^(system|[a-z]{20})$`)
-
 // ValidRef reports whether ref can name a project directory: the system project or a project ref.
 // A ref that arrives from a peer is checked with it before it builds a path.
-func ValidRef(ref string) bool { return refRe.MatchString(ref) }
+func ValidRef(ref string) bool { return secrets.ValidProjectRef(ref) }
 
 // NodePath is the file of the node record: <state_dir>/fenced.json.
 func NodePath(p config.Paths) string { return filepath.Join(p.Root, "fenced.json") }
@@ -145,52 +144,15 @@ func write(path string, r Record) error {
 	if old, err := read(path); err == nil && old != nil && old.Epoch >= r.Epoch {
 		return nil
 	}
-	b, err := json.MarshalIndent(r, "", "  ")
-	if err != nil {
-		return err
-	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
+	if err := fsutil.WriteJSON(path, r, 0o600, fsutil.Options{Sync: true, SyncDir: true, MkdirMode: 0o750}); err != nil {
 		return fmt.Errorf("fenced: %w", err)
 	}
-	tmp, err := os.CreateTemp(filepath.Dir(path), ".fenced-*")
-	if err != nil {
-		return fmt.Errorf("fenced: %w", err)
-	}
-	defer os.Remove(tmp.Name())
-	if err := tmp.Chmod(0o600); err != nil {
-		tmp.Close()
-		return fmt.Errorf("fenced: %w", err)
-	}
-	if _, err := tmp.Write(append(b, '\n')); err != nil {
-		tmp.Close()
-		return fmt.Errorf("fenced: %w", err)
-	}
-	if err := tmp.Sync(); err != nil {
-		tmp.Close()
-		return fmt.Errorf("fenced: %w", err)
-	}
-	if err := tmp.Close(); err != nil {
-		return fmt.Errorf("fenced: %w", err)
-	}
-	if err := os.Rename(tmp.Name(), path); err != nil {
-		return fmt.Errorf("fenced: %w", err)
-	}
-	return syncDir(filepath.Dir(path))
+	return nil
 }
 
 func remove(path string) error {
 	if err := os.Remove(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return fmt.Errorf("fenced: %w", err)
 	}
-	return nil
-}
-
-func syncDir(dir string) error {
-	d, err := os.Open(dir)
-	if err != nil {
-		return nil // the rename happened; durability is best effort
-	}
-	defer d.Close()
-	_ = d.Sync()
 	return nil
 }

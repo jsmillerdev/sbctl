@@ -46,8 +46,6 @@ type HandlerDeps struct {
 	Timers lifecycle.Timers
 	// Resources reads the memory and cores of this node; nil answers that they are unknown.
 	Resources func() lifecycle.NodeResources
-	// MaxBody bounds a request body (default 4 MiB).
-	MaxBody int64
 }
 
 // Register registers the instance, plane and backup endpoints of the peer API with handle, which is
@@ -59,12 +57,13 @@ func Register(handle func(pattern string, fn mesh.HandlerFunc), d HandlerDeps) e
 		return errors.New("placement: the peer API handlers need the agent, the cluster membership and the resolver")
 	}
 	h := &handlers{d}
-	handle("PUT "+peerapi.PathInstance, h.ensure)
-	handle("GET "+peerapi.PathInstance, h.observe)
-	handle("DELETE "+peerapi.PathInstance, h.remove)
-	handle("POST "+peerapi.PathInstanceAction, h.action)
-	handle("POST "+peerapi.PathPlane, h.plane)
-	handle("POST "+peerapi.PathBackup, h.backup)
+	// The endpoints change what runs on the node: they admit the cluster leader only, before they read the request.
+	handle("PUT "+peerapi.PathInstance, h.leaderOnly(h.ensure))
+	handle("GET "+peerapi.PathInstance, h.leaderOnly(h.observe))
+	handle("DELETE "+peerapi.PathInstance, h.leaderOnly(h.remove))
+	handle("POST "+peerapi.PathInstanceAction, h.leaderOnly(h.action))
+	handle("POST "+peerapi.PathPlane, h.leaderOnly(h.plane))
+	handle("POST "+peerapi.PathBackup, h.leaderOnly(h.backup))
 	return nil
 }
 
@@ -74,30 +73,23 @@ const queryEpoch = "epoch"
 
 type handlers struct{ d HandlerDeps }
 
-func writeJSON(w http.ResponseWriter, status int, v any) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	if v != nil {
-		_ = json.NewEncoder(w).Encode(v)
-	}
-}
+// maxBody bounds a request body.
+const maxBody = 4 << 20
 
 // writeErr answers err with the status that stands for it.
 func writeErr(w http.ResponseWriter, err error) {
 	status, code := statusOf(err)
-	writeJSON(w, status, &peerapi.Error{Message: err.Error(), Code: code})
+	mesh.RespondError(w, status, code, err.Error())
 }
 
 func badRequest(w http.ResponseWriter, format string, args ...any) {
-	writeJSON(w, http.StatusBadRequest, &peerapi.Error{Message: fmt.Sprintf(format, args...), Code: "bad_request"})
+	mesh.RespondError(w, http.StatusBadRequest, "bad_request", fmt.Sprintf(format, args...))
 }
 
-func (h *handlers) decode(w http.ResponseWriter, r *http.Request, v any) bool {
-	max := h.d.MaxBody
-	if max <= 0 {
-		max = 4 << 20
-	}
-	b, err := io.ReadAll(http.MaxBytesReader(w, r.Body, max))
+// decode reads the JSON body of a request into v. An empty body leaves v as it is: it is not an error
+// here, where mesh.DecodeBodyMax answers 400 for it.
+func decode(w http.ResponseWriter, r *http.Request, v any) bool {
+	b, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxBody))
 	if err != nil {
 		badRequest(w, "read the request: %v", err)
 		return false
@@ -112,7 +104,8 @@ func (h *handlers) decode(w http.ResponseWriter, r *http.Request, v any) bool {
 	return true
 }
 
-// authorize admits the cluster leader only: the endpoints here change what runs on the node.
+// authorize admits the cluster leader only: the endpoints here change what runs on the node. The
+// refusal names who asked and who leads, which the leader's log and the remote error carry.
 func (h *handlers) authorize(r *http.Request) error {
 	peer, ok := mesh.PeerFrom(r.Context())
 	if !ok || peer.Node == "" {
@@ -125,6 +118,19 @@ func (h *handlers) authorize(r *http.Request) error {
 	return nil
 }
 
+// leaderOnly runs fn for the leader's requests and answers every other with writeErr, before fn reads
+// the request. (mesh.RequireLeader answers with a generic message; the one here is what callers have
+// always got.)
+func (h *handlers) leaderOnly(fn mesh.HandlerFunc) mesh.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if err := h.authorize(r); err != nil {
+			writeErr(w, err)
+			return
+		}
+		fn(w, r)
+	}
+}
+
 func (h *handlers) epochOK(epoch int64) error {
 	if cur := h.d.Members.Epoch(); epoch < cur {
 		return fmt.Errorf("%w: the request is under epoch %d and this node is at %d", ErrStaleEpoch, epoch, cur)
@@ -133,12 +139,8 @@ func (h *handlers) epochOK(epoch int64) error {
 }
 
 func (h *handlers) ensure(w http.ResponseWriter, r *http.Request) {
-	if err := h.authorize(r); err != nil {
-		writeErr(w, err)
-		return
-	}
 	var spec peerapi.InstanceSpec
-	if !h.decode(w, r, &spec) {
+	if !decode(w, r, &spec) {
 		return
 	}
 	if id := r.PathValue("identifier"); spec.Identifier == "" {
@@ -152,27 +154,19 @@ func (h *handlers) ensure(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, st)
+	mesh.RespondJSON(w, http.StatusOK, st)
 }
 
 func (h *handlers) observe(w http.ResponseWriter, r *http.Request) {
-	if err := h.authorize(r); err != nil {
-		writeErr(w, err)
-		return
-	}
 	st, err := h.d.Agent.Observe(r.Context(), r.PathValue("identifier"))
 	if err != nil {
 		writeErr(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, st)
+	mesh.RespondJSON(w, http.StatusOK, st)
 }
 
 func (h *handlers) remove(w http.ResponseWriter, r *http.Request) {
-	if err := h.authorize(r); err != nil {
-		writeErr(w, err)
-		return
-	}
 	// The removal deletes a directory: it is made under the epoch of the leader that asks, like every
 	// other request that changes the node, so that a leader that was replaced and does not know it yet
 	// cannot destroy what the new one keeps. (A request without an epoch is a leader of an older
@@ -196,12 +190,8 @@ func (h *handlers) remove(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *handlers) action(w http.ResponseWriter, r *http.Request) {
-	if err := h.authorize(r); err != nil {
-		writeErr(w, err)
-		return
-	}
 	var req peerapi.InstanceAction
-	if !h.decode(w, r, &req) {
+	if !decode(w, r, &req) {
 		return
 	}
 	st, err := h.d.Agent.Do(r.Context(), r.PathValue("identifier"), peerapi.Action(r.PathValue("action")), req)
@@ -209,7 +199,7 @@ func (h *handlers) action(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, st)
+	mesh.RespondJSON(w, http.StatusOK, st)
 }
 
 // home checks that the project is homed on this node: the plane and backup endpoints run what only
@@ -226,10 +216,6 @@ func (h *handlers) home(ctx context.Context, ref string) error {
 }
 
 func (h *handlers) plane(w http.ResponseWriter, r *http.Request) {
-	if err := h.authorize(r); err != nil {
-		writeErr(w, err)
-		return
-	}
 	ref, method := r.PathValue("ref"), peerapi.PlaneMethod(r.PathValue("method"))
 	call, ok := h.planeCall(method)
 	if !ok {
@@ -237,7 +223,7 @@ func (h *handlers) plane(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var pc peerapi.PlaneCall
-	if !h.decode(w, r, &pc) {
+	if !decode(w, r, &pc) {
 		return
 	}
 	if err := h.epochOK(pc.Epoch); err != nil {
@@ -264,7 +250,7 @@ func (h *handlers) plane(w http.ResponseWriter, r *http.Request) {
 		}
 		out.Result = b
 	}
-	writeJSON(w, http.StatusOK, out)
+	mesh.RespondJSON(w, http.StatusOK, out)
 }
 
 // planeCall is what the agent does for method: a method of lifecycle.Plane (planeCalls), or one of the
@@ -308,12 +294,8 @@ func (h *handlers) finalCheckpoint(_ context.Context, _ lifecycle.Plane, ref str
 }
 
 func (h *handlers) backup(w http.ResponseWriter, r *http.Request) {
-	if err := h.authorize(r); err != nil {
-		writeErr(w, err)
-		return
-	}
 	var req peerapi.BackupRequest
-	if !h.decode(w, r, &req) {
+	if !decode(w, r, &req) {
 		return
 	}
 	if err := h.epochOK(req.Epoch); err != nil {
@@ -340,7 +322,7 @@ func (h *handlers) backup(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, res)
+	mesh.RespondJSON(w, http.StatusOK, res)
 }
 
 // RunBackup performs the backup operation op for ref with the node's backup service: a base backup,

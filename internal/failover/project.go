@@ -2,7 +2,6 @@ package failover
 
 import (
 	"context"
-	"crypto/rand"
 	"errors"
 	"fmt"
 	"net/http"
@@ -16,8 +15,10 @@ import (
 	"github.com/supavise/supavise/internal/lifecycle"
 	"github.com/supavise/supavise/internal/mesh"
 	"github.com/supavise/supavise/internal/mesh/peerapi"
+	"github.com/supavise/supavise/internal/pglsn"
 	"github.com/supavise/supavise/internal/placement"
 	"github.com/supavise/supavise/internal/registry"
+	"github.com/supavise/supavise/internal/replicas/replicaid"
 )
 
 // A project move (design 2.10.3). The leader runs it, holding the project's lock; the project
@@ -270,7 +271,7 @@ func (o *Orchestrator) projectSteps(ctx context.Context, j *journal, run *projec
 			// The position is what the promotion waits for. Without one the replica could be
 			// promoted before it has the old primary's last WAL, and a switchover loses nothing
 			// only because it waits. Nothing is recorded, so a resume stops again and reads it again.
-			if _, perr := ParseLSN(lsn); perr != nil {
+			if !pglsn.Valid(lsn) {
 				return "", &abortError{cause: fmt.Errorf("%w: %s reported %q for %s", ErrNoFinalPosition, run.from.Name, lsn, ref)}
 			}
 			return lsn, nil
@@ -398,7 +399,7 @@ func (o *Orchestrator) settle(ctx context.Context, ref string, s registry.Status
 // movable reports whether the status is one a move leaves behind or sets: the move's own RESTARTING,
 // and the active ones it gives back.
 func movable(s registry.Status) bool {
-	return s == registry.StatusRestarting || s == registry.StatusActiveHealthy || s == registry.StatusActiveUnhealthy
+	return s == registry.StatusRestarting || s.Running()
 }
 
 // statusAfter is the status a project gets back once its move is over: paused stays paused, and
@@ -646,7 +647,7 @@ func (o *Orchestrator) addReplicaRow(ctx context.Context, ref string, node regis
 		origin = registry.ReplicaSystem
 	}
 	r := registry.Replica{
-		Identifier: registry.ReplicaIdentifier(ref, o.regionOf(node), newID6()), Ref: ref, NodeID: node.ID, Origin: origin,
+		Identifier: registry.ReplicaIdentifier(ref, o.regionOf(node), replicaid.Short()), Ref: ref, NodeID: node.ID, Origin: origin,
 		Status: "ACTIVE_UNHEALTHY", InitStep: registry.ReplicaStepDone,
 	}
 	if err := st.CreateReplica(ctx, &r); err != nil {
@@ -665,18 +666,6 @@ func (o *Orchestrator) regionOf(n registry.Node) string {
 		r = "local"
 	}
 	return r
-}
-
-func newID6() string {
-	const alphabet = "abcdefghijklmnopqrstuvwxyz0123456789"
-	var b [6]byte
-	if _, err := rand.Read(b[:]); err != nil {
-		panic(err)
-	}
-	for i := range b {
-		b[i] = alphabet[int(b[i])%len(alphabet)]
-	}
-	return string(b[:])
 }
 
 // lockHold is the project's lock as a move holds it, released once whatever happens.

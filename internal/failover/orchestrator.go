@@ -12,6 +12,7 @@ import (
 	"github.com/supavise/supavise/internal/backup"
 	"github.com/supavise/supavise/internal/cluster"
 	"github.com/supavise/supavise/internal/config"
+	"github.com/supavise/supavise/internal/ctxutil"
 	"github.com/supavise/supavise/internal/registry"
 )
 
@@ -130,7 +131,7 @@ func New(d Deps) (*Orchestrator, error) {
 		d.Now = time.Now
 	}
 	if d.Sleep == nil {
-		d.Sleep = sleep
+		d.Sleep = ctxutil.Sleep
 	}
 	if d.Notify == nil {
 		d.Notify = func(ctx context.Context, ev alerts.Event) { _ = alerts.Notify(ctx, ev) }
@@ -171,17 +172,6 @@ func (d Deps) Gaps() []Gap {
 
 // Gaps lists what is not wired for this orchestrator (Deps.Gaps).
 func (o *Orchestrator) Gaps() []Gap { return o.d.Gaps() }
-
-func sleep(ctx context.Context, d time.Duration) error {
-	t := time.NewTimer(d)
-	defer t.Stop()
-	select {
-	case <-t.C:
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
-	}
-}
 
 func (o *Orchestrator) conf() config.Failover { return o.d.Cfg.Failover }
 func (o *Orchestrator) store() Store          { return o.d.Store() }

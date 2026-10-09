@@ -9,6 +9,7 @@ import (
 
 	"github.com/supavise/supavise/internal/alerts"
 	"github.com/supavise/supavise/internal/backup"
+	"github.com/supavise/supavise/internal/config"
 	"github.com/supavise/supavise/internal/lifecycle"
 	"github.com/supavise/supavise/internal/mesh"
 	"github.com/supavise/supavise/internal/mesh/peerapi"
@@ -33,7 +34,7 @@ import (
 // replicable reports whether a project can be copied now: a project that is not the system
 // project or a branch, and runs, so that a base backup can be taken or found.
 func replicable(p *registry.Project) bool {
-	if p.Ref == "system" || p.Branch != nil {
+	if p.Ref == config.SystemRef || p.Branch != nil {
 		return false
 	}
 	switch p.Status {
@@ -56,7 +57,7 @@ func (c *Controller) admit(ctx context.Context, nodes []registry.Node, projects 
 	}
 	slots := c.cfg.Replicas.SetupConcurrency()
 	for i := range rows {
-		if r := &rows[i]; settingUp(r) && r.Origin != registry.ReplicaSystem && r.InitStep != StepRequested {
+		if r := &rows[i]; settingUp(r) && !r.IsSystemStandby() && r.InitStep != StepRequested {
 			slots--
 		}
 	}
@@ -68,7 +69,7 @@ func (c *Controller) admit(ctx context.Context, nodes []registry.Node, projects 
 	seeds := map[string]int64{}
 	for i := range rows {
 		r := &rows[i]
-		if settingUp(r) && r.Origin != registry.ReplicaSystem && r.InitStep == StepStarted && c.roomRefusal(r.Identifier) != nil {
+		if settingUp(r) && !r.IsSystemStandby() && r.InitStep == StepStarted && c.roomRefusal(r.Identifier) != nil {
 			// Admitted again after the node refused it, and the node has not taken it yet: the
 			// node is still the one this replica waits for, so its alert stays open.
 			if n := nodeByID[r.NodeID]; n.ID != "" {
@@ -76,7 +77,7 @@ func (c *Controller) admit(ctx context.Context, nodes []registry.Node, projects 
 			}
 			continue
 		}
-		if !settingUp(r) || r.Origin == registry.ReplicaSystem || r.InitStep != StepRequested {
+		if !settingUp(r) || r.IsSystemStandby() || r.InitStep != StepRequested {
 			continue
 		}
 		p, n := projByRef[r.Ref], nodeByID[r.NodeID]
@@ -134,7 +135,7 @@ func hostedOn(node string, projects []registry.Project, rows []registry.Replica,
 		}
 	}
 	for _, r := range rows {
-		if r.NodeID != node || r.Identifier == exclude || r.Origin == registry.ReplicaSystem || (settingUp(&r) && r.InitStep == StepRequested) {
+		if r.NodeID != node || r.Identifier == exclude || r.IsSystemStandby() || (settingUp(&r) && r.InitStep == StepRequested) {
 			continue
 		}
 		if p, ok := byRef[r.Ref]; ok {

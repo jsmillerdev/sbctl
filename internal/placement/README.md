@@ -148,15 +148,8 @@ leader, and logs once, not every tick, that a leader has no report endpoint (`Er
 `Fleet` is the `lifecycle.ReplicaFleet` of the leader's Engine: it restarts a project's replicas through
 `InstanceOps` when the project is resized.
 
-Five more pieces are the wiring's to attach:
+Four more pieces are the wiring's to attach:
 
-- `LocalPrimaries` (`localprimaries.go`) is the failover orchestrator's hand on the primaries homed here
-  (it has the methods of `failover.LocalPrimaries`; this package does not import `internal/failover`). `Stop`
-  stops the backup timer and the units and returns the cluster's latest checkpoint location from
-  its control file, an error when it cannot be read or the cluster did not shut down cleanly; `Start`
-  starts a primary (a fenced one answers `lifecycle.ErrFenced`); `Healthy`; `SetAside` refuses while a
-  postmaster of the directory is alive and otherwise calls `MoveAside`, which the wiring binds to
-  `failover.SetAsideDiverged`.
 - `RoutedBackups` (`routedbackups.go`) takes a base backup on the node a project is homed on and records
   it on the leader: the home takes it without writing its registry (`backup.BackupOptions.NoRecord`;
   the backup handler always asks for that, because a follower's registry is a read-only copy), and the

@@ -3,8 +3,6 @@ package replicas
 import (
 	"context"
 	"errors"
-	"strconv"
-	"strings"
 	"time"
 
 	"github.com/supavise/supavise/internal/mesh/peerapi"
@@ -220,18 +218,4 @@ func (c *Controller) seedSize(ctx context.Context, ref string) int64 {
 		}
 	}
 	return 0
-}
-
-// parseLSN reads the text form of a pg_lsn ("0/3000100").
-func parseLSN(s string) (uint64, bool) {
-	hi, lo, ok := strings.Cut(s, "/")
-	if !ok {
-		return 0, false
-	}
-	h, err1 := strconv.ParseUint(hi, 16, 32)
-	l, err2 := strconv.ParseUint(lo, 16, 32)
-	if err1 != nil || err2 != nil {
-		return 0, false
-	}
-	return h<<32 | l, true
 }

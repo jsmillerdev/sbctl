@@ -4,12 +4,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"sync"
 	"time"
 
 	"github.com/supavise/supavise/internal/alerts"
 	"github.com/supavise/supavise/internal/backup"
 	"github.com/supavise/supavise/internal/cluster"
+	"github.com/supavise/supavise/internal/config"
 	"github.com/supavise/supavise/internal/failover"
 	"github.com/supavise/supavise/internal/lifecycle"
 	"github.com/supavise/supavise/internal/mesh"
@@ -120,7 +122,7 @@ func placementWiring(ctx context.Context, w *Wire, handle func(pattern string, f
 			rs, err := node.Registry.ListReplicasOn(ctx, self())
 			var refs []string
 			for _, r := range rs {
-				if r.Ref != "system" {
+				if !r.IsSystemStandby() {
 					refs = append(refs, r.Ref)
 				}
 			}
@@ -197,29 +199,52 @@ func unlessLeader(m cluster.Membership, f func(context.Context) []peerapi.Projec
 	}
 }
 
+// projectProbeTimeout bounds the health probe of one project, which has no bound of its own as a whole:
+// it asks the unit manager and then probes the database and the APIs, each for up to four seconds, so
+// a healthy project can take more than ten. The limit is there for a probe that hangs, which would
+// otherwise stop the report from ever refreshing. (A variable so that a test can shorten it.)
+var projectProbeTimeout = 30 * time.Second
+
 // projectHealth reports the health of the projects homed on this node, for the report to the leader.
+// It probes a few at a time (placement.DefaultConcurrency), each under projectProbeTimeout, and lists
+// them in the order the registry does.
 func projectHealth(reg registry.Registry, plane lifecycle.Plane, self func() string) func(ctx context.Context) []peerapi.ProjectHealth {
 	return func(ctx context.Context) []peerapi.ProjectHealth {
 		ps, err := reg.ListProjects(ctx)
 		if err != nil {
 			return nil
 		}
-		var out []peerapi.ProjectHealth
+		var homed []*registry.Project
 		for i := range ps {
 			p := &ps[i]
-			if p.NodeID != self() || p.Ref == "system" || (p.Status != registry.StatusActiveHealthy && p.Status != registry.StatusActiveUnhealthy) {
+			if p.NodeID != self() || p.Ref == config.SystemRef || !p.Status.Running() {
 				continue
 			}
+			homed = append(homed, p)
+		}
+		if len(homed) == 0 {
+			return nil
+		}
+		out := make([]peerapi.ProjectHealth, len(homed))
+		idx := make([]int, len(homed))
+		for i := range idx {
+			idx[i] = i
+		}
+		placement.EachLimit(ctx, placement.DefaultConcurrency, idx, func(i int) {
+			p := homed[i]
+			pctx, cancel := context.WithTimeout(ctx, projectProbeTimeout)
+			defer cancel()
 			ph := peerapi.ProjectHealth{Ref: p.Ref, Healthy: true}
-			for _, h := range plane.Health(ctx, p, nil) {
+			for _, h := range plane.Health(pctx, p, nil) {
 				if !h.Healthy {
 					ph.Healthy, ph.Detail = false, h.Name+": "+h.Error
 					break
 				}
 			}
-			out = append(out, ph)
-		}
-		return out
+			out[i] = ph
+		})
+		// A project that was not probed because ctx ended has no entry.
+		return slices.DeleteFunc(out, func(h peerapi.ProjectHealth) bool { return h.Ref == "" })
 	}
 }
 

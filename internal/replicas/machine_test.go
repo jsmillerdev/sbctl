@@ -529,6 +529,92 @@ func TestHandleReportRecordsOnlyTheNodesOwnInstances(t *testing.T) {
 	}
 }
 
+// A report wakes the pass when it says something new: an empty one, or one that repeats the last report
+// of the node (but for the time of the observation), does not. It refreshes the observations all the same.
+func TestHandleReportWakesThePassOnlyForNews(t *testing.T) {
+	e := newEnv(t)
+	id := e.activeReplica().Identifier
+	woken := func() bool {
+		select {
+		case <-e.ctrl.wake:
+			return true
+		default:
+			return false
+		}
+	}
+	woken() // a pass that the setup asked for
+	st := fakeStatus(id, refA)
+	st.At = e.clock.Now()
+
+	e.ctrl.HandleReport(e.ctx, reportOf("n2"))
+	if woken() {
+		t.Fatal("an empty report woke the pass")
+	}
+	e.ctrl.HandleReport(e.ctx, reportOf("n2", st))
+	if !woken() {
+		t.Fatal("the first report of the node did not wake the pass")
+	}
+	e.clock.Advance(10 * time.Second)
+	again := st
+	again.At = e.clock.Now()
+	e.ctrl.HandleReport(e.ctx, reportOf("n2", again))
+	if woken() {
+		t.Fatal("a report that repeats the last woke the pass")
+	}
+	if _, ok := e.ctrl.fresh(id, time.Second); !ok {
+		t.Fatal("a report that repeats the last did not refresh the observation")
+	}
+	// A report of another node is its own.
+	e.ctrl.HandleReport(e.ctx, reportOf("n3", fakeStatus("zzz", refA)))
+	woken()
+	lag := 90.0
+	changed := again
+	changed.LagSeconds = &lag
+	e.ctrl.HandleReport(e.ctx, reportOf("n2", changed))
+	if !woken() {
+		t.Fatal("a report with a changed field did not wake the pass")
+	}
+	changed.PostgRESTReady = false
+	e.ctrl.HandleReport(e.ctx, reportOf("n2", changed))
+	if !woken() {
+		t.Fatal("a report with another field changed did not wake the pass")
+	}
+	// An instance that dropped out of the reports is news once, and so is its return.
+	e.ctrl.HandleReport(e.ctx, reportOf("n2"))
+	if !woken() {
+		t.Fatal("an instance that dropped out of the reports did not wake the pass")
+	}
+	e.ctrl.HandleReport(e.ctx, reportOf("n2"))
+	if woken() {
+		t.Fatal("a second empty report woke the pass")
+	}
+	e.ctrl.HandleReport(e.ctx, reportOf("n2", changed))
+	if !woken() {
+		t.Fatal("an instance that came back did not wake the pass")
+	}
+}
+
+// The monitor takes a node's report for current for a pass interval less a second, and asks the node
+// itself for anything older: a node that stops reporting is found by the first pass after that.
+func TestMonitorAsksTheNodeOnceItsReportIsOlderThanTheInterval(t *testing.T) {
+	e := newEnv(t)
+	id := e.activeReplica().Identifier
+	e.ctrl.HandleReport(e.ctx, reportOf("n2", fakeStatus(id, refA)))
+	polls := func() int { return e.nodes.callsMatching("observe n2 " + id) }
+	before := polls()
+
+	e.clock.Advance(e.ctrl.interval() - 2*time.Second)
+	e.tick(1)
+	if got := polls(); got != before {
+		t.Fatalf("asked the node although its report was %s old: %d -> %d", e.ctrl.interval()-2*time.Second, before, got)
+	}
+	e.clock.Advance(2 * time.Second)
+	e.tick(1)
+	if got := polls(); got != before+1 {
+		t.Fatalf("a report as old as the interval was taken for current: %d -> %d", before, got)
+	}
+}
+
 // A report is read with one query for the node's replicas, however many instances it holds, and an
 // instance under another project than its row names is not taken: it would skew that project's
 // estimate of the WAL position.

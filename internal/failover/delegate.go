@@ -174,7 +174,7 @@ func (o *Orchestrator) delegateServer(ctx context.Context, opts ServerOptions, r
 // of the daemon, and handleServerStatus tells how it goes.
 func (o *Orchestrator) handleServerStart(w http.ResponseWriter, r *http.Request) {
 	var req serverReq
-	if !decodePeer(w, r, &req) {
+	if !mesh.DecodeBodyMax(w, r, peerBodyMax, &req) {
 		return
 	}
 	peer, ok := caller(w, r)
@@ -190,7 +190,7 @@ func (o *Orchestrator) handleServerStart(w http.ResponseWriter, r *http.Request)
 	// run below is the one that holds it.
 	release, err := o.acquire()
 	if err != nil {
-		writePeerError(w, http.StatusConflict, "busy", ErrBusy.Error())
+		mesh.RespondError(w, http.StatusConflict, "busy", ErrBusy.Error())
 		return
 	}
 	started := false
@@ -201,15 +201,15 @@ func (o *Orchestrator) handleServerStart(w http.ResponseWriter, r *http.Request)
 	}()
 	pl, err := o.PlanServer(r.Context(), opts)
 	if err != nil {
-		writePeerError(w, http.StatusInternalServerError, "plan_failed", err.Error())
+		mesh.RespondError(w, http.StatusInternalServerError, "plan_failed", err.Error())
 		return
 	}
 	if refused := pl.Refused(opts.Force); len(refused) > 0 {
-		writePeerError(w, http.StatusConflict, "refused", (&RefusedError{Checks: refused}).Error())
+		mesh.RespondError(w, http.StatusConflict, "refused", (&RefusedError{Checks: refused}).Error())
 		return
 	}
 	if pl.Kind != string(registry.MoveSwitchover) {
-		writePeerError(w, http.StatusConflict, "not_planned", "the old leader does not answer here: a failover is run on this node, not asked of it")
+		mesh.RespondError(w, http.StatusConflict, "not_planned", "the old leader does not answer here: a failover is run on this node, not asked of it")
 		return
 	}
 	run := o.keepRun(peer.Node)
@@ -218,7 +218,7 @@ func (o *Orchestrator) handleServerStart(w http.ResponseWriter, r *http.Request)
 		defer release()
 		run.record(context.Background(), func(ctx context.Context) (*registry.Move, error) { return o.failoverServer(ctx, opts) })
 	}()
-	writePeerJSON(w, http.StatusAccepted, nil)
+	writePeerStatus(w, http.StatusAccepted)
 }
 
 // keepRun starts the record of a run that node follows, in place of the one before it.
@@ -369,12 +369,12 @@ func (o *Orchestrator) handleServerStatus(w http.ResponseWriter, r *http.Request
 	from, _ := strconv.Atoi(r.URL.Query().Get("from"))
 	epoch, _ := strconv.ParseInt(r.URL.Query().Get("epoch"), 10, 64)
 	if run != nil && run.by != peer.Node && run.by != "" {
-		writePeerError(w, http.StatusForbidden, "forbidden", "the move runs for another node")
+		mesh.RespondError(w, http.StatusForbidden, "forbidden", "the move runs for another node")
 		return
 	}
 	if run != nil {
 		if st := run.status(from); epoch <= 0 || st.Move == nil || st.Move.Epoch == epoch {
-			writePeerJSON(w, http.StatusOK, st)
+			mesh.RespondJSON(w, http.StatusOK, st)
 			return
 		}
 	}
@@ -385,8 +385,8 @@ func (o *Orchestrator) handleServerStatus(w http.ResponseWriter, r *http.Request
 		return fromNode == peer.Node && toNode == self && (epoch <= 0 || e == epoch)
 	}
 	if st, ok := o.loggedStatus(r.Context(), from, match); ok {
-		writePeerJSON(w, http.StatusOK, st)
+		mesh.RespondJSON(w, http.StatusOK, st)
 		return
 	}
-	writePeerJSON(w, http.StatusOK, ServerStatus{State: "idle"})
+	mesh.RespondJSON(w, http.StatusOK, ServerStatus{State: "idle"})
 }

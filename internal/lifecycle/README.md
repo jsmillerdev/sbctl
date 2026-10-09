@@ -670,6 +670,6 @@ and `upgrade-smoke` run the systemd, compute size, saved settings and upgrade fl
 - The move of a project between nodes has a window between the planned stop of the old primary and the
   move of the home in the registry: a daemon restart in it starts the old primary again at boot, because
   the registry still names the node the home, until the fence record the orchestrator writes after the
-  promotion. `LocalPrimaries.Stop` (`internal/placement`) leaves no hold of its own.
+  promotion. `localPrimaries.Stop` (`internal/app/wire_primaries.go`) leaves no hold of its own.
 - A replica is not stopped, started or removed with its project (pause, resume, delete): the replica
   controller does that through the node agent.
