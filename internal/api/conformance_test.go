@@ -229,6 +229,8 @@ func TestImplementedRoutesMatchSpec(t *testing.T) {
 		{key: "DELETE /platform/projects/{ref}/content/folders", path: "/platform/projects/" + testRef + "/content/folders?ids=" + folderID},
 		{key: "DELETE /platform/projects/{ref}/content", path: "/platform/projects/" + testRef + "/content?ids=" + contentID, check: want("0.id", contentID)},
 	})
+	// The OAuth operations that answer JSON of the spec (oauth_consent_test.go says which are left out and why).
+	f.run(t, oauthConformanceSteps(f))
 }
 
 func functionUpload(t *testing.T, name, src string) ([]byte, string) {
