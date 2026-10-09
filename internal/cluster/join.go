@@ -2,6 +2,7 @@ package cluster
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"crypto/ed25519"
 	"crypto/x509"
@@ -18,6 +19,7 @@ import (
 	"time"
 
 	"github.com/supavise/supavise/internal/config"
+	"github.com/supavise/supavise/internal/fsutil"
 	"github.com/supavise/supavise/internal/mesh"
 	"github.com/supavise/supavise/internal/mesh/peerapi"
 	"github.com/supavise/supavise/internal/registry"
@@ -283,9 +285,9 @@ func ReadJoinState(dir string) (*JoinState, error) {
 // exchange is phase one. secret and keyBody are what inputs checked.
 func (o *JoinOptions) exchange(ctx context.Context, dir string, secret, keyBody []byte) (*JoinState, error) {
 	tok := o.Token
-	name := firstNonEmpty(o.Name, tok.Name, o.Cfg.NodeName())
-	region := firstNonEmpty(o.Region, tok.Region, o.Cfg.NodeRegion())
-	address := firstNonEmpty(o.Address, o.Cfg.PeerAddr())
+	name := cmp.Or(o.Name, tok.Name, o.Cfg.NodeName())
+	region := cmp.Or(o.Region, tok.Region, o.Cfg.NodeRegion())
+	address := cmp.Or(o.Address, o.Cfg.PeerAddr())
 	key, err := NewKey()
 	if err != nil {
 		return nil, err
@@ -542,18 +544,5 @@ func standbyStreaming(ctx context.Context, dsn string) (lsn string, streaming bo
 }
 
 func writeJSON(path string, v any) error {
-	b, err := json.MarshalIndent(v, "", "  ")
-	if err != nil {
-		return err
-	}
-	return writeFile(path, append(b, '\n'), 0o600)
-}
-
-func firstNonEmpty(vs ...string) string {
-	for _, v := range vs {
-		if v != "" {
-			return v
-		}
-	}
-	return ""
+	return fsutil.WriteJSON(path, v, 0o600, writeOpts)
 }

@@ -21,6 +21,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/supavise/supavise/internal/fsutil"
 	"github.com/supavise/supavise/internal/mesh"
 	"github.com/supavise/supavise/internal/mesh/peerapi"
 )
@@ -434,26 +435,7 @@ func writeIfChanged(p string, data []byte) error {
 	if cur, err := os.ReadFile(p); err == nil && bytes.Equal(cur, data) {
 		return nil
 	}
-	if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
-		return err
-	}
-	f, err := os.CreateTemp(filepath.Dir(p), ".mirror-*")
-	if err != nil {
-		return err
-	}
-	defer os.Remove(f.Name())
-	if err := f.Chmod(0o600); err != nil {
-		f.Close()
-		return err
-	}
-	if _, err := f.Write(data); err != nil {
-		f.Close()
-		return err
-	}
-	if err := f.Close(); err != nil {
-		return err
-	}
-	return os.Rename(f.Name(), p)
+	return fsutil.WriteFile(p, data, 0o600, fsutil.Options{MkdirMode: 0o700})
 }
 
 // certMirror copies the leader's store into the local one, once a minute and when asked.
