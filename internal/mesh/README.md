@@ -54,7 +54,7 @@ The windows come from spike S6: 4 MiB per stream and 32 MiB per session (the rec
 
 The port is `LocalPort(cfg, kind, ref, seq)`, the number the forwarder on the other side binds. It refuses a sequence below 1 or above `config.MaxProjectSeq()` and, for the replica kinds, above `config.MaxReplicaSeq()`. A node answers from its own copy of the registry and remembers a project's home for one second; the table of what it remembers is swept of expired entries as it grows.
 
-The request policy for rpc streams (`rpcAllowed`) is by caller state: no certificate reaches the join endpoint; a joining node the ping, the join confirmation and the rejoin (a rejoin that stopped on the node asks again); a fenced node the ping, the fence and the rejoin; an active node everything. The endpoints that only the leader may call wrap their handler in `RequireLeader`.
+The request policy for rpc streams (`rpcAllowed`) is by caller state: no certificate reaches the join endpoint; a joining node the ping, the join confirmation and the rejoin (a rejoin that stopped on the node asks again); a fenced node the ping, the fence and the rejoin; an active node everything. An endpoint that only the leader may call checks the caller in its handler (`RequireLeader` is the shared check).
 
 ## Forwarders
 

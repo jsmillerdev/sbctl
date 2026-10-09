@@ -240,6 +240,9 @@ type slowSource struct {
 func (s *slowSource) GetProject(ctx context.Context, ref string) (*registry.Project, error) {
 	s.gets.Add(1)
 	<-s.release
+	if err := ctx.Err(); err != nil { // a read that belongs to a caller that left fails, as a real one would
+		return nil, err
+	}
 	return s.Source.GetProject(ctx, ref)
 }
 
@@ -292,5 +295,44 @@ func TestPlacementSharesReadsAndFetchesReplicasOnlyForReplicaKinds(t *testing.T)
 	_ = resolve(KindPostgres)
 	if g, l := src.gets.Load(), src.lists.Load(); g != 2 || l != 1 {
 		t.Fatalf("a remembered placement was read again: %d project reads and %d replica reads", g, l)
+	}
+}
+
+// The registry read belongs to every caller that waits for it: the stream that started it giving up
+// neither fails the others nor leaves an error in the cache, and that stream itself returns at once.
+func TestPlacementACallerThatLeavesDoesNotFailTheOthers(t *testing.T) {
+	reg, cfg := authzFixture(t)
+	src := &slowSource{Source: reg, release: make(chan struct{})}
+	az := &Authorizer{Cfg: cfg, Topology: regTopo{reg, "n2"}, Source: src}
+	first, leave := context.WithCancel(context.Background())
+	firstDone := make(chan error, 1)
+	go func() { _, err := az.place(first, refB, false); firstDone <- err }()
+	eventually(t, "the registry read to start", func() bool { return src.gets.Load() == 1 })
+	secondDone := make(chan error, 1)
+	go func() { _, err := az.place(context.Background(), refB, false); secondDone <- err }()
+	time.Sleep(50 * time.Millisecond) // the second caller joins the read in progress
+	leave()
+	select {
+	case err := <-firstDone:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("the caller that left: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the caller that left is still waiting for the read")
+	}
+	close(src.release)
+	select {
+	case err := <-secondDone:
+		if err != nil {
+			t.Fatalf("the caller that stayed: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the caller that stayed got no answer")
+	}
+	if n := src.gets.Load(); n != 1 {
+		t.Fatalf("%d project reads, want the one the callers shared", n)
+	}
+	if _, err := az.place(context.Background(), refB, false); err != nil || src.gets.Load() != 1 {
+		t.Fatalf("the placement was not remembered: %v, %d reads", err, src.gets.Load())
 	}
 }
