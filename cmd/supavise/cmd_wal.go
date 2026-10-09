@@ -67,7 +67,7 @@ func init() {
 			defer cancel()
 			var err error
 			if fetchSocket != "" {
-				err = backup.RelayFetch(ctx, fetchSocket, fetchRef, args[0], args[1])
+				err = relayFetchPatiently(ctx, fetchSocket, fetchRef, args[0], args[1])
 			} else {
 				var svc *backup.Service
 				if svc, err = walService(); err != nil {
@@ -88,6 +88,30 @@ func init() {
 
 	wal.AddCommand(push, fetch)
 	rootCmd.AddCommand(wal)
+}
+
+// walRelayWait is how long a fetch waits for a relay that does not answer. The relay is the daemon's, and so are the
+// forwarders that carry a standby's stream: when the daemon restarts (an upgrade, a role change) a standby loses both
+// at once, and a restore_command that failed at once with an exit status above 125 would end the standby's startup
+// process and stop its cluster with it. The restart takes seconds; a daemon that is still away after this long is
+// reported the way it always was. A variable so that a test can shorten it.
+var walRelayWait = 2 * time.Minute
+
+// relayFetchPatiently is backup.RelayFetch that asks again, once a second, while nothing answers on the relay socket.
+// Every other failure, a file that is not in the archive included, is returned at once.
+func relayFetchPatiently(ctx context.Context, socket, ref, name, dest string) error {
+	deadline := time.Now().Add(walRelayWait)
+	for {
+		err := backup.RelayFetch(ctx, socket, ref, name, dest)
+		if !errors.Is(err, backup.ErrRelayDown) || !time.Now().Before(deadline) {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return err
+		case <-time.After(time.Second):
+		}
+	}
 }
 
 // walService builds a Service with just the backend: wal commands run once per WAL

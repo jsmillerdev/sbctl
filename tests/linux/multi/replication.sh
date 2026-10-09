@@ -589,6 +589,9 @@ c_upgrade_refused() {
   onl "$lead" wait_replicas "$ref" 1 600
   trap '[[ -z $moved ]] || refused_cleanup "$lead" "$ref"' EXIT
   moved=1
+  # The rejoined follower's daemon has just restarted into its role: the move's preflight asks it over the mesh, and the
+  # question is asked again until the session is up and the replica is within its lag (as the other project moves do).
+  wait_dry_run "$lead" 120 supavise projects failover "$ref" --to "$f"
   onl "$lead" supavise projects failover "$ref" --to "$f" --yes
   onl "$lead" wait_project "$ref" ACTIVE_HEALTHY 300
   [[ $(onl "$lead" home_of "$ref") == "$f" ]] || fail "$ref is homed on $(onl "$lead" home_of "$ref"), want the follower $f"
@@ -604,6 +607,7 @@ c_upgrade_refused() {
   [[ $(onl "$f" daemon_version) == *v0.0.1* ]] || fail "$f: the daemon runs $(onl "$f" daemon_version) after a refusal"
   onl "$f" unit_stamp >"$WORK/refused-$f.after"
   diff -u "$WORK/refused-$f.before" "$WORK/refused-$f.after" || fail "$f: a PostgreSQL cluster was restarted by a refused upgrade"
+  wait_dry_run "$lead" 120 supavise projects failover "$ref" --to "$lead"
   onl "$lead" supavise projects failover "$ref" --to "$lead" --yes
   moved=""
   onl "$lead" wait_project "$ref" ACTIVE_HEALTHY 300
