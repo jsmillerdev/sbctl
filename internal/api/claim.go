@@ -23,6 +23,7 @@ import (
 
 	"github.com/supavise/supavise/internal/config"
 	"github.com/supavise/supavise/internal/members"
+	"github.com/supavise/supavise/internal/oauth"
 	"github.com/supavise/supavise/internal/registry"
 	"github.com/supavise/supavise/internal/secrets"
 )
@@ -84,6 +85,34 @@ type Accounts struct {
 		DeleteSSOUser(ctx context.Context, userID string) error
 		DenySSOEmail(ctx context.Context, providerID, email string, at time.Time) error
 	}
+	// OAuth ends the OAuth grants of a user who is removed (`users remove`) or whom single sign-on
+	// no longer admits (a denied user, a removed provider). The API refuses such a user's access
+	// token at its next request in any case; this keeps the grants and their refresh tokens from
+	// outliving the account. Nil: no grants are ended.
+	OAuth GrantRevoker
+}
+
+// GrantRevoker ends the OAuth grants of a user. *oauth.Service implements it (oauth.Authority has
+// the same method).
+type GrantRevoker interface {
+	RevokeUser(ctx context.Context, userID, reason, actor string) (int, error)
+}
+
+// revokeGrants revokes every live OAuth grant of a user who was removed, on behalf of actor (a user
+// id, or oauth.ActorOperator for the command line), and returns how many it ended. A user with none
+// is not an error.
+func (a *Accounts) revokeGrants(ctx context.Context, userID, actor string) (int, error) {
+	if a.OAuth == nil {
+		return 0, nil
+	}
+	n, err := a.OAuth.RevokeUser(ctx, userID, oauth.ReasonUserRemoved, actor)
+	if err != nil {
+		return 0, err
+	}
+	if n > 0 {
+		a.log().Info("OAuth grants of a removed user were revoked", "user", userID, "grants", n)
+	}
+	return n, nil
 }
 
 func (a *Accounts) now() time.Time {
@@ -455,7 +484,8 @@ func (a *Accounts) RemoveUser(ctx context.Context, email string, force bool) (to
 //  2. The user is recorded as removed. From that moment the API refuses the user's GoTrue
 //     session (which would otherwise stay valid until it expires, an hour) and every
 //     personal access token the user holds, on the next request.
-//  3. The personal access tokens the user created are deleted.
+//  3. The personal access tokens the user created are deleted, and the user's OAuth grants
+//     (an MCP client's sign-in) are revoked, with the access and refresh tokens that belong to them.
 //  4. The GoTrue account is deleted, which also deletes the user's sessions and refresh
 //     tokens there, so no new access token can be issued.
 //
@@ -501,6 +531,9 @@ func (a *Accounts) RemoveUserBy(ctx context.Context, email string, force bool, s
 			return u, tokens, err
 		}
 		tokens++
+	}
+	if _, err := a.revokeGrants(ctx, u.ID, oauth.ActorOperator); err != nil {
+		return u, tokens, fmt.Errorf("revoking the OAuth grants of %s: %w", u.Email, err)
 	}
 	if _, err := a.goTrue(ctx, http.MethodDelete, "/admin/users/"+url.PathEscape(u.ID), nil, nil); err != nil {
 		return u, tokens, err
