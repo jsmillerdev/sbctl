@@ -5,21 +5,27 @@ package fleet_test
 import (
 	"context"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/jackc/pgx/v5"
 
+	"github.com/supavise/supavise/internal/api"
 	"github.com/supavise/supavise/internal/artifacts"
 	"github.com/supavise/supavise/internal/config"
 	"github.com/supavise/supavise/internal/fleet"
 	"github.com/supavise/supavise/internal/lifecycle"
+	"github.com/supavise/supavise/internal/proxy"
 	"github.com/supavise/supavise/internal/registry"
 	"github.com/supavise/supavise/internal/secrets"
 	"github.com/supavise/supavise/internal/units"
@@ -32,7 +38,7 @@ import (
 // daemon of a second node whose system cluster is the standby: it opens that registry read-only,
 // starts the shared services as that node would (fleet.Setup with Start, under the exec
 // supervisor so that nothing clashes with the leader's units), and checks what design 2.6 and
-// spike S1 promise.
+// spike S1 promise. It ends with the remote MCP endpoint on that node (followerMCP).
 func TestLinuxFollower(t *testing.T) {
 	followerConf, leaderConf := os.Getenv("FLEET_FOLLOWER_CONFIG"), os.Getenv("FLEET_LEADER_CONFIG")
 	if followerConf == "" || leaderConf == "" {
@@ -237,6 +243,104 @@ func TestLinuxFollower(t *testing.T) {
 	eventually("the project's tenant next to the replica's", fmt.Sprintf("false|%d", primaryPort), fcfg.Ports.SupavisorTransaction, "postgres."+ref)
 	if want := lcfg.ReplicaPorts(ref, mustProject(t, lreg, ref).Seq).Postgres; want != replicaPort {
 		t.Errorf("the script started the replica on %d; the configuration puts it on %d", replicaPort, want)
+	}
+
+	t.Log("remote MCP: the follower's edge gates /mcp against its standby and forwards it to Studio's port")
+	followerMCP(t, log, fcfg, freg, sec, ref, os.Getenv("FLEET_PAT"))
+}
+
+// noManager is the lifecycle.Manager of an API server that never manages a project: the follower's
+// gate reads the registry and nothing else. Any call of the Manager panics on the nil interface.
+type noManager struct{ lifecycle.Manager }
+
+// followerMCP checks the remote MCP endpoint on a follower. The
+// follower's edge answers api.<domain>/mcp itself, with the Management API's gate reading the
+// follower's registry, which is the standby: a read-only database that a write to would log an
+// error. A personal access token created on the leader is good there once the standby has replayed
+// it; nothing is written (the script looks at the standby's log afterwards). What the gate lets
+// through goes to Studio's port, which on a follower is the mesh's forwarder to the leader's Studio
+// (mesh.KindStudio) and here, where the mesh is not running, a stand-in that records the request.
+func followerMCP(t *testing.T, log *slog.Logger, fcfg *config.Config, freg *registry.Postgres, sec secrets.Secrets, ref, pat string) {
+	t.Helper()
+	if pat == "" {
+		t.Fatal("FLEET_PAT must be set to a personal access token of the leader")
+	}
+	var mu sync.Mutex
+	var seen []string
+	l, err := net.Listen("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(fcfg.Ports.Studio)))
+	if err != nil {
+		t.Fatalf("Studio's port on the follower is not free for the forwarder: %v", err)
+	}
+	studio := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		mu.Lock()
+		seen = append(seen, r.Method+" "+r.URL.Path+"?"+r.URL.RawQuery+" auth="+strconv.FormatBool(r.Header.Get("Authorization") == "Bearer "+pat))
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":{}}`))
+	}))
+	studio.Listener.Close()
+	studio.Listener = l
+	studio.Start()
+	t.Cleanup(studio.Close)
+
+	apiH, err := api.NewServer(api.Deps{Registry: freg, Secrets: sec, Manager: noManager{}, Config: fcfg, Logger: log.With("component", "api")})
+	if err != nil {
+		t.Fatalf("the Management API on the standby: %v", err)
+	}
+	edge, err := proxy.New(proxy.Options{
+		Config: fcfg, Registry: freg, Keys: proxy.RegistryKeys{Registry: freg, Secrets: sec},
+		APIHandler: apiH, MCPGate: apiH.MCPGate, Logger: log.With("component", "proxy"),
+		Cluster: &proxy.Cluster{Leader: func() bool { return false }},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ts := httptest.NewServer(edge.Handler())
+	t.Cleanup(ts.Close)
+	call := func(token string) (*http.Response, string) {
+		t.Helper()
+		req, err := http.NewRequest("POST", ts.URL+"/mcp?project_ref="+ref+"&access_token=dropped", strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"tools/list"}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Host = fcfg.APIHost()
+		req.Header.Set("Content-Type", "application/json")
+		if token != "" {
+			req.Header.Set("Authorization", "Bearer "+token)
+		}
+		resp, err := ts.Client().Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		b, _ := io.ReadAll(resp.Body)
+		return resp, strings.TrimSpace(string(b))
+	}
+
+	resp, body := call("")
+	if want := `Bearer resource_metadata="` + fcfg.APIURL() + `/.well-known/oauth-protected-resource/mcp"`; resp.StatusCode != 401 ||
+		resp.Header.Get("WWW-Authenticate") != want || body != `{"message":"No access token provided"}` {
+		t.Errorf("no token: %d %q %q, want the discovery challenge %q", resp.StatusCode, body, resp.Header.Get("WWW-Authenticate"), want)
+	}
+	if resp, _ := call("sbp_" + strings.Repeat("0", 40)); resp.StatusCode != 401 || !strings.Contains(resp.Header.Get("WWW-Authenticate"), `error="invalid_token"`) {
+		t.Errorf("an unknown token: %d %q", resp.StatusCode, resp.Header.Get("WWW-Authenticate"))
+	}
+	mu.Lock()
+	n := len(seen)
+	mu.Unlock()
+	if n != 0 {
+		t.Fatalf("Studio's port received %v before a good token", seen)
+	}
+
+	resp, body = call(pat)
+	if resp.StatusCode != 200 || !strings.Contains(body, `"result"`) {
+		t.Fatalf("the leader's personal access token on the follower: %d %q (the standby may not have it; is the token older than the base backup?)", resp.StatusCode, body)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if want := "POST /api/mcp?project_ref=" + ref + " auth=true"; len(seen) != 1 || seen[0] != want {
+		t.Errorf("Studio's port saw %q, want [%q]", seen, want)
 	}
 }
 
