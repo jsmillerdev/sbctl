@@ -25,6 +25,7 @@ import (
 	"github.com/supavise/supavise/internal/health"
 	"github.com/supavise/supavise/internal/lifecycle"
 	"github.com/supavise/supavise/internal/notice"
+	"github.com/supavise/supavise/internal/oauth"
 	"github.com/supavise/supavise/internal/proxy"
 	"github.com/supavise/supavise/internal/registry"
 )
@@ -90,6 +91,8 @@ func Serve(ctx context.Context, cfg *config.Config, o Options) error {
 	upgradeAlerts := newUpgradeAlerter(notifier, log.With("component", "alerts"))
 	defer upgradeAlerts.wait()
 	lo.UpgradeNotify = upgradeAlerts.notify
+	oauthAlerts := newOAuthAlerter(notifier, log.With("component", "alerts"))
+	defer oauthAlerts.wait()
 	// Without a Fleet from the caller the Engine registers projects with Supavisor,
 	// Realtime and Storage through a Lazy fleet (credentials loaded on first use, a
 	// service this node never rendered skipped), so a project created through the API
@@ -176,6 +179,10 @@ func Serve(ctx context.Context, cfg *config.Config, o Options) error {
 		Settings:      node.Settings, // the settings the engine renders units and tenants from
 		StudioRefresh: fm.RefreshStudio,
 		Logger:        log.With("component", "api"),
+		// The OAuth service raises an alert when a refresh token or a code is replayed. NewServer
+		// fills in the rest of the service in place: its store, the issuer, the admission checks
+		// and the audit events (registry events on the system project).
+		OAuth: &oauth.Service{Alert: oauthAlerts.alert},
 		// Per-project disk sizes: the supervisor starts the root unit that sets an XFS quota.
 		Disk: diskquota.New(cfg, node.Supervisor),
 	}
