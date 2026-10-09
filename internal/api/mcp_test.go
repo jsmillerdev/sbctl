@@ -157,8 +157,8 @@ func (f *mcpFixture) settle() {
 	}
 }
 
-// gated is what one call of the gate did.
-type gated struct {
+// mcpGated is what one call of the gate did.
+type mcpGated struct {
 	rec   *httptest.ResponseRecorder
 	req   *http.Request
 	query string
@@ -166,10 +166,10 @@ type gated struct {
 	done  context.CancelFunc // the proxy has served the request
 }
 
-func (g gated) body() string { return strings.TrimSpace(g.rec.Body.String()) }
+func (g mcpGated) body() string { return strings.TrimSpace(g.rec.Body.String()) }
 
 // gate calls MCPGate for a request to target with the given headers (alternating name, value).
-func (f *mcpFixture) gate(method, target, body string, headers ...string) gated {
+func (f *mcpFixture) gate(method, target, body string, headers ...string) mcpGated {
 	f.t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	f.t.Cleanup(cancel)
@@ -179,7 +179,7 @@ func (f *mcpFixture) gate(method, target, body string, headers ...string) gated 
 	}
 	rec := httptest.NewRecorder()
 	q, ok := f.srv.MCPGate(rec, req)
-	return gated{rec: rec, req: req, query: q, ok: ok, done: cancel}
+	return mcpGated{rec: rec, req: req, query: q, ok: ok, done: cancel}
 }
 
 // mcpAuthz is the headers of a request that carries token.
@@ -461,7 +461,7 @@ func TestMCPLimits(t *testing.T) {
 
 	t.Run("in flight", func(t *testing.T) {
 		f := newMCPFixture(t)
-		var open []gated
+		var open []mcpGated
 		for i := 0; i < mcpMaxInFlight; i++ {
 			g := f.gate("POST", "/mcp", `{}`, mcpAuthz(f.oauth)...)
 			if !g.ok {
@@ -479,7 +479,7 @@ func TestMCPLimits(t *testing.T) {
 		}
 		// A request is done when the server cancels its context after the proxy has served it.
 		open[3].done()
-		var again gated
+		var again mcpGated
 		waitFor(t, "a slot to be given back", func() bool {
 			again = f.gate("POST", "/mcp", `{}`, mcpAuthz(f.oauth)...)
 			return again.ok
@@ -615,7 +615,7 @@ func TestMCPCORS(t *testing.T) {
 	}
 
 	// The answers are readable by a page of another origin, the challenge included.
-	for name, g := range map[string]gated{
+	for name, g := range map[string]mcpGated{
 		"no token":   f.gate("POST", "/mcp", `{}`, "Origin", "https://claude.ai"),
 		"bad token":  f.gate("POST", "/mcp", `{}`, "Origin", "https://claude.ai", "Authorization", "Bearer x"),
 		"good token": f.gate("POST", "/mcp", `{}`, "Origin", "https://claude.ai", "Authorization", "Bearer "+f.oauth),
