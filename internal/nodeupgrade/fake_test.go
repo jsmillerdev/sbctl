@@ -103,6 +103,7 @@ type fakeHost struct {
 	halted        string // the project the rollout stopped at (HaltReporter)
 
 	convergeErr error        // Converge (a host layer without a swap) fails
+	restartErr  error        // RestartDaemon (services to move without a swap) fails
 	stackErr    error        // UpdateStack fails
 	stackCmd    string       // UpdateStack could not run and returns this command
 	notices     []Event      // what Notify received
@@ -277,6 +278,12 @@ var errBoom = errors.New("boom")
 
 // HaltedProject implements HaltReporter.
 func (f *fakeHost) HaltedProject() string { return f.halted }
+
+// RestartDaemon implements DaemonRestarter.
+func (f *fakeHost) RestartDaemon(context.Context) error {
+	f.rec("restart-daemon")
+	return f.restartErr
+}
 
 // Converge implements HostConverger.
 func (f *fakeHost) Converge(context.Context) error {

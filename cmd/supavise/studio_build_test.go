@@ -13,8 +13,10 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/klauspost/compress/zstd"
 
@@ -22,6 +24,7 @@ import (
 	"github.com/supavise/supavise/internal/config"
 	"github.com/supavise/supavise/internal/fleet"
 	"github.com/supavise/supavise/internal/nodeupgrade"
+	"github.com/supavise/supavise/internal/notice"
 	"github.com/supavise/supavise/internal/selfupdate"
 	"github.com/supavise/supavise/internal/units"
 	"github.com/supavise/supavise/internal/versions"
@@ -219,7 +222,10 @@ func TestStudioSetupFetchesTheBuildOfItsOwnRelease(t *testing.T) {
 	var envs [][]string
 	var out bytes.Buffer
 	s := &studioSetup{cfg: cfg, cfgPath: cfgPath, out: &out, errw: &out,
-		fetch: func(_ context.Context, env []string) error {
+		fetch: func(ctx context.Context, env []string) error {
+			if d, ok := ctx.Deadline(); !ok || time.Until(d) > studioStepTimeout {
+				t.Errorf("the Studio step has no deadline of %s: %v %v", studioStepTimeout, d, ok)
+			}
 			envs = append(envs, env)
 			if env == nil {
 				return errors.New("studio.artifact_url names the Studio build " + tag + "-p2")
@@ -241,6 +247,10 @@ func TestStudioSetupFetchesTheBuildOfItsOwnRelease(t *testing.T) {
 	if got := studioConfigOf(t, cfgPath); got.ArtifactURL != url || got.ArtifactSHA256 != sha {
 		t.Fatalf("config studio = %+v", got)
 	}
+	// Converge restarts nothing, and says what does.
+	if !strings.Contains(out.String(), "Studio runs it once supavise.service restarts") {
+		t.Errorf("no word of the restart:\n%s", out.String())
+	}
 
 	// Without a release to ask, Studio stays as it is and config.toml too.
 	cfg, cfgPath = studioNode(t, oldURL, strings.Repeat("a", 64))
@@ -250,7 +260,7 @@ func TestStudioSetupFetchesTheBuildOfItsOwnRelease(t *testing.T) {
 		fetch:   func(context.Context, []string) error { return errors.New("stale") },
 		release: func(context.Context, string, string) (string, string, error) { return "", "", errors.New("offline") }}
 	s.run(context.Background())
-	if !strings.Contains(out.String(), "keeps running the build it ran") || studioConfigOf(t, cfgPath).ArtifactURL != oldURL {
+	if !strings.Contains(out.String(), "keeps running the build it ran") || !strings.Contains(out.String(), "`sudo supavise upgrade` installs it") || studioConfigOf(t, cfgPath).ArtifactURL != oldURL {
 		t.Fatalf("output %s, config %+v", out.String(), studioConfigOf(t, cfgPath))
 	}
 }
@@ -345,5 +355,233 @@ func TestArtifactsFetchStudioAlone(t *testing.T) {
 	_, _, build := pinned(t)
 	if got := strings.TrimSpace(out.String()); got != fmt.Sprintf("%-12s %s", config.SvcStudio, cfg.Paths().Artifact(config.SvcStudio, build)) {
 		t.Fatalf("output %q", got)
+	}
+}
+
+// A run on the installed release whose Studio is behind it (a self-update whose converge could not
+// fetch the build): no binary is staged, so the installed binary fetches the build from the signed
+// list of the release Resolve verified, and the daemon restarts so that it runs it.
+func TestSameReleaseStudioMoveFetchesAndRestarts(t *testing.T) {
+	_, tag, build := pinned(t)
+	bin := filepath.Join(t.TempDir(), "supavise")
+	record := bin + ".calls"
+	script := "#!/bin/sh\necho \"$* url=$SUPAVISE_STUDIO_ARTIFACT_URL sha=$SUPAVISE_STUDIO_ARTIFACT_SHA256\" >>" + record + "\n"
+	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	h, out, restarts := stubHost(bin)
+	h.cfg.StateDir = t.TempDir()
+	own, err := nodeupgrade.OwnInfo("v0.2.1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	n := &nodeupgrade.Node{Version: "v0.2.1", Platform: "linux-amd64", BinaryInfo: own, Pins: map[string]string{}}
+	for svc, pin := range own.Pins {
+		n.Pins[svc] = pin
+	}
+	n.Pins[config.SvcStudio] = tag
+	p := nodeupgrade.BuildPlan(n, own, nodeupgrade.PlanOptions{Canary: 1, Batch: 5})
+	if m, ok := moved(p.Shared, config.SvcStudio); p.BinaryChange || !ok || m.To != build || len(p.System) != 0 {
+		t.Fatalf("plan: binary change %v, shared %+v, system %+v", p.BinaryChange, p.Shared, p.System)
+	}
+	var url, sha string
+	h.release, url, sha = studioSums(build, "linux-amd64")
+	if err := h.Prefetch(context.Background(), &nodeupgrade.Staged{Info: own}, n, p); err != nil {
+		t.Fatalf("prefetch: %v\n%s", err, out)
+	}
+	if got := calls(t, record); !strings.HasSuffix(got, "artifacts fetch --studio url="+url+" sha="+sha) {
+		t.Fatalf("prefetch ran %q", got)
+	}
+
+	// A resolved release that is not the installed one, or that lists another build, gives no
+	// archive: the installed binary still fetches, from the build on disk and config.toml.
+	for _, rel := range []string{"v0.2.2", "other build"} {
+		_ = os.Remove(record)
+		h.release, _, _ = studioSums(build, "linux-amd64")
+		if rel == "v0.2.2" {
+			h.release.Release.Tag = rel
+		} else {
+			h.release, _, _ = studioSums(tag+"-p9", "linux-amd64")
+		}
+		if err := h.Prefetch(context.Background(), &nodeupgrade.Staged{Info: own}, n, p); err != nil {
+			t.Fatal(err)
+		}
+		if got := calls(t, record); !strings.HasSuffix(got, "artifacts fetch --studio url= sha=") {
+			t.Fatalf("%s: prefetch ran %q", rel, got)
+		}
+	}
+
+	_ = os.Remove(record)
+	if err := h.RestartDaemon(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := calls(t, record); !strings.HasPrefix(got, "system install-units") || *restarts != 1 {
+		t.Fatalf("restart ran %q, restarts %d", got, *restarts)
+	}
+}
+
+// A follower parks Studio (its daemon renders the unit for the build and keeps it stopped), so the
+// wait for a Studio move ends once the unit is set to run the new build; it does not wait for a
+// Studio that a follower never runs.
+func TestFollowerWaitForAParkedStudioEndsWhenItIsRendered(t *testing.T) {
+	_, tag, build := pinned(t)
+	cfg := config.Default()
+	cfg.StateDir = t.TempDir()
+	renderStudio(t, cfg, build)
+	h := &nodeHost{cfg: cfg, follower: true}
+	// No supervisor and no fleet manager: a parked service is not asked whether it runs.
+	if err := h.waitService(context.Background(), nil, nil, nodeupgrade.ServiceMove{Service: config.SvcStudio, From: tag, To: build}); err != nil {
+		t.Fatal(err)
+	}
+	if !fleet.Parked(true, config.SvcStudio) || fleet.Parked(true, config.SvcSupavisor) || fleet.Parked(false, config.SvcStudio) {
+		t.Fatal("a follower parks Studio and runs Supavisor; a leader parks nothing")
+	}
+}
+
+// studioRefused is an artifact store whose Studio fetch is refused (config.toml names an older
+// build and the pinned one is not on disk) and whose other fetches succeed.
+type studioRefused struct{ fetched []string }
+
+func (a *studioRefused) Dir(svc string) (string, error) { return "/artifacts/" + svc, nil }
+func (a *studioRefused) Tag(svc string) (string, error) { return "v1", nil }
+func (a *studioRefused) Fetch(_ context.Context, svc string) (string, error) {
+	if svc == config.SvcStudio {
+		return "", errors.New("studio.artifact_url names the Studio build 2026.10.05-sha-94b8b06-p2")
+	}
+	a.fetched = append(a.fetched, svc)
+	return "/artifacts/" + svc, nil
+}
+
+// A Studio build that cannot be fetched does not stop `fleet start` on a node whose Studio runs a
+// build already: Studio keeps it, and the other services start. On a node that runs no Studio yet
+// (an install), it still stops fleet start.
+func TestFleetStartKeepsARunningStudioWhoseBuildCannotBeFetched(t *testing.T) {
+	_, tag, _ := pinned(t)
+	cfg := config.Default()
+	cfg.StateDir = t.TempDir()
+	cfg.Studio.ArtifactURL = "https://h/" + artifacts.StudioAsset(tag+"-p2", "linux-amd64")
+	var errw bytes.Buffer
+	if _, err := fetchFleet(context.Background(), &studioRefused{}, cfg, nil, &errw); err == nil || !strings.Contains(err.Error(), "fetch studio") {
+		t.Fatalf("an install without its Studio build: %v", err)
+	}
+	renderStudio(t, cfg, tag)
+	a := &studioRefused{}
+	skip, err := fetchFleet(context.Background(), a, cfg, nil, &errw)
+	if err != nil || !slices.Contains(skip, config.SvcStudio) || len(a.fetched) != len(fleet.ServicesFor(cfg))-1 {
+		t.Fatalf("skip %v, fetched %v, %v", skip, a.fetched, err)
+	}
+	if !strings.Contains(errw.String(), "Studio keeps running the build "+tag) {
+		t.Errorf("warning: %s", errw.String())
+	}
+
+	// The seeding of a follower fetches the rest and warns about Studio.
+	b := &studioRefused{}
+	var warned error
+	if err := fetchStandby(context.Background(), b, []string{config.SvcPostgres, config.SvcStudio, config.SvcStorage}, func(err error) { warned = err }); err != nil || warned == nil {
+		t.Fatalf("%v, warned %v", err, warned)
+	}
+	if strings.Join(b.fetched, ",") != config.SvcPostgres+","+config.SvcStorage {
+		t.Fatalf("fetched %v", b.fetched)
+	}
+}
+
+// `supavise status` says when Studio runs a build other than the pinned one, and is silent when it
+// runs the pinned build, on a node without a dashboard and while an upgrade runs.
+func TestStatusSaysStudioIsBehind(t *testing.T) {
+	_, tag, build := pinned(t)
+	cfg := config.Default()
+	cfg.StateDir = t.TempDir()
+	cfg.Studio.ArtifactURL = "https://h/" + artifacts.StudioAsset(build, "linux-amd64")
+	now := time.Now()
+	if b := studioStatus(cfg, now); b != nil {
+		t.Fatalf("no Studio rendered: %+v", b)
+	}
+	renderStudio(t, cfg, tag)
+	b := studioStatus(cfg, now)
+	if b == nil || b.Runs != tag || b.Pinned != build {
+		t.Fatalf("block = %+v", b)
+	}
+	var out bytes.Buffer
+	statusSections{Studio: b}.render(&out)
+	if !strings.Contains(out.String(), "studio  runs the build "+tag+" and this release pins "+build) || !strings.Contains(out.String(), "sudo supavise upgrade") {
+		t.Fatalf("rendered:\n%s", out.String())
+	}
+	if err := notice.WriteUpgrade(cfg.Paths(), notice.Upgrade{PID: os.Getpid(), Phase: "services", StartedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	if b := studioStatus(cfg, now); b != nil {
+		t.Fatalf("during an upgrade: %+v", b)
+	}
+	if err := notice.WriteUpgrade(cfg.Paths(), notice.Upgrade{Phase: "succeeded", StartedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	renderStudio(t, cfg, build)
+	if b := studioStatus(cfg, now); b != nil {
+		t.Fatalf("on the pinned build: %+v", b)
+	}
+	cfg.Studio.ArtifactURL = ""
+	renderStudio(t, cfg, tag)
+	if b := studioStatus(cfg, now); b != nil {
+		t.Fatalf("no dashboard: %+v", b)
+	}
+}
+
+// Converge edits [studio] artifact_url and artifact_sha256 in place: comments, explicit settings
+// equal to a default and the layout stay byte for byte. It edits them only when the URL names a
+// release asset of another build.
+func TestSyncStudioConfigEditsOnlyTheStudioKeys(t *testing.T) {
+	_, tag, build := pinned(t)
+	oldURL := "https://h/" + artifacts.StudioAsset(tag+"-p2", "linux-amd64")
+	newURL := "https://github.com/supavise/supavise/releases/download/v0.2.1/" + artifacts.StudioAsset(build, "linux-amd64")
+	cfg := config.Default()
+	cfg.StateDir = t.TempDir()
+	installBuild(t, cfg, build, newURL, strings.Repeat("b", 64))
+	dir := cfg.Paths().Artifact(config.SvcStudio, build)
+	cfgPath := filepath.Join(t.TempDir(), "config.toml")
+	write := func(body string) {
+		t.Helper()
+		if err := os.WriteFile(cfgPath, []byte(body), 0o640); err != nil {
+			t.Fatal(err)
+		}
+	}
+	read := func() string { b, _ := os.ReadFile(cfgPath); return string(b) }
+	head := "# Written by `supavise install`; edit freely.\nstate_dir = '" + cfg.StateDir + "'\nplatform = 'linux-amd64'\n\n[tls]\nmode = 'auto' # the default, on purpose\n\n"
+	body := head + "[studio] # the dashboard\n# where the build comes from\nartifact_url = '" + oldURL + "'   # set by install\nartifact_sha256 = '" + strings.Repeat("a", 64) + "'\n"
+	write(body)
+	var out bytes.Buffer
+	if changed, err := syncStudioConfig(cfgPath, dir, &out); err != nil || !changed {
+		t.Fatalf("%v, %v", changed, err)
+	}
+	want := head + "[studio] # the dashboard\n# where the build comes from\nartifact_url = \"" + newURL + "\"   # set by install\nartifact_sha256 = \"" + strings.Repeat("b", 64) + "\"\n"
+	if got := read(); got != want {
+		t.Fatalf("config.toml:\n%s\nwant:\n%s", got, want)
+	}
+	if fi, _ := os.Stat(cfgPath); fi.Mode().Perm() != 0o640 {
+		t.Errorf("mode %v", fi.Mode().Perm())
+	}
+
+	// A digest missing from the table is added below its header.
+	write(head + "[studio]\nartifact_url = \"" + oldURL + "\"\n")
+	if changed, err := syncStudioConfig(cfgPath, dir, &out); err != nil || !changed {
+		t.Fatalf("%v, %v", changed, err)
+	}
+	if got := studioConfigOf(t, cfgPath); got.ArtifactURL != newURL || got.ArtifactSHA256 != strings.Repeat("b", 64) {
+		t.Fatalf("config studio = %+v\n%s", got, read())
+	}
+
+	// Left alone: a mirror of the installed build, and a URL that names no build.
+	for _, url := range []string{"https://mirror.example/" + artifacts.StudioAsset(build, "linux-amd64"), "https://h/my-studio.tar.zst"} {
+		b := head + "[studio]\nartifact_url = '" + url + "'\nartifact_sha256 = '" + strings.Repeat("d", 64) + "'\n"
+		write(b)
+		if changed, err := syncStudioConfig(cfgPath, dir, &out); err != nil || changed || read() != b {
+			t.Fatalf("%s: %v, %v\n%s", url, changed, err, read())
+		}
+	}
+
+	// Keys the edit cannot place are not edited; the error says what to set.
+	b := "studio.artifact_url = '" + oldURL + "'\nstudio.artifact_sha256 = '" + strings.Repeat("a", 64) + "'\n" + head
+	write(b)
+	if changed, err := syncStudioConfig(cfgPath, dir, &out); err == nil || changed || read() != b || !strings.Contains(err.Error(), newURL) {
+		t.Fatalf("dotted keys: %v, %v\n%s", changed, err, read())
 	}
 }

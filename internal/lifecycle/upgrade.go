@@ -13,6 +13,7 @@ import (
 
 	"github.com/supavise/supavise/internal/artifacts"
 	"github.com/supavise/supavise/internal/config"
+	"github.com/supavise/supavise/internal/fleet"
 	"github.com/supavise/supavise/internal/registry"
 	"github.com/supavise/supavise/internal/secrets"
 )
@@ -1104,8 +1105,8 @@ func (e *Engine) recoverUpgrade(ctx context.Context, ref string) (touched bool) 
 }
 
 // CollectArtifacts removes the artifacts that nothing references: not the node's pins, not those
-// of the last keepReleases releases the node ran, and not any version a project runs or is being
-// upgraded to. keep names more versions to keep, by service (the pins of the binaries `supavise
+// of the last keepReleases releases the node ran, not any version a project runs or is being
+// upgraded to, and not the one a shared service's unit runs. keep names more versions to keep, by service (the pins of the binaries `supavise
 // rollback` can go back to: a daemon that did not record its pins leaves no history). dryRun lists
 // them only. The artifact store must be an *artifacts.Store.
 func (e *Engine) CollectArtifacts(ctx context.Context, keepReleases int, dryRun bool, keep ...map[string]string) ([]artifacts.Unused, error) {
@@ -1134,6 +1135,18 @@ func (e *Engine) CollectArtifacts(ctx context.Context, keepReleases int, dryRun 
 		if u, err := store.LatestUpgrade(ctx, ps[i].Ref); err == nil && u.Status == registry.UpgradeRunning {
 			used = append(used, u.To)
 		}
+	}
+	// The releases the shared services' units run. They are the pins, except while a service is
+	// behind its pin (a Studio build that converge could not fetch after a self-update): its unit
+	// runs the one before, which is not garbage until it stops running it.
+	rendered := map[string]string{}
+	for _, svc := range fleet.ServicesFor(e.cfg) {
+		if tag, err := fleet.RenderedTag(e.cfg, svc); err == nil {
+			rendered[svc] = tag
+		}
+	}
+	if len(rendered) > 0 {
+		used = append(used, rendered)
 	}
 	keepSet, err := st.KeepSet(keepReleases, append(used, keep...))
 	if err != nil {

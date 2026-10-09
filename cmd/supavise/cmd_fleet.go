@@ -57,16 +57,9 @@ when no artifact is installed and [studio] artifact_url is not set.`,
 			defer n.Close()
 			skip := fleetSkip
 			if !fleetNoFetch {
-				if s, ok := n.Artifacts.(interface {
-					Fetch(context.Context, string) (string, error)
-				}); ok {
-					for _, svc := range fleet.ServicesFor(cfg) {
-						if slices.Contains(skip, svc) || (svc == config.SvcStudio && cfg.Studio.ArtifactURL == "") {
-							continue
-						}
-						if _, err := s.Fetch(cmd.Context(), svc); err != nil {
-							return fmt.Errorf("fetch %s: %w", svc, err)
-						}
+				if s, ok := n.Artifacts.(fetcher); ok {
+					if skip, err = fetchFleet(cmd.Context(), s, cfg, skip, cmd.ErrOrStderr()); err != nil {
+						return err
 					}
 				}
 			}
@@ -267,4 +260,33 @@ func serviceNames(f fleet.Fleet) string {
 		s = append(s, t.Service())
 	}
 	return strings.Join(s, ", ")
+}
+
+// fetcher is an artifact store that downloads.
+type fetcher interface {
+	Fetch(context.Context, string) (string, error)
+}
+
+// fetchFleet fetches the artifact of every shared service fleet start starts, and returns skip with
+// Studio added when its build could not be fetched on a node whose Studio runs a build already: that
+// Studio keeps running the build it runs, as the daemon keeps it when it cannot fetch the build
+// either, and the other services start. Any other failure, Studio's on a node that runs no Studio
+// yet (an install) included, stops fleet start.
+func fetchFleet(ctx context.Context, s fetcher, cfg *config.Config, skip []string, errw io.Writer) ([]string, error) {
+	for _, svc := range fleet.ServicesFor(cfg) {
+		if slices.Contains(skip, svc) || (svc == config.SvcStudio && cfg.Studio.ArtifactURL == "") {
+			continue
+		}
+		if _, err := s.Fetch(ctx, svc); err != nil {
+			if svc == config.SvcStudio {
+				if runs, rerr := fleet.RenderedTag(cfg, svc); rerr == nil {
+					fmt.Fprintf(errw, "warning: studio: %v; Studio keeps running the build %s (`sudo supavise upgrade` installs the pinned build)\n", err, runs)
+					skip = append(skip[:len(skip):len(skip)], svc)
+					continue
+				}
+			}
+			return skip, fmt.Errorf("fetch %s: %w", svc, err)
+		}
+	}
+	return skip, nil
 }

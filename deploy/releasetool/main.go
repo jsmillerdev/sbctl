@@ -4,7 +4,7 @@
 // .github/workflows/bump-proposals.yml call it; it reads and writes files, runs a built binary's
 // release-info when the manifest is given one, and never touches the network.
 //
-//	releasetool manifest -version v1.4.0 -min-upgrade-from v1.2.0 [-min-peer-from v1.3.0] [-wal-compat=false] [-versions FILE] [-patchset FILE] [-binary FILE [-require-converge]] [-template FILE] [-out FILE]
+//	releasetool manifest -version v1.4.0 -min-upgrade-from v1.2.0 [-min-peer-from v1.3.0] [-wal-compat=false] [-versions FILE] [-patchset FILE] [-dist DIR] [-binary FILE [-require-converge]] [-template FILE] [-out FILE]
 //	releasetool notes    -tag v1.4.0 [-prev-tag v1.3.0] -repo owner/name -new FILE [-old FILE] [-log FILE] [-min-upgrade-from v1.2.0]
 //	releasetool bump     -versions FILE -service auth -to auth-v2.196.0-r0
 //	releasetool table    -old FILE -new FILE        (the service version table alone, for a pull request)
@@ -14,6 +14,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -79,6 +80,7 @@ func cmdManifest(args []string) error {
 	minPeer := fs.String("min-peer-from", "", "the oldest release a joined server may run alongside this one (min_peer_from; empty leaves the field out)")
 	walCompat := fs.Bool("wal-compat", true, "false when this release's PostgreSQL cannot read the WAL of the releases before it, so that the servers holding standbys must upgrade first (wal_compat)")
 	patchset := fs.String("patchset", "", "studio/PATCHSET of the tree the Studio archives were built from: it must equal studio.patchset in -versions (empty skips the check)")
+	dist := fs.String("dist", "", "the directory of the release's assets: every Studio archive in it must be the build -versions pins (empty skips the check)")
 	out := fs.String("out", "-", "output file")
 	_ = fs.Parse(args)
 	v, err := readVersions(*versions)
@@ -87,6 +89,11 @@ func cmdManifest(args []string) error {
 	}
 	if *patchset != "" {
 		if err := checkPatchset(*patchset, v); err != nil {
+			return err
+		}
+	}
+	if *dist != "" {
+		if err := checkStudioAssets(*dist, v); err != nil {
 			return err
 		}
 	}
@@ -144,6 +151,28 @@ func checkPatchset(path string, v *artifacts.Versions) error {
 	}
 	if n != v.Studio.Patchset {
 		return fmt.Errorf("%s says patch set %d and versions.yaml studio.patchset says %d: the release would ship Studio archives of one build and a binary that runs another; change them together", path, n, v.Studio.Patchset)
+	}
+	return nil
+}
+
+// checkStudioAssets refuses a release directory that holds a Studio archive of a build other than
+// the one v pins. The signed list covers every archive in it, and a reader takes the first Studio
+// line for its platform, so a stale or extra archive would be handed to nodes as the release's.
+func checkStudioAssets(dir string, v *artifacts.Versions) error {
+	names, err := filepath.Glob(filepath.Join(dir, "supavise-studio-*"))
+	if err != nil {
+		return err
+	}
+	build := v.StudioBuild()
+	for _, path := range names {
+		name := filepath.Base(path)
+		arch, ok := strings.CutPrefix(name, "supavise-studio-"+build+"-linux-")
+		if ok {
+			arch, ok = strings.CutSuffix(arch, ".tar.zst")
+		}
+		if !ok || name != artifacts.StudioAsset(build, "linux-"+arch) || strings.ContainsAny(arch, "-.") || arch == "" {
+			return fmt.Errorf("%s holds %s, and this release pins the Studio build %s (supavise-studio-%s-linux-<arch>.tar.zst): remove the archive of the other build", dir, name, build, build)
+		}
 	}
 	return nil
 }

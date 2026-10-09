@@ -16,6 +16,7 @@ import (
 	"github.com/supavise/supavise/internal/fleet"
 	"github.com/supavise/supavise/internal/registry"
 	"github.com/supavise/supavise/internal/secrets"
+	"github.com/supavise/supavise/internal/units"
 )
 
 // tagArts is an artifact store whose pins a test can move, like a node update does.
@@ -902,6 +903,43 @@ func TestCollectArtifactsKeepsWhatProjectsRun(t *testing.T) {
 		To: map[string]string{config.SvcGoTrue: oldAuth}, Status: registry.UpgradeRunning})
 	if gone, err = e.CollectArtifacts(ctx, 1, true); err != nil || len(gone) != 0 {
 		t.Fatalf("dry run during an upgrade = %+v, %v", gone, err)
+	}
+}
+
+// The Studio build a unit still runs is not garbage while the binary pins a newer one: a converge
+// that could not fetch the pinned build after a self-update leaves Studio on the build before, and
+// its launcher names that directory until the daemon restarts Studio on the pinned one.
+func TestCollectArtifactsKeepsTheBuildTheStudioUnitRuns(t *testing.T) {
+	cfg := config.Default()
+	cfg.StateDir = shortTempDir(t)
+	cfg.Domain = "example.test"
+	const tag = "2026.10.05-sha-94b8b06"
+	v := &artifacts.Versions{Artifacts: map[string]string{"postgres": oldPG, "auth": newAuth, "postgrest": "postgrest-v16.4-r0"}}
+	v.Studio.Tag, v.Studio.Patchset = tag, 3
+	st, err := artifacts.New(cfg, artifacts.WithVersions(v))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, d := range []string{"postgres/" + oldPG, "auth/" + newAuth, "postgrest/postgrest-v16.4-r0", "studio/" + tag, "studio/" + tag + "-p3", "studio/2026.10.01-sha-aaaaaaa"} {
+		if err := os.MkdirAll(filepath.Join(cfg.Paths().Artifacts(), d), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	run := units.FilesFor(cfg, units.Spec{Service: config.SvcStudio}).Run
+	if err := os.MkdirAll(filepath.Dir(run), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(run, []byte("#!/bin/sh\nexec '"+cfg.Paths().Artifact(config.SvcStudio, tag)+"/bin/studio'\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := fleet.RenderedTag(cfg, config.SvcStudio); err != nil || got != tag {
+		t.Fatalf("rendered %q, %v", got, err)
+	}
+	sec, _ := secrets.New(make([]byte, 32))
+	e := NewEngine(cfg, registry.NewMemory(), sec, st, newFakePlane(), Options{})
+	gone, err := e.CollectArtifacts(context.Background(), 1, true)
+	if err != nil || len(gone) != 1 || gone[0].Tag != "2026.10.01-sha-aaaaaaa" {
+		t.Fatalf("would remove %+v, %v: only the build nothing pins or runs", gone, err)
 	}
 }
 

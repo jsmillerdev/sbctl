@@ -499,6 +499,50 @@ echo '{"version":"v1.1.0","converge_revision":1,"pins":{"studio":"2026.10.12-sha
 	}
 }
 
+// The release job refuses a release directory with a Studio archive of another build: the signed
+// list would hand it to nodes as the release's Studio.
+func TestManifestRefusesAStudioArchiveOfAnotherBuild(t *testing.T) {
+	dir := t.TempDir()
+	withPatchset := strings.Replace(newYAML, "  tag: 2026.10.12-sha-abcdef1\n", "  tag: 2026.10.12-sha-abcdef1\n  patchset: 3\n", 1)
+	vf := filepath.Join(dir, "versions.yaml")
+	if err := os.WriteFile(vf, []byte(withPatchset), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	dist := filepath.Join(dir, "dist")
+	if err := os.Mkdir(dist, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	put := func(name string) {
+		if err := os.WriteFile(filepath.Join(dist, name), []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	out := filepath.Join(dir, "m.json")
+	manifest := func() error {
+		return cmdManifest([]string{"-version", "v1.1.0", "-min-upgrade-from", "v1.0.0", "-versions", vf, "-dist", dist, "-out", out})
+	}
+	if err := manifest(); err != nil {
+		t.Fatalf("no Studio archive: %v", err)
+	}
+	put("supavise-studio-2026.10.12-sha-abcdef1-p3-linux-amd64.tar.zst")
+	put("supavise-studio-2026.10.12-sha-abcdef1-p3-linux-arm64.tar.zst")
+	put("supavise-linux-amd64")
+	if err := manifest(); err != nil {
+		t.Fatalf("the pinned build for both platforms: %v", err)
+	}
+	for _, stray := range []string{
+		"supavise-studio-2026.10.12-sha-abcdef1-p2-linux-amd64.tar.zst", // the build before
+		"supavise-studio-2026.10.12-sha-abcdef1-linux-amd64.tar.zst",    // the tag alone
+		"supavise-studio-2026.10.12-sha-abcdef1-p3-linux-amd64.tar.zst.part",
+	} {
+		put(stray)
+		if err := manifest(); err == nil || !strings.Contains(err.Error(), stray) {
+			t.Errorf("%s: %v", stray, err)
+		}
+		os.Remove(filepath.Join(dist, stray))
+	}
+}
+
 // A release that changes only the patch set lists Studio as moved, linked to its upstream commit
 // and without a comparison of a commit with itself.
 func TestNotesListAPatchsetOnlyStudioChange(t *testing.T) {

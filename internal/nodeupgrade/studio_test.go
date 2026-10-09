@@ -2,6 +2,7 @@ package nodeupgrade
 
 import (
 	"bytes"
+	"context"
 	"strings"
 	"testing"
 
@@ -80,5 +81,64 @@ func TestCheckManifestPinsComparesTheStudioBuild(t *testing.T) {
 	old := &Info{Version: "v0.2.0", Pins: PinsOf(before)}
 	if err := CheckManifestPins(old, before.Artifacts, before.StudioBuild()); err != nil || before.StudioBuild() != "2026.10.05-sha-94b8b06" {
 		t.Fatalf("a release before the patch set: %v", err)
+	}
+}
+
+// sameReleaseStudioBehind is a node whose installed binary is the release asked for and pins a
+// Studio build its unit does not run yet: `supavise self-update` swapped the binary and its
+// converge could not fetch the build, so Studio kept running the one before.
+func sameReleaseStudioBehind() *fakeHost {
+	h := newFakeHost()
+	h.tag = "v1.1.0"
+	h.node.Version = "v1.1.0"
+	h.info.Pins[config.SvcStudio] = "2026.10.05-sha-94b8b06-p3"
+	h.node.BinaryInfo = h.info
+	h.node.Pins = newPins()
+	h.node.Pins[config.SvcStudio] = "2026.10.05-sha-94b8b06"
+	for i := range h.node.Projects {
+		if h.node.Projects[i].Ref != "system" {
+			h.node.Projects[i].Versions = map[string]string{"gotrue": authNew, "postgrest": restNew, "postgres": pgOld}
+		}
+	}
+	return h
+}
+
+// The run on the installed release moves Studio: no binary is swapped, so it restarts the daemon,
+// which renders Studio from the new build, before it waits for Studio. Without the restart nothing
+// moves Studio and the wait fails after its six minutes.
+func TestSameReleaseStudioMoveRestartsTheDaemon(t *testing.T) {
+	h := sameReleaseStudioBehind()
+	p := BuildPlan(h.node, h.node.BinaryInfo, PlanOptions{Canary: 1, Batch: 5})
+	if p.BinaryChange || moveNames(p.Shared) != config.SvcStudio || p.Rollout() {
+		t.Fatalf("plan: binary change %v, shared %q, rollout %v", p.BinaryChange, moveNames(p.Shared), p.Rollout())
+	}
+	var plan bytes.Buffer
+	p.Render(&plan)
+	mustContain(t, plan.String(), "supavise.service, the daemon")
+	if err := Run(context.Background(), h, runOpts(h)); err != nil {
+		t.Fatalf("%v\n%s", err, h.out)
+	}
+	order := h.order()
+	if h.has("install") || h.has("stage") || !h.has("prefetch") {
+		t.Fatalf("calls: %s", order)
+	}
+	if i, j := strings.Index(order, "restart-daemon"), strings.Index(order, "wait studio"); i < 0 || j < i {
+		t.Fatalf("the daemon did not restart before the wait: %s", order)
+	}
+
+	// A daemon that does not come back cannot be put back by a rollback either: exit 4, no wait.
+	h = sameReleaseStudioBehind()
+	h.restartErr = errBoom
+	err := Run(context.Background(), h, runOpts(h))
+	if code(t, err) != ExitNeedsOperator || h.has("wait") {
+		t.Fatalf("err = %v, calls %s", err, h.order())
+	}
+
+	// A run that moves nothing restarts nothing.
+	h = sameReleaseStudioBehind()
+	h.node.Pins = newPins()
+	h.node.Pins[config.SvcStudio] = h.info.Pins[config.SvcStudio]
+	if err := Run(context.Background(), h, runOpts(h)); err != nil || h.has("restart-daemon") {
+		t.Fatalf("err = %v, calls %s", err, h.order())
 	}
 }

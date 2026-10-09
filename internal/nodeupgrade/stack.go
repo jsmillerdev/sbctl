@@ -52,6 +52,16 @@ type HostConverger interface {
 	Converge(ctx context.Context) error
 }
 
+// DaemonRestarter is the optional Host capability that renders the units with the installed binary
+// and restarts the daemon, for a run that swaps no binary but has services to move: the installed
+// release pins a service that its unit does not run yet (a Studio build that `system converge` could
+// not fetch after `supavise self-update`, say). The daemon renders and moves the services when it
+// starts, so without a restart nothing would move them and the wait for them could only fail. When
+// the binary changes, Install restarts the daemon.
+type DaemonRestarter interface {
+	RestartDaemon(ctx context.Context) error
+}
+
 // stackStep runs the stack update for --aws, before anything on the node changes. It returns the
 // command to print at the end when the update could not run, and a Failure (exit status 2: the node
 // is unchanged) when the script refused or failed.

@@ -311,7 +311,9 @@ func short(svc, tag string) string {
 
 // describe fills Restarts, Impact and Notes.
 func (p *Plan) describe() {
-	if p.BinaryChange {
+	// A new binary restarts the daemon, and so does a run on the installed release whose services are
+	// behind it: the daemon moves them when it starts.
+	if p.BinaryChange || len(p.System) > 0 || len(p.Shared) > 0 {
 		p.Restarts = append(p.Restarts, "supavise.service, the daemon with the HTTPS proxy and the Management API")
 		p.Impact = append(p.Impact, "HTTPS requests fail for a few seconds while the daemon restarts; the projects' databases and services keep running unless the new release renders their files differently (see the notes)")
 	}

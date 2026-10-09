@@ -110,6 +110,10 @@ func (m *Manager) park(ctx context.Context, spec units.Spec) error {
 // isCold reports whether svc is parked on a follower.
 func isCold(follower bool, svc string) bool { return follower && svc != config.SvcSupavisor }
 
+// Parked reports whether the daemon of a follower parks the shared service svc: it renders the
+// unit for the release it runs and keeps it stopped, every service but Supavisor (Start).
+func Parked(follower bool, svc string) bool { return isCold(follower, svc) }
+
 func modeOf(follower bool) Mode {
 	if follower {
 		return ModeFollower
