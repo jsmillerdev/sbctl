@@ -491,7 +491,10 @@ func TestRestartInterruptedByShutdownRaisesNothing(t *testing.T) {
 	if err := <-done; !errors.Is(err, context.Canceled) {
 		t.Fatalf("Run = %v", err)
 	}
-	if got := e.replica(refA, "n2").Status; got != statusRestart {
+	// The restart is not recorded as failed. The row is still marked as restarting, or healthy: a pass of the
+	// controller that runs between the end of the restart call and the end of Run sees a fresh, healthy
+	// observation and closes the restart, which is what it does after a restart that worked.
+	if got := e.replica(refA, "n2").Status; got != statusRestart && got != statusHealthy {
 		t.Fatalf("status %s", got)
 	}
 	if e.alerts.count(alerts.KindReplicaUnhealthy, false) != 0 {
