@@ -27,6 +27,8 @@ import (
 	"github.com/aws/smithy-go/middleware"
 	smithyhttp "github.com/aws/smithy-go/transport/http"
 	"golang.org/x/sync/errgroup"
+
+	"github.com/supavise/supavise/internal/s3util"
 )
 
 const (
@@ -37,7 +39,6 @@ const (
 	bigPartSize     = 64 << 20
 	uploadParallel  = 3
 	deleteBatchSize = 1000
-	s3Attempts      = 5
 )
 
 // S3Options configures NewS3Store.
@@ -68,7 +69,7 @@ type S3Store struct {
 // NewS3Store connects with the AWS SDK default credential chain, or static
 // credentials when given. A custom endpoint without a region uses "us-east-1".
 func NewS3Store(ctx context.Context, o S3Options) (*S3Store, error) {
-	opts := []func(*config.LoadOptions) error{config.WithRetryMaxAttempts(s3Attempts)}
+	opts := []func(*config.LoadOptions) error{config.WithRetryMaxAttempts(s3util.Attempts)}
 	region := o.Region
 	if region == "" {
 		region = firstEnv("AWS_REGION", "AWS_DEFAULT_REGION")
@@ -89,15 +90,7 @@ func NewS3Store(ctx context.Context, o S3Options) (*S3Store, error) {
 	if cfg.Region == "" {
 		return nil, errors.New("backup: s3 region unknown: set backup.s3_region or AWS_REGION")
 	}
-	c := s3.NewFromConfig(cfg, func(so *s3.Options) {
-		if o.Endpoint != "" {
-			so.BaseEndpoint = aws.String(o.Endpoint)
-		}
-		so.UsePathStyle = o.ForcePathStyle
-		// Newer SDKs add CRC32 trailers by default, which many S3-compatible servers reject.
-		so.RequestChecksumCalculation = aws.RequestChecksumCalculationWhenRequired
-		so.ResponseChecksumValidation = aws.ResponseChecksumValidationWhenRequired
-	})
+	c := s3.NewFromConfig(cfg, s3util.ClientOptions(o.Endpoint, o.ForcePathStyle))
 	ps := o.PartSize
 	if ps == 0 {
 		ps = defaultPartSize
@@ -130,26 +123,6 @@ func (s *S3Store) rel(k string) string {
 
 // URL implements Store.
 func (s *S3Store) URL(key string) string { return "s3://" + s.bucket + "/" + s.key(key) }
-
-func isNotFound(err error) bool {
-	var nsk *types.NoSuchKey
-	var nf *types.NotFound
-	if errors.As(err, &nsk) || errors.As(err, &nf) {
-		return true
-	}
-	var re *awshttp.ResponseError
-	if errors.As(err, &re) && re.HTTPStatusCode() == http.StatusNotFound {
-		return true
-	}
-	var ae smithy.APIError
-	if errors.As(err, &ae) {
-		switch ae.ErrorCode() {
-		case "NoSuchKey", "NotFound":
-			return true
-		}
-	}
-	return false
-}
 
 // accessDeniedHint explains the usual cause of a 403 on a key lookup. Without
 // s3:ListBucket, S3 answers 403 instead of 404 for a key that does not exist, so a
@@ -281,7 +254,7 @@ func (s *S3Store) Get(ctx context.Context, key string) (io.ReadCloser, error) {
 	k := s.key(key)
 	out, err := s.c.GetObject(ctx, &s3.GetObjectInput{Bucket: &s.bucket, Key: &k})
 	if err != nil {
-		if isNotFound(err) {
+		if s3util.IsNotFound(err) {
 			return nil, ErrNotFound
 		}
 		return nil, fmt.Errorf("backup: s3 get %s: %w%s", k, err, accessDeniedHint(err))
@@ -297,7 +270,7 @@ func (s *S3Store) Stat(ctx context.Context, key string) (ObjectInfo, error) {
 	k := s.key(key)
 	out, err := s.c.HeadObject(ctx, &s3.HeadObjectInput{Bucket: &s.bucket, Key: &k})
 	if err != nil {
-		if isNotFound(err) {
+		if s3util.IsNotFound(err) {
 			return ObjectInfo{}, ErrNotFound
 		}
 		return ObjectInfo{}, fmt.Errorf("backup: s3 head %s: %w%s", k, err, accessDeniedHint(err))
@@ -315,7 +288,7 @@ func (s *S3Store) GetTagged(ctx context.Context, key string) ([]byte, string, er
 	k := s.key(key)
 	out, err := s.c.GetObject(ctx, &s3.GetObjectInput{Bucket: &s.bucket, Key: &k})
 	if err != nil {
-		if isNotFound(err) {
+		if s3util.IsNotFound(err) {
 			return nil, "", ErrNotFound
 		}
 		return nil, "", fmt.Errorf("backup: s3 get %s: %w%s", k, err, accessDeniedHint(err))

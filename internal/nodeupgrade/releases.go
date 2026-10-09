@@ -13,6 +13,8 @@ import (
 	"regexp"
 	"sort"
 	"time"
+
+	"github.com/supavise/supavise/internal/fsutil"
 )
 
 // Record is what the node keeps about a release it ran: where its binary is and what it pinned.
@@ -127,27 +129,7 @@ func (r Releases) Keep(rec Record, src string) (Record, error) {
 }
 
 func (r Releases) write(d string, rec Record) error {
-	b, err := json.MarshalIndent(rec, "", "  ")
-	if err != nil {
-		return err
-	}
-	tmp, err := os.CreateTemp(d, ".record-*")
-	if err != nil {
-		return err
-	}
-	defer os.Remove(tmp.Name())
-	if _, err := tmp.Write(append(b, '\n')); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Chmod(0o644); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	return os.Rename(tmp.Name(), filepath.Join(d, recordName))
+	return fsutil.WriteJSON(filepath.Join(d, recordName), rec, 0o644, fsutil.Options{})
 }
 
 // Touch marks version as installed now, which makes it the newest record: a rollback to it

@@ -94,68 +94,45 @@ type lazyTenant struct {
 
 func (t lazyTenant) Service() string { return t.svc }
 
-func (t lazyTenant) EnsureTenant(ctx context.Context, spec TenantSpec) error {
+// forward calls do on the real tenant behind t when it implements C. It does nothing when this
+// node never rendered the service's unit, or the real tenant is not a C.
+func forward[C any](ctx context.Context, t lazyTenant, do func(C) error) error {
 	r, err := t.l.tenant(ctx, t.svc)
 	if err != nil || r == nil {
 		return err
 	}
-	return r.EnsureTenant(ctx, spec)
+	if c, ok := r.(C); ok {
+		return do(c)
+	}
+	return nil
+}
+
+func (t lazyTenant) EnsureTenant(ctx context.Context, spec TenantSpec) error {
+	return forward(ctx, t, func(r Tenant) error { return r.EnsureTenant(ctx, spec) })
 }
 
 func (t lazyTenant) RemoveTenant(ctx context.Context, ref string) error {
-	r, err := t.l.tenant(ctx, t.svc)
-	if err != nil || r == nil {
-		return err
-	}
-	return r.RemoveTenant(ctx, ref)
+	return forward(ctx, t, func(r Tenant) error { return r.RemoveTenant(ctx, ref) })
 }
 
 // RefreshTenant implements Refresher for the Supavisor entry; the other two tenants cache
 // nothing about logins.
 func (t lazyTenant) RefreshTenant(ctx context.Context, ref string) error {
-	r, err := t.l.tenant(ctx, t.svc)
-	if err != nil || r == nil {
-		return err
-	}
-	if rf, ok := r.(Refresher); ok {
-		return rf.RefreshTenant(ctx, ref)
-	}
-	return nil
+	return forward(ctx, t, func(r Refresher) error { return r.RefreshTenant(ctx, ref) })
 }
 
 // EnsureReplicaTenant implements ReplicaTenanter for the Supavisor entry; the other two tenants
 // serve no replica.
 func (t lazyTenant) EnsureReplicaTenant(ctx context.Context, spec TenantSpec) error {
-	r, err := t.l.tenant(ctx, t.svc)
-	if err != nil || r == nil {
-		return err
-	}
-	if rt, ok := r.(ReplicaTenanter); ok {
-		return rt.EnsureReplicaTenant(ctx, spec)
-	}
-	return nil
+	return forward(ctx, t, func(r ReplicaTenanter) error { return r.EnsureReplicaTenant(ctx, spec) })
 }
 
 // RemoveReplicaTenant implements ReplicaTenanter for the Supavisor entry.
 func (t lazyTenant) RemoveReplicaTenant(ctx context.Context, identifier string) error {
-	r, err := t.l.tenant(ctx, t.svc)
-	if err != nil || r == nil {
-		return err
-	}
-	if rt, ok := r.(ReplicaTenanter); ok {
-		return rt.RemoveReplicaTenant(ctx, identifier)
-	}
-	return nil
+	return forward(ctx, t, func(r ReplicaTenanter) error { return r.RemoveReplicaTenant(ctx, identifier) })
 }
 
 // QuiesceTenant implements Quiescer for the Realtime entry.
 func (t lazyTenant) QuiesceTenant(ctx context.Context, ref string) error {
-	r, err := t.l.tenant(ctx, t.svc)
-	if err != nil || r == nil {
-		return err
-	}
-	if q, ok := r.(Quiescer); ok {
-		return q.QuiesceTenant(ctx, ref)
-	}
-	return nil
+	return forward(ctx, t, func(q Quiescer) error { return q.QuiesceTenant(ctx, ref) })
 }

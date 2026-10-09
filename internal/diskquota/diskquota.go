@@ -105,7 +105,7 @@ func parseMountInfo(r io.Reader, dir string) (mount, fstype string, opts []strin
 		if len(f) < 6 || len(g) < 3 {
 			continue
 		}
-		mp := unescapeMount(f[4])
+		mp := UnescapeMount(f[4])
 		if !within(mp, dir) || len(mp) < len(mount) {
 			continue
 		}
@@ -123,8 +123,8 @@ func within(mp, dir string) bool {
 	return dir == mp || strings.HasPrefix(dir, mp+"/")
 }
 
-// unescapeMount undoes the octal escapes of mountinfo (a space is \040).
-func unescapeMount(s string) string {
+// UnescapeMount undoes the octal escapes of mountinfo (a space is \040).
+func UnescapeMount(s string) string {
 	if !strings.Contains(s, `\`) {
 		return s
 	}

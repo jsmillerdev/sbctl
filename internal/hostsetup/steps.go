@@ -8,13 +8,14 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"regexp"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/supavise/supavise/deploy/systemd"
+	"github.com/supavise/supavise/internal/diskquota"
+	"github.com/supavise/supavise/internal/fsutil"
 )
 
 // Titles of the steps. They are what a release's host_changes lists and what the upgrade plan
@@ -175,7 +176,7 @@ func directoriesStep(o Options) Step {
 				if fi.Mode().Perm() != 0o750 {
 					todo = append(todo, fmt.Sprintf("%s is mode %04o", dir, fi.Mode().Perm()))
 				}
-				if u, g, ok := ownerOf(fi); ok && (u != uid || g != gid) {
+				if u, g, ok := fsutil.OwnerOf(dir); ok && (u != uid || g != gid) {
 					todo = append(todo, dir+" has another owner")
 				}
 			}
@@ -216,7 +217,7 @@ func directoriesStep(o Options) Step {
 						return out, err
 					}
 				} else {
-					if u, g, ok := ownerOf(fi); ok && (u != uid || g != gid) {
+					if u, g, ok := fsutil.OwnerOf(dir); ok && (u != uid || g != gid) {
 						fixed = true
 					}
 					fixed = fixed || fi.Mode().Perm() != 0o750
@@ -363,18 +364,9 @@ func parseMountPoints(b []byte) []string {
 		if len(f) < 5 {
 			continue
 		}
-		out = append(out, unescapeMount(f[4]))
+		out = append(out, diskquota.UnescapeMount(f[4]))
 	}
 	return out
-}
-
-var octalEscape = regexp.MustCompile(`\\[0-7]{3}`)
-
-func unescapeMount(s string) string {
-	return octalEscape.ReplaceAllStringFunc(s, func(m string) string {
-		n, _ := strconv.ParseUint(m[1:], 8, 8)
-		return string([]byte{byte(n)})
-	})
 }
 
 // onOwnMount reports whether dir is a mount point or lies below one other than the root file

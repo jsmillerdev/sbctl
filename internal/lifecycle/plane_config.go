@@ -7,6 +7,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -202,7 +203,7 @@ func (pl *PostgresPlane) ApplyPostgresSettings(ctx context.Context, p *registry.
 			return false, err
 		}
 		if _, ok := projectconfig.PostgresSchema.Field(n); ok {
-			if _, keep := wanted[n]; !keep && !isCmdline(n) {
+			if _, keep := wanted[n]; !keep && !slices.Contains(cmdlineSettings, n) {
 				stale = append(stale, n)
 			}
 		}
@@ -249,7 +250,7 @@ func (pl *PostgresPlane) ApplyPostgresSettings(ctx context.Context, p *registry.
 	// be asked; the others are compared with their saved values below.
 	var managed []string
 	for _, f := range projectconfig.PostgresSchema.Fields {
-		if !isCmdline(f.Name) {
+		if !slices.Contains(cmdlineSettings, f.Name) {
 			managed = append(managed, f.Name)
 		}
 	}
@@ -273,15 +274,6 @@ func (pl *PostgresPlane) ApplyPostgresSettings(ctx context.Context, p *registry.
 		return false, nil
 	}
 	return pending, nil
-}
-
-func isCmdline(name string) bool {
-	for _, n := range cmdlineSettings {
-		if n == name {
-			return true
-		}
-	}
-	return false
 }
 
 // cmdlinePending reports whether a saved command-line setting is not what the running

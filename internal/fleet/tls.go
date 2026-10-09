@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/supavise/supavise/internal/config"
+	"github.com/supavise/supavise/internal/fsutil"
 )
 
 const (
@@ -77,10 +78,10 @@ func ensureDownstreamCert(cfg *config.Config, now time.Time) (string, error) {
 	}
 	// The key first: a crash between the two writes leaves a pair that does not match, which
 	// validDownstreamCert detects on the next call.
-	if err := writeFileAtomic(key, pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(k)}), 0o600); err != nil {
+	if err := fsutil.WriteFile(key, pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(k)}), 0o600, fsutil.Options{}); err != nil {
 		return "", err
 	}
-	if err := writeFileAtomic(crt, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), 0o640); err != nil {
+	if err := fsutil.WriteFile(crt, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), 0o640, fsutil.Options{}); err != nil {
 		return "", err
 	}
 	sum := sha256.Sum256(der)
@@ -103,25 +104,4 @@ func validDownstreamCert(crtPath, keyPath, host string, now time.Time) (string, 
 	}
 	sum := sha256.Sum256(leaf.Raw)
 	return hex.EncodeToString(sum[:]), true
-}
-
-func writeFileAtomic(path string, data []byte, mode os.FileMode) error {
-	tmp, err := os.CreateTemp(filepath.Dir(path), ".tmp-*")
-	if err != nil {
-		return err
-	}
-	name := tmp.Name()
-	defer os.Remove(name)
-	if _, err := tmp.Write(data); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Chmod(mode); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	return os.Rename(name, path)
 }

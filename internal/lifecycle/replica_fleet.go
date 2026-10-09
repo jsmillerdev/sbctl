@@ -69,7 +69,7 @@ func (e *Engine) restartReplicas(ctx context.Context, p *registry.Project, why, 
 	sem := make(chan struct{}, replicaRestartConcurrency)
 	var wg sync.WaitGroup
 	for _, r := range rs {
-		if r.Status != string(registry.StatusActiveHealthy) && r.Status != string(registry.StatusActiveUnhealthy) {
+		if !registry.Status(r.Status).Running() {
 			continue
 		}
 		sem <- struct{}{}

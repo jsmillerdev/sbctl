@@ -25,16 +25,4 @@ type HomeRouter interface {
 	RoutesByHome()
 }
 
-// The capabilities of a FullPlane that the Engine's files define for themselves.
-type (
-	// ConfigPlane is what Engine.ApplyConfig needs beyond Plane.
-	ConfigPlane = configPlane
-	// RecoverPlane is what ApplyConfig needs to honor ApplyOptions.Recover.
-	RecoverPlane = recoverPlane
-	// RenderChecker renders a service's units from the saved settings without starting anything.
-	RenderChecker = renderChecker
-	// RolePasswordPlane gives a restored cluster the role passwords the registry holds.
-	RolePasswordPlane = rolePasswordPlane
-)
-
 var _ FullPlane = (*PostgresPlane)(nil)

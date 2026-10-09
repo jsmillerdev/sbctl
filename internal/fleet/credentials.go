@@ -22,6 +22,7 @@ import (
 
 	"github.com/supavise/supavise/internal/awsapi"
 	"github.com/supavise/supavise/internal/config"
+	"github.com/supavise/supavise/internal/fsutil"
 )
 
 // supavise-storage cannot use the instance role: IMDS is denied to it, because Storage runs on
@@ -110,7 +111,13 @@ func StorageCredentialToken(cfg *config.Config) (string, error) {
 		return "", fmt.Errorf("fleet: credential token: %w", err)
 	}
 	defer f.Close()
-	chownLikeDir(f, filepath.Dir(path))
+	if os.Geteuid() == 0 {
+		// A token made by a render that was run with sudo can be read by the daemon, which runs as
+		// the unit's user and owns the directory.
+		if uid, gid, ok := fsutil.OwnerOf(filepath.Dir(path)); ok {
+			_ = f.Chown(uid, gid)
+		}
+	}
 	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
 		return "", fmt.Errorf("fleet: credential token: %w", err)
 	}
@@ -139,22 +146,6 @@ func StorageCredentialToken(cfg *config.Config) (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(raw), nil
-}
-
-// chownLikeDir gives f the owner of dir when this process runs as root, so that a token made by a
-// render that was run with sudo can be read by the daemon, which runs as the unit's user and owns
-// the directory.
-func chownLikeDir(f *os.File, dir string) {
-	if os.Geteuid() != 0 {
-		return
-	}
-	fi, err := os.Stat(dir)
-	if err != nil {
-		return
-	}
-	if st, ok := fi.Sys().(*syscall.Stat_t); ok {
-		_ = f.Chown(int(st.Uid), int(st.Gid))
-	}
 }
 
 // ---- the endpoint -------------------------------------------------------------------------

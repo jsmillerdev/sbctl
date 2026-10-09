@@ -6,11 +6,13 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/supavise/supavise/internal/fsutil"
 )
 
 func TestReadStateRefusesAFileThatIsNotJSON(t *testing.T) {
 	e := newEnv(t)
-	if err := ensureDir(runDir(e.paths)); err != nil {
+	if err := fsutil.MkdirAllOwned(runDir(e.paths), 0o750); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(runDir(e.paths), stateFile), []byte("{nope"), 0o644); err != nil {
@@ -45,14 +47,6 @@ func TestStateRoundTripKeepsNoSecret(t *testing.T) {
 	for _, s := range []string{c.String(), c.GoString()} {
 		if strings.Contains(s, "topsecret") || strings.Contains(s, "AKIAEXAMPLE") {
 			t.Errorf("a credentials value prints its key: %s", s)
-		}
-	}
-}
-
-func TestBytesString(t *testing.T) {
-	for n, want := range map[int64]string{0: "0 B", 1023: "1023 B", 1024: "1.0 KiB", 300_000: "293.0 KiB", 80 << 20: "80.0 MiB", 3 << 30: "3.0 GiB"} {
-		if got := bytesString(n); got != want {
-			t.Errorf("bytesString(%d) = %q, want %q", n, got, want)
 		}
 	}
 }

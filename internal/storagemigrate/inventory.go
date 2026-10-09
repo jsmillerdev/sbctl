@@ -129,15 +129,4 @@ func (l *limiter) setRate(r float64) (old float64) {
 	return old
 }
 
-func sleepCtx(ctx context.Context, d time.Duration) error {
-	t := time.NewTimer(d)
-	defer t.Stop()
-	select {
-	case <-t.C:
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
-	}
-}
-
 func quote(s string) string { return strconv.QuoteToGraphic(s) }

@@ -3,9 +3,10 @@ package backup
 import (
 	"bufio"
 	"context"
-	"errors"
 	"fmt"
 	"strings"
+
+	"github.com/supavise/supavise/internal/pglsn"
 )
 
 // timelineFork is one line of a timeline history file: the timeline a branch left
@@ -63,22 +64,13 @@ func (s *Service) latestHistory(ctx context.Context, ref string) (timelineHistor
 		if _, err := fmt.Sscanf(f[0], "%d", &parent); err != nil {
 			return h, fmt.Errorf("backup: malformed timeline history line %q", line)
 		}
-		lsn, err := parseLSN(f[1])
+		lsn, err := pglsn.Parse(f[1])
 		if err != nil {
-			return h, fmt.Errorf("backup: malformed timeline history line %q: %w", line, err)
+			return h, fmt.Errorf("backup: malformed timeline history line %q: not an LSN: %s", line, f[1])
 		}
 		h.Forks = append(h.Forks, timelineFork{Parent: parent, Switch: lsn})
 	}
 	return h, sc.Err()
-}
-
-// parseLSN parses "X/Y" (hex) into a 64-bit position.
-func parseLSN(s string) (uint64, error) {
-	var hi, lo uint32
-	if n, err := fmt.Sscanf(s, "%X/%X", &hi, &lo); err != nil || n != 2 {
-		return 0, errors.New("not an LSN: " + s)
-	}
-	return uint64(hi)<<32 | uint64(lo), nil
 }
 
 // onHistory reports whether recovery from backup m can reach the latest timeline: the
@@ -91,7 +83,7 @@ func (h timelineHistory) onHistory(m *Manifest) bool {
 	if h.Latest == 0 || uint32(m.Timeline) == h.Latest {
 		return true
 	}
-	stop, err := parseLSN(m.StopLSN)
+	stop, err := pglsn.Parse(m.StopLSN)
 	if err != nil {
 		return true
 	}

@@ -42,6 +42,7 @@ import (
 
 	"github.com/supavise/supavise/internal/api"
 	"github.com/supavise/supavise/internal/config"
+	"github.com/supavise/supavise/internal/fsutil"
 	"github.com/supavise/supavise/internal/registry"
 	"github.com/supavise/supavise/internal/secrets"
 	"github.com/supavise/supavise/internal/units"
@@ -741,23 +742,7 @@ func writeIfChanged(p string, b []byte, mode os.FileMode) (bool, error) {
 			return false, nil
 		}
 	}
-	tmp, err := os.CreateTemp(filepath.Dir(p), "."+filepath.Base(p)+".")
-	if err != nil {
-		return false, err
-	}
-	defer os.Remove(tmp.Name())
-	if err := tmp.Chmod(mode); err != nil {
-		tmp.Close()
-		return false, err
-	}
-	if _, err := io.Copy(tmp, bytes.NewReader(b)); err != nil {
-		tmp.Close()
-		return false, err
-	}
-	if err := tmp.Close(); err != nil {
-		return false, err
-	}
-	return true, os.Rename(tmp.Name(), p)
+	return true, fsutil.WriteFile(p, b, mode, fsutil.Options{})
 }
 
 func validRef(ref string) error {

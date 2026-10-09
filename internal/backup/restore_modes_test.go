@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"github.com/supavise/supavise/internal/lifecycle"
 	"os"
 	"path/filepath"
 	"strings"
@@ -13,6 +12,8 @@ import (
 	"time"
 
 	"github.com/supavise/supavise/internal/config"
+	"github.com/supavise/supavise/internal/lifecycle"
+	"github.com/supavise/supavise/internal/pglsn"
 )
 
 // putHistory stores a timeline history file the way PushWAL does (zstd).
@@ -45,13 +46,13 @@ func (e *testEnv) putManifest(t *testing.T, ref string, tli int, start, stop str
 
 func TestParseLSN(t *testing.T) {
 	for in, want := range map[string]uint64{"0/0": 0, "0/2000028": 0x2000028, "1/0": 1 << 32, "A/FF": 0xA<<32 | 0xFF} {
-		if got, err := parseLSN(in); err != nil || got != want {
-			t.Errorf("parseLSN(%q) = %x, %v, want %x", in, got, err, want)
+		if got, err := pglsn.Parse(in); err != nil || got != want {
+			t.Errorf("pglsn.Parse(%q) = %x, %v, want %x", in, got, err, want)
 		}
 	}
 	for _, in := range []string{"", "abc", "0/", "/1", "g/1"} {
-		if _, err := parseLSN(in); err == nil {
-			t.Errorf("parseLSN(%q) succeeded", in)
+		if _, err := pglsn.Parse(in); err == nil {
+			t.Errorf("pglsn.Parse(%q) succeeded", in)
 		}
 	}
 }

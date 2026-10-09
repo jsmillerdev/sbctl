@@ -312,13 +312,6 @@ func (d Deps) rolledBackTarget(ctx context.Context) string {
 	return ""
 }
 
-func nextWindow(w config.Window, now time.Time) string {
-	if t, ok := w.Next(now); ok {
-		return t.Format(time.RFC3339)
-	}
-	return ""
-}
-
 // Resume clears what stops automatic upgrades after a failure (the pause of an upgrade that needs
 // the operator, and the memory of a rolled-back release), so the next window may try again. It
 // returns what it cleared, or "" when nothing stopped them.

@@ -85,7 +85,7 @@ func (e *Engine) checkRestoreSpace(ref string) error {
 	}
 	return fmt.Errorf("%w: the disk has %s free and restoring project %s needs about %s (its data is %s; the restore keeps it "+
 		"aside, writes a second copy and needs room to replay WAL). Free some disk space on the server and try again",
-		ErrInsufficientDisk, humanBytes(free), ref, humanBytes(need), humanBytes(size))
+		ErrInsufficientDisk, HumanBytes(free), ref, HumanBytes(need), HumanBytes(size))
 }
 
 // pruneRestoreLeftovers bounds what restores leave on disk for ref. After a restore that
@@ -130,7 +130,8 @@ func leftovers(prefix string) []string {
 	return out
 }
 
-func humanBytes(n int64) string {
+// HumanBytes writes n as a size for an operator to read: "812 B", "1.5 GiB".
+func HumanBytes(n int64) string {
 	const unit = 1024
 	if n < unit {
 		return fmt.Sprintf("%d B", n)

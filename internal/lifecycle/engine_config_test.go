@@ -103,7 +103,7 @@ func TestSplitPostgresSettings(t *testing.T) {
 	}
 }
 
-// configPlane over fakePlane.
+// ConfigPlane over fakePlane.
 type cfgPlane struct {
 	*fakePlane
 	mu       sync.Mutex

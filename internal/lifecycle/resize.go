@@ -118,7 +118,7 @@ func (e *Engine) beginResize(ctx context.Context, ref string, to Class, unlock f
 	if err := e.atHome(p, "resize"); err != nil {
 		return nil, err
 	}
-	if !(active(p.Status) || p.Status == registry.StatusInactive) {
+	if !(p.Status.Running() || p.Status == registry.StatusInactive) {
 		return nil, invalidState(p, "resize")
 	}
 	from, ferr := ClassFor(p.Class)
@@ -272,7 +272,7 @@ func (r *ResizeRun) fail(ctx context.Context, cause error, restart bool) error {
 		}
 	}
 	status := r.prev
-	if !active(status) {
+	if !status.Running() {
 		status = registry.StatusActiveHealthy
 	}
 	if !rolled {
@@ -309,7 +309,7 @@ func (e *Engine) restoreRecord(ctx context.Context, old *registry.Project, final
 	cur.Class, cur.Limits = old.Class, old.Limits
 	if final {
 		cur.Status = old.Status
-		if !active(cur.Status) {
+		if !cur.Status.Running() {
 			cur.Status = registry.StatusActiveHealthy
 		}
 	}

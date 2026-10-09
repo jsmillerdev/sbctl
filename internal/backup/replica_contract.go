@@ -13,7 +13,7 @@ import (
 
 // This file is the contract of the replica work in this package: what the replica controller and
 // the failover orchestrator call, and the formats other packages write and this package reads.
-// Service implements ReplicaSeeder, StandbyConfigurer, BaseBackupEnsurer and EpochMarkerStore.
+// Service implements ReplicaSeeder, BaseBackupEnsurer and EpochMarkerStore.
 
 // ReplicaSeedPlan describes a standby Postgres to build.
 type ReplicaSeedPlan struct {
@@ -53,15 +53,6 @@ type ReplicaSeedPlan struct {
 // and the next SeedReplica clears it and starts over.
 type ReplicaSeeder interface {
 	SeedReplica(ctx context.Context, plan ReplicaSeedPlan) error
-}
-
-// StandbyConfigurer turns a stopped cluster that already has its data into a standby: the demotion
-// of a primary in place (design 2.10.3 step 7 and 2.10.4 step 9), which has the same end state as
-// a seed and no base backup to extract. ConfigureStandby writes what SeedReplica writes after the
-// extraction, from the same plan (BackupID only names the backup in a comment and may be empty),
-// and deletes the project's promote.ok.
-type StandbyConfigurer interface {
-	ConfigureStandby(plan ReplicaSeedPlan) error
 }
 
 // BaseBackupEnsurer hands out a base backup that is recent enough to seed from.

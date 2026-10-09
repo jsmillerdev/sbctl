@@ -51,9 +51,6 @@ type Store struct {
 // Option customises a Store.
 type Option func(*Store)
 
-// WithHTTPClient replaces the HTTP client (tests, proxies).
-func WithHTTPClient(c *http.Client) Option { return func(s *Store) { s.client = c } }
-
 // WithLogger sets the logger; the default discards.
 func WithLogger(l *slog.Logger) Option { return func(s *Store) { s.log = l } }
 

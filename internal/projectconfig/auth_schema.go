@@ -27,9 +27,6 @@ var authTemplates = []string{
 	"identity_linked_notification", "identity_unlinked_notification",
 }
 
-// TemplateNames lists the template names (invite, confirmation, ...).
-func TemplateNames() []string { return append([]string(nil), authTemplates...) }
-
 var authNotifications = authTemplates[6:]
 
 // Hook points of GoTrue's extensibility API.
@@ -70,15 +67,6 @@ var authProviders = []provider{
 	{name: "x", emailOptional: true},
 	{name: "workos", url: true},
 	{name: "zoom", emailOptional: true},
-}
-
-// ProviderNames lists the external providers.
-func ProviderNames() []string {
-	out := make([]string, len(authProviders))
-	for i, p := range authProviders {
-		out[i] = p.name
-	}
-	return out
 }
 
 var (

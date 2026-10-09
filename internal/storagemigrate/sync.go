@@ -40,7 +40,7 @@ func (e *Engine) walkTenant(ctx context.Context, ref string) (inventory, []Skipp
 	root := e.paths.StorageObjects(ref)
 	var inv inventory
 	var skipped []Skipped
-	err := e.files.Walk(ctx, root, func(abs string) {
+	err := e.d.Files.Walk(ctx, root, func(abs string) {
 		rel, err := filepath.Rel(root, abs)
 		if err != nil {
 			rel = abs
@@ -115,7 +115,7 @@ func (e *Engine) upload(ctx context.Context, b Bucket, ref string, files []fileS
 	}
 	var n, bytes atomic.Int64
 	g, gctx := errgroup.WithContext(ctx)
-	g.SetLimit(e.workers)
+	g.SetLimit(e.d.Workers)
 	var mu sync.Mutex
 	var firstErr error
 	for _, f := range files {
@@ -157,7 +157,7 @@ func (e *Engine) upload(ctx context.Context, b Bucket, ref string, files []fileS
 func (e *Engine) copyFile(ctx context.Context, b Bucket, ref string, f fileState) (int64, error) {
 	root := e.paths.StorageObjects(ref)
 	abs := filepath.Join(root, filepath.FromSlash(f.Path))
-	fh, err := e.files.Open(root, f.Path)
+	fh, err := e.d.Files.Open(root, f.Path)
 	if err != nil {
 		return 0, err
 	}
@@ -169,7 +169,7 @@ func (e *Engine) copyFile(ctx context.Context, b Bucket, ref string, f fileState
 	if !fi.Mode().IsRegular() {
 		return 0, fmt.Errorf("%s: %w", quote(abs), fs.ErrNotExist)
 	}
-	meta, err := e.files.MetaOf(fh)
+	meta, err := e.d.Files.MetaOf(fh)
 	if err != nil {
 		return 0, fmt.Errorf("%s: read extended attributes: %w", quote(abs), err)
 	}
@@ -189,10 +189,10 @@ var errChanged = errors.New("the file changed while it was copied")
 // returned function is called. A run that dies leaves a marker that expires on its own.
 func (e *Engine) holdWrites(ctx context.Context) (release func()) {
 	write := func() {
-		now := e.now()
-		m := hold.Marker{PID: os.Getpid(), Since: now.UTC(), Until: now.Add(e.holdFor).UTC(), Reason: "Storage migration"}
+		now := e.d.Now()
+		m := hold.Marker{PID: os.Getpid(), Since: now.UTC(), Until: now.Add(e.d.HoldFor).UTC(), Reason: "Storage migration"}
 		if err := hold.Write(e.paths, m); err != nil {
-			e.log.Warn("could not write the Storage write hold; writes are fenced by stopping Storage instead", "err", err)
+			e.d.Log.Warn("could not write the Storage write hold; writes are fenced by stopping Storage instead", "err", err)
 		}
 	}
 	write()
@@ -201,7 +201,7 @@ func (e *Engine) holdWrites(ctx context.Context) (release func()) {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		t := time.NewTicker(e.holdFor / 4)
+		t := time.NewTicker(e.d.HoldFor / 4)
 		defer t.Stop()
 		for {
 			select {

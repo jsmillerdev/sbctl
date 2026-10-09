@@ -575,7 +575,7 @@ func TestIntegrationCloneSize(t *testing.T) {
 	if err := c.QueryRow(ctx, `select pg_database_size('postgres')`).Scan(&size); err != nil {
 		t.Fatal(err)
 	}
-	t.Logf("parent: %d rows, %s database, loaded in %s", rows, humanBytes(size), time.Since(loadStart).Round(time.Second))
+	t.Logf("parent: %d rows, %s database, loaded in %s", rows, lifecycle.HumanBytes(size), time.Since(loadStart).Round(time.Second))
 
 	method := os.Getenv("SUPAVISE_TEST_EXPECT_METHOD")
 	if method == MethodBackup {
@@ -629,7 +629,7 @@ func TestIntegrationCloneSize(t *testing.T) {
 		if err == nil {
 			defer out.Close()
 			fmt.Fprintf(out, "\n#### Branch clone on %s (%s)\n\n| method | parent database | whole branch creation | clone copy | extra disk |\n|---|---|---|---|---|\n| %s | %s | %d ms | %s | %s |\n",
-				fsName(st.cfg.StateDir), os.Getenv("SUPAVISE_TEST_LABEL"), b.CloneMethod, humanBytes(size), total.Milliseconds(), cloneMS(res), humanBytes(max(free0-free1, 0)))
+				fsName(st.cfg.StateDir), os.Getenv("SUPAVISE_TEST_LABEL"), b.CloneMethod, lifecycle.HumanBytes(size), total.Milliseconds(), cloneMS(res), lifecycle.HumanBytes(max(free0-free1, 0)))
 		}
 	}
 	if _, err := st.svc.Delete(ctx, b.Ref, DeleteOptions{}); err != nil {

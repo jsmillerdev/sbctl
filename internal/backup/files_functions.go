@@ -3,7 +3,6 @@ package backup
 import (
 	"bytes"
 	"context"
-	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -12,6 +11,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/supavise/supavise/internal/secrets"
 )
 
 // FunctionRecord is the deployment record of one Edge Function, as the Management API
@@ -188,17 +189,6 @@ func (s *Service) backupFunctions(ctx context.Context, ref, reason string) (*Fil
 	return snap, nil
 }
 
-// newUUID returns a random (version 4) UUID in its text form.
-func newUUID() string {
-	var b [16]byte
-	if _, err := io.ReadFull(rand.Reader, b[:]); err != nil {
-		panic(err) // crypto/rand does not fail on a working system
-	}
-	b[6] = b[6]&0x0f | 0x40
-	b[8] = b[8]&0x3f | 0x80
-	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:])
-}
-
 func fnSlug(entryPath string) (string, bool) {
 	rest, ok := strings.CutPrefix(entryPath, fnFilePrefix)
 	if !ok {
@@ -222,7 +212,7 @@ func (s *Service) restoreFunctions(ctx context.Context, snap *FilesSnapshot, ref
 	recs := map[string]FunctionRecord{}
 	for _, r := range snap.Functions {
 		if fresh {
-			r.ID = newUUID()
+			r.ID = secrets.NewUUID()
 		}
 		recs[r.Slug] = r
 	}

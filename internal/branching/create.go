@@ -137,7 +137,7 @@ func (s *Service) Create(ctx context.Context, ref string, in CreateInput) (*Bran
 	}
 
 	info := &registry.BranchInfo{
-		ID: newUUID(), ParentRef: p.Ref, Name: in.Name, GitBranch: in.GitBranch, Persistent: in.Persistent, WithData: in.WithData,
+		ID: secrets.NewUUID(), ParentRef: p.Ref, Name: in.Name, GitBranch: in.GitBranch, Persistent: in.Persistent, WithData: in.WithData,
 		NotifyURL: in.NotifyURL, State: registry.BranchCreatingProject, Detail: "creating the project",
 	}
 	if in.WithData {
@@ -319,7 +319,7 @@ func (s *Service) doCreate(ctx context.Context, j *createJob) (string, error) {
 		detail = "data cloned by " + method
 	default:
 		detail = fmt.Sprintf("data cloned by %s in %d ms (%d files, %s apparent, %s of new disk, %d WAL segments)",
-			method, stats.TotalMillis, stats.Files, humanBytes(stats.Bytes), humanBytes(stats.ExtraDiskByte), stats.WALSegments)
+			method, stats.TotalMillis, stats.Files, lifecycle.HumanBytes(stats.Bytes), lifecycle.HumanBytes(stats.ExtraDiskByte), stats.WALSegments)
 	}
 	egress := ""
 	if j.in.WithData && method != MethodSchema {
@@ -521,17 +521,4 @@ func (s *Service) replay(ctx context.Context, j *createJob) (migrations int, see
 		return len(parentMigs), true, nil
 	}
 	return len(parentMigs), false, nil
-}
-
-func humanBytes(n int64) string {
-	const unit = 1024
-	if n < unit {
-		return fmt.Sprintf("%d B", n)
-	}
-	div, exp := int64(unit), 0
-	for m := n / unit; m >= unit; m /= unit {
-		div *= unit
-		exp++
-	}
-	return fmt.Sprintf("%.1f %ciB", float64(n)/float64(div), "KMGTPE"[exp])
 }

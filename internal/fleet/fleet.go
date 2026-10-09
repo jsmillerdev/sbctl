@@ -55,15 +55,7 @@ type Quiescer interface {
 
 // QuiesceTenant calls QuiesceTenant on every tenant that implements Quiescer.
 func (f Fleet) QuiesceTenant(ctx context.Context, ref string) error {
-	var first error
-	for _, t := range f {
-		if q, ok := t.(Quiescer); ok {
-			if err := q.QuiesceTenant(ctx, ref); err != nil && first == nil {
-				first = err
-			}
-		}
-	}
-	return first
+	return forAll(f, func(q Quiescer) error { return q.QuiesceTenant(ctx, ref) })
 }
 
 // Refresher is an optional Tenant capability: drop whatever the service cached about a
@@ -75,15 +67,7 @@ type Refresher interface {
 
 // RefreshTenant calls RefreshTenant on every tenant that implements Refresher.
 func (f Fleet) RefreshTenant(ctx context.Context, ref string) error {
-	var first error
-	for _, t := range f {
-		if r, ok := t.(Refresher); ok {
-			if err := r.RefreshTenant(ctx, ref); err != nil && first == nil {
-				first = err
-			}
-		}
-	}
-	return first
+	return forAll(f, func(r Refresher) error { return r.RefreshTenant(ctx, ref) })
 }
 
 // ReplicaTenanter is an optional Tenant capability: pool a project's read replica under a tenant
@@ -96,27 +80,12 @@ type ReplicaTenanter interface {
 
 // EnsureReplicaTenant calls EnsureReplicaTenant on every tenant that implements ReplicaTenanter.
 func (f Fleet) EnsureReplicaTenant(ctx context.Context, spec TenantSpec) error {
-	for _, t := range f {
-		if r, ok := t.(ReplicaTenanter); ok {
-			if err := r.EnsureReplicaTenant(ctx, spec); err != nil {
-				return err
-			}
-		}
-	}
-	return nil
+	return forEach(f, func(r ReplicaTenanter) error { return r.EnsureReplicaTenant(ctx, spec) })
 }
 
 // RemoveReplicaTenant calls RemoveReplicaTenant on every tenant that implements ReplicaTenanter.
 func (f Fleet) RemoveReplicaTenant(ctx context.Context, identifier string) error {
-	var first error
-	for _, t := range f {
-		if r, ok := t.(ReplicaTenanter); ok {
-			if err := r.RemoveReplicaTenant(ctx, identifier); err != nil && first == nil {
-				first = err
-			}
-		}
-	}
-	return first
+	return forAll(f, func(r ReplicaTenanter) error { return r.RemoveReplicaTenant(ctx, identifier) })
 }
 
 // Tenant is one shared service's tenant registry. Both calls are idempotent and
@@ -131,19 +100,34 @@ type Tenant interface {
 type Fleet []Tenant
 
 func (f Fleet) EnsureTenant(ctx context.Context, spec TenantSpec) error {
+	return forEach(f, func(t Tenant) error { return t.EnsureTenant(ctx, spec) })
+}
+
+func (f Fleet) RemoveTenant(ctx context.Context, ref string) error {
+	return forAll(f, func(t Tenant) error { return t.RemoveTenant(ctx, ref) })
+}
+
+// forEach calls do on every tenant of f that implements C, in order, and stops at the first error.
+func forEach[C any](f Fleet, do func(C) error) error {
 	for _, t := range f {
-		if err := t.EnsureTenant(ctx, spec); err != nil {
-			return err
+		if c, ok := t.(C); ok {
+			if err := do(c); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
 }
 
-func (f Fleet) RemoveTenant(ctx context.Context, ref string) error {
+// forAll calls do on every tenant of f that implements C, in order, whatever the others return, and
+// reports the first error.
+func forAll[C any](f Fleet, do func(C) error) error {
 	var first error
 	for _, t := range f {
-		if err := t.RemoveTenant(ctx, ref); err != nil && first == nil {
-			first = err
+		if c, ok := t.(C); ok {
+			if err := do(c); err != nil && first == nil {
+				first = err
+			}
 		}
 	}
 	return first

@@ -1,7 +1,6 @@
 package branching
 
 import (
-	"crypto/rand"
 	"crypto/sha1"
 	"errors"
 	"fmt"
@@ -88,17 +87,6 @@ func ValidName(name string) error {
 		return invalid("%q is the name of the default branch", DefaultBranchName)
 	}
 	return nil
-}
-
-// newUUID returns a random (version 4) UUID.
-func newUUID() string {
-	var b [16]byte
-	if _, err := rand.Read(b[:]); err != nil {
-		panic(err) // crypto/rand does not fail on supported platforms
-	}
-	b[6] = b[6]&0x0f | 0x40
-	b[8] = b[8]&0x3f | 0x80
-	return fmtUUID(b)
 }
 
 // defaultBranchID derives the stable id of a project's default branch (a version 5 style

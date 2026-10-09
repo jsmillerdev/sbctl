@@ -14,6 +14,7 @@ import (
 	"strconv"
 
 	"github.com/supavise/supavise/internal/config"
+	"github.com/supavise/supavise/internal/fsutil"
 	"github.com/supavise/supavise/internal/functions/mainservice"
 	"github.com/supavise/supavise/internal/units"
 )
@@ -192,7 +193,7 @@ func EnsureMainService(cfg *config.Config) (string, error) {
 		if err := os.MkdirAll(filepath.Dir(p), 0o750); err != nil {
 			return "", err
 		}
-		if err := writeAtomic(p, body, 0o640); err != nil {
+		if err := fsutil.WriteFile(p, body, 0o640, fsutil.Options{}); err != nil {
 			return "", err
 		}
 	}
@@ -218,24 +219,4 @@ func EnsureMainService(cfg *config.Config) (string, error) {
 		}
 	}
 	return hashFiles(files), errors.Join(errs...)
-}
-
-func writeAtomic(p string, b []byte, mode os.FileMode) error {
-	tmp, err := os.CreateTemp(filepath.Dir(p), "."+filepath.Base(p)+".")
-	if err != nil {
-		return err
-	}
-	defer os.Remove(tmp.Name())
-	if err := tmp.Chmod(mode); err != nil {
-		tmp.Close()
-		return err
-	}
-	if _, err := tmp.Write(b); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	return os.Rename(tmp.Name(), p)
 }

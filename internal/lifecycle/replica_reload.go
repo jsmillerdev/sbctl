@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/supavise/supavise/internal/config"
+	"github.com/supavise/supavise/internal/ctxutil"
 	"github.com/supavise/supavise/internal/units"
 )
 
@@ -34,7 +35,9 @@ func (pl *PostgresPlane) ReloadSchema(ctx context.Context, ref string) error {
 }
 
 // RunSchemaReload calls ReloadSchema for every ref refs returns once per every, until ctx ends. The
-// daemon runs it with [replicas] schema_reload_seconds and the refs of the replicas on this node.
+// signals of one round are spread across the interval, every/len(refs) apart, so that the
+// PostgREST processes of a node do not rebuild their schema caches at the same moment. The daemon
+// runs it with [replicas] schema_reload_seconds and the refs of the replicas on this node.
 func (pl *PostgresPlane) RunSchemaReload(ctx context.Context, every time.Duration, refs func(context.Context) ([]string, error)) {
 	if every <= 0 {
 		every = 10 * time.Second
@@ -52,7 +55,15 @@ func (pl *PostgresPlane) RunSchemaReload(ctx context.Context, every time.Duratio
 			pl.log.Warn("schema reload: listing the replicas", "error", err)
 			continue
 		}
-		for _, ref := range rs {
+		gap := every / time.Duration(max(len(rs), 1))
+		start := time.Now()
+		for i, ref := range rs {
+			// Each signal has its own moment in the round, counted from its start, so that the time
+			// ReloadSchema takes does not add up over the refs and the round ends before the next tick.
+			// The first ref is signalled at once.
+			if i > 0 && ctxutil.Sleep(ctx, time.Until(start.Add(time.Duration(i)*gap))) != nil {
+				return
+			}
 			if err := pl.ReloadSchema(ctx, ref); err != nil {
 				pl.log.Warn("schema reload", "ref", ref, "error", err)
 			}

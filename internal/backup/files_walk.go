@@ -8,6 +8,8 @@ import (
 	"os"
 	"path/filepath"
 	"time"
+
+	"github.com/supavise/supavise/internal/storageattr"
 )
 
 // StorageObject is one object of a project's Storage objects directory, as WalkStorage reports it.
@@ -28,7 +30,7 @@ type StorageObject struct {
 // Attr returns the metadata Storage kept for the object under name ("content-type",
 // "cache-control", "content-encoding", "etag"), and false when it kept none.
 func (o StorageObject) Attr(name string) (string, bool) {
-	for _, p := range storageAttrPrefixes {
+	for _, p := range storageattr.Prefixes {
 		if v, ok := o.Attrs[p+name]; ok {
 			return string(v), true
 		}

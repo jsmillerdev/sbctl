@@ -59,8 +59,8 @@ func pathsFor(cfg *config.Config, ref string, port int) pgPaths {
 	return p
 }
 
-// kvQuote quotes a libpq key/value connection string value.
-func kvQuote(s string) string {
+// KVQuote quotes s as the value of a libpq key/value connection string.
+func KVQuote(s string) string {
 	return "'" + strings.NewReplacer(`\`, `\\`, `'`, `\'`).Replace(s) + "'"
 }
 
@@ -69,8 +69,15 @@ func kvQuote(s string) string {
 // supavise user). No password is needed, which is what lets supavise read its own registry
 // before it can decrypt any secret.
 func socketDSN(p pgPaths, db string) string {
-	return fmt.Sprintf("host=%s port=%d user=%s dbname=%s sslmode=disable connect_timeout=5 application_name=supavise",
-		kvQuote(p.Sock), p.Port, RoleAdmin, db)
+	return AdminSocketDSN(p.Sock, p.Port, db, "supavise")
+}
+
+// AdminSocketDSN is a libpq connection string to database db of the cluster whose unix socket
+// directory is sock, as supabase_admin, which pg_hba trusts on the socket. The server shows
+// application as the application_name of the session.
+func AdminSocketDSN(sock string, port int, db, application string) string {
+	return fmt.Sprintf("host=%s port=%d user=%s dbname=%s sslmode=disable connect_timeout=5 application_name=%s",
+		KVQuote(sock), port, RoleAdmin, db, application)
 }
 
 // RegistryDSN is the DSN of the "supavise" registry database in the system cluster.

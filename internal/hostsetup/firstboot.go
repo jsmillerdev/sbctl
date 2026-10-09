@@ -14,6 +14,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/supavise/supavise/internal/fsutil"
 )
 
 // The CloudFormation template's first-boot script used to do this in bash: find the data volume,
@@ -457,13 +459,7 @@ func (f *FirstBoot) bindConfig(ctx context.Context) error {
 func (f *FirstBoot) restoreAccount(ctx context.Context) error {
 	owner := f.Owner
 	if owner == nil {
-		owner = func(dir string) (int, int, bool) {
-			fi, err := os.Stat(dir)
-			if err != nil {
-				return 0, 0, false
-			}
-			return ownerOf(fi)
-		}
+		owner = fsutil.OwnerOf
 	}
 	uid, gid, ok := owner(f.StateDir)
 	if !ok || uid == 0 {

@@ -361,7 +361,7 @@ func (pl *PostgresPlane) SetWALKeepSize(ctx context.Context, p *registry.Project
 // project's primary: the mesh carries it to the home and is already TLS, so sslmode is disable.
 func primaryConninfo(port int, password, applicationName string) string {
 	return fmt.Sprintf("host=127.0.0.1 port=%d user=%s password=%s application_name=%s sslmode=disable",
-		port, RoleReplication, kvQuote(password), kvQuote(applicationName))
+		port, RoleReplication, KVQuote(password), KVQuote(applicationName))
 }
 
 func fileExists(path string) bool {

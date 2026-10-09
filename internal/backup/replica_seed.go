@@ -15,10 +15,7 @@ import (
 	"github.com/supavise/supavise/internal/registry"
 )
 
-var (
-	_ ReplicaSeeder     = (*Service)(nil)
-	_ StandbyConfigurer = (*Service)(nil)
-)
+var _ ReplicaSeeder = (*Service)(nil)
 
 // replicationRole is the role a standby streams with (lifecycle.RoleReplication; the loopback
 // pg_hba rule for it exists on every project cluster).
@@ -184,17 +181,13 @@ func (s *Service) standbyConf(plan ReplicaSeedPlan) string {
 	return b.String()
 }
 
-// StandbyGUCs are the settings the seeder adds that a primary does not keep. After a promotion,
-// ALTER SYSTEM RESET each of them (or ClearStandbyConf before the cluster starts as a primary):
-// primary_conninfo holds the replication password, and the base backups of the promoted cluster
-// copy its data directory. archive_mode and archive_command stay: they are the primary's own.
-var StandbyGUCs = []string{"primary_conninfo", "restore_command", "recovery_target_timeline", "hot_standby"}
-
 // ClearStandbyConf removes the standby block of SeedReplica from the postgresql.auto.conf of the
-// stopped cluster in dataDir: its header and every setting of a cluster in recovery (StandbyGUCs and
-// the recovery_target_* family). The primary's own archive_mode and archive_command stay. The rest of
-// the file is kept, and it is not rewritten when it has none of them. The shared implementation is
-// lifecycle.ClearStandbyBlock, which the plane's promotion and demotion use as well.
+// stopped cluster in dataDir: its header and every setting of a cluster in recovery
+// (primary_conninfo, restore_command, recovery_target_timeline, hot_standby and the
+// recovery_target_* family). primary_conninfo holds the replication password, and the base backups of
+// a promoted cluster copy its data directory. The primary's own archive_mode and archive_command
+// stay. The rest of the file is kept, and it is not rewritten when it has none of them. The shared
+// implementation is lifecycle.ClearStandbyBlock, which the plane's promotion and demotion use as well.
 func ClearStandbyConf(dataDir string) error {
 	if err := lifecycle.ClearStandbyBlock(dataDir, false); err != nil {
 		return err

@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/supavise/supavise/internal/config"
+	"github.com/supavise/supavise/internal/fsutil"
 	"github.com/supavise/supavise/internal/registry"
 	"github.com/supavise/supavise/internal/secrets"
 	"github.com/supavise/supavise/internal/units"
@@ -68,9 +69,6 @@ type PlaneOptions struct {
 	// ref's archive (backup.RestoreCommandFor, which this package cannot import). DemoteToReplica
 	// writes it into the cluster it turns into a standby.
 	RestoreCommandFor func(ref string) string
-	// ReplicaReadyTimeout bounds the start of a standby until it accepts connections (default 10
-	// minutes: it may replay a backlog of archived WAL first).
-	ReplicaReadyTimeout time.Duration
 	// ClusterSQL replaces the SQL the plane asks of a cluster (tests).
 	ClusterSQL ClusterSQL
 	// HoldPorts takes ref's canonical and replica ports from the mesh's forwarders
@@ -200,23 +198,7 @@ func writeFile(path string, b []byte, mode os.FileMode) (bool, error) {
 			return false, nil
 		}
 	}
-	tmp, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".")
-	if err != nil {
-		return false, err
-	}
-	defer os.Remove(tmp.Name())
-	if err := tmp.Chmod(mode); err != nil {
-		tmp.Close()
-		return false, err
-	}
-	if _, err := tmp.Write(b); err != nil {
-		tmp.Close()
-		return false, err
-	}
-	if err := tmp.Close(); err != nil {
-		return false, err
-	}
-	return true, os.Rename(tmp.Name(), path)
+	return true, fsutil.WriteFile(path, b, mode, fsutil.Options{})
 }
 
 // Create implements DataPlane: it initializes (or seeds) the cluster, sets role
@@ -867,7 +849,7 @@ func (pl *PostgresPlane) serviceHealth(ctx context.Context, ref, svc string, f f
 // Delete implements DataPlane: stop and remove the units and delete the project
 // directory (cluster, env files, run scripts). It is safe to call on a half-created project.
 func (pl *PostgresPlane) Delete(ctx context.Context, ref string) error {
-	if ref != config.SystemRef && !secrets.ValidRef(ref) {
+	if !secrets.ValidProjectRef(ref) {
 		return fmt.Errorf("lifecycle: refusing to delete %q: not a project ref", ref)
 	}
 	var first error
