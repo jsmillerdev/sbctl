@@ -104,6 +104,21 @@ follower() { if [[ $(sget leader) == n1 ]]; then echo n2; else echo n1; fi; }
 next_run() { local r; r=$(($(cat "$WORK/state/kv/run" 2>/dev/null || echo 0) + 1)); sset run "$r"; echo "$r"; }
 refs() { echo "$(sget ref1) $(sget ref2)"; }
 
+# wait_dry_run NODE SECONDS CMD...: CMD --dry-run on NODE, again every five seconds until it passes or SECONDS have gone.
+# A move refuses a replica whose lag is above max_lag_seconds (30), and the lag of an idle project is the age of its
+# last replayed commit whenever the reading falls between receiving a record and replaying it: a standby that has
+# just reconnected can show a minute for an instant. The move asks the same question when it runs and is not
+# repeated; only the wait for the question to be answered yes is.
+wait_dry_run() {
+  local node=$1 n=$2 i
+  shift 2
+  for ((i = 0; i < n; i += 5)); do
+    onl "$node" "$@" --dry-run >/dev/null 2>&1 && return 0
+    sleep 5
+  done
+  onl "$node" "$@" --dry-run || log "the dry run was refused for ${n}s (the move would be refused)"
+}
+
 # copy_secrets FROM TO: the keys, the passwords and the token of the API, between the nodes through this pipe.
 copy_secrets() { on "$1" tar -C / -cf - root/keys root/pat root/pat.hdr root/org | on "$2" tar -C / -xf -; }
 
@@ -336,7 +351,7 @@ project_move() {
   run=$(next_run)
   onl n2 writer_start "$ref" "$run" "$WRITER_RATE"
   sleep 10
-  onl "$lead" supavise projects failover "$ref" --to "$to" --dry-run || log "the dry run was refused (the move would be refused)"
+  wait_dry_run "$lead" 120 supavise projects failover "$ref" --to "$to"
   t0=$SECONDS
   onl "$lead" supavise projects failover "$ref" --to "$to" --yes
   note "project.$from-$to.seconds" "$((SECONDS - t0))"
@@ -371,7 +386,7 @@ server_move() {
   run=$(next_run)
   onl n2 writer_start "$ref1" "$run" "$WRITER_RATE"
   sleep 10
-  onl "$runner" supavise failover --to "$new" --dry-run || log "the dry run was refused (the move would be refused)"
+  wait_dry_run "$runner" 120 supavise failover --to "$new"
   t0=$SECONDS
   onl "$runner" supavise failover --to "$new" --yes || rc=$?
   note "server.$old-$new.seconds" "$((SECONDS - t0))"
