@@ -64,7 +64,7 @@ is the daemon that `supavise.service` runs.
   | `wireMesh` | `mesh.Mesh`, `cluster.Membership` (a `*cluster.Live`), `*cluster.Reporter`, `*cluster.Reports`, `*mesh.Forwarders`, `*cluster.Authority` |
   | `wirePlacement` | `placement.Resolver`, `PlaneRouter`, `InstanceOps`, `BackupOps`, `Contribution`, `lifecycle.Timers`, `failover.LocalPrimaries` |
   | `wireFleet` | `fleet.Fleet`, `fleet.PeerRefresher`, `replicas.Pooler`, `failover.Fleet`, `failover.LocalServices`, a server check for the shared services' artifacts |
-  | `wireReplicas` | `replicas.Service`, `Remover`, `ReportSink`; sets `Deps.Replicas` (the controller, or `replicasOff` while it does not run) and `Deps.Placement`; subscribes the controller to the reports |
+  | `wireReplicas` | `replicas.Service`, `Remover`, `ReportSink`; sets `Deps.Replicas` (the controller, or `replicasOff` while it does not run); subscribes the controller to the reports |
   | `wireProxy` | `*proxy.CertRole`; sets `proxy.Options.Cluster` and `Deps.LoadBalancers`; serves `GET /peer/v1/certs`; a server check that the mirrored certificates are the leader's |
   | `wireFailover` | `failover.Service`, `Locker`, `ExtraChecks`, `Takeover`; sets `Deps.Failover` |
 
