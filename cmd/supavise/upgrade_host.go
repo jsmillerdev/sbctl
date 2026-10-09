@@ -26,11 +26,13 @@ import (
 	"github.com/supavise/supavise/internal/backup"
 	"github.com/supavise/supavise/internal/config"
 	"github.com/supavise/supavise/internal/fleet"
+	"github.com/supavise/supavise/internal/fsutil"
 	"github.com/supavise/supavise/internal/hostsetup"
 	"github.com/supavise/supavise/internal/infra"
 	"github.com/supavise/supavise/internal/lifecycle"
 	"github.com/supavise/supavise/internal/nodeupgrade"
 	"github.com/supavise/supavise/internal/notice"
+	"github.com/supavise/supavise/internal/procutil"
 	"github.com/supavise/supavise/internal/registry"
 	"github.com/supavise/supavise/internal/selfupdate"
 	"github.com/supavise/supavise/internal/units"
@@ -223,7 +225,7 @@ func (h *nodeHost) Inspect(ctx context.Context) (*nodeupgrade.Node, error) {
 	}
 	// A binary that reports its release is one that knows the reason "pre-upgrade" for a backup.
 	h.knowsReason = n.BinaryInfo != nil
-	if u := notice.ReadUpgrade(h.cfg.Paths()); u != nil && u.Running(time.Now()) && u.PID != os.Getpid() && (u.PID == 0 || pidAlive(u.PID)) {
+	if u := notice.ReadUpgrade(h.cfg.Paths()); u != nil && u.Running(time.Now()) && u.PID != os.Getpid() && (u.PID == 0 || procutil.Alive(u.PID)) {
 		n.Running = &nodeupgrade.Running{PID: u.PID, Phase: u.Phase, To: u.To}
 	}
 
@@ -319,11 +321,6 @@ func (h *nodeHost) nodePins(n *nodeupgrade.Node) {
 		}
 		n.Pins[svc] = best
 	}
-}
-
-func pidAlive(pid int) bool {
-	err := syscall.Kill(pid, 0)
-	return err == nil || errors.Is(err, syscall.EPERM)
 }
 
 // freeBytes returns the free space of the volume holding path; unknown is true when it cannot be
@@ -792,28 +789,11 @@ func (h *nodeHost) Restore(ctx context.Context, from string, rec nodeupgrade.Rec
 
 // replaceFile copies src next to dst and renames it over dst, so a reader sees one or the other.
 func replaceFile(src, dst string) error {
-	in, err := os.Open(src)
+	b, err := os.ReadFile(src)
 	if err != nil {
 		return err
 	}
-	defer in.Close()
-	tmp, err := os.CreateTemp(filepath.Dir(dst), "."+filepath.Base(dst)+".restore-*")
-	if err != nil {
-		return err
-	}
-	defer os.Remove(tmp.Name())
-	if _, err := io.Copy(tmp, in); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Chmod(0o755); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	return os.Rename(tmp.Name(), dst)
+	return fsutil.WriteFile(dst, b, 0o755, fsutil.Options{})
 }
 
 // WaitShared implements nodeupgrade.Host: for each service in order, wait until its unit is set to

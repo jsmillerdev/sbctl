@@ -4,6 +4,8 @@ import (
 	"context"
 	"math/rand/v2"
 	"time"
+
+	"github.com/supavise/supavise/internal/ctxutil"
 )
 
 const (
@@ -24,7 +26,7 @@ type retrier struct {
 }
 
 func newRetrier(attempts int, backoff time.Duration) *retrier {
-	return &retrier{attempts: attempts, backoff: backoff, jitter: rand.Float64, sleep: sleepContext}
+	return &retrier{attempts: attempts, backoff: backoff, jitter: rand.Float64, sleep: ctxutil.Sleep}
 }
 
 // delay is the wait after the nth failed attempt, counting from 1. The schedule starts at the
@@ -44,14 +46,3 @@ func (r *retrier) delay(n int) time.Duration {
 // wait sleeps for the delay after the nth failed attempt. It returns the context's error when the
 // context ends first.
 func (r *retrier) wait(ctx context.Context, n int) error { return r.sleep(ctx, r.delay(n)) }
-
-func sleepContext(ctx context.Context, d time.Duration) error {
-	t := time.NewTimer(d)
-	defer t.Stop()
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-t.C:
-		return nil
-	}
-}

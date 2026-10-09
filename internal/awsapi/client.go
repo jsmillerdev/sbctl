@@ -13,6 +13,7 @@ package awsapi
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"fmt"
 	"io"
@@ -118,10 +119,10 @@ func New(cfg Config) (*Client, error) {
 		cfg.HTTPClient = &http.Client{Timeout: 30 * time.Second}
 	}
 	ep := map[string]string{
-		"ec2":            firstNonEmpty(cfg.Endpoints.EC2, cfg.Getenv(EnvEndpointEC2)),
-		"secretsmanager": firstNonEmpty(cfg.Endpoints.SecretsManager, cfg.Getenv(EnvEndpointSecretsManager), cfg.Getenv(envEndpointSecretsManagerSDK)),
-		"sts":            firstNonEmpty(cfg.Endpoints.STS, cfg.Getenv(EnvEndpointSTS)),
-		"imds":           firstNonEmpty(cfg.Endpoints.IMDS, cfg.Getenv(EnvEndpointIMDS), cfg.Getenv(envEndpointIMDSSDK)),
+		"ec2":            cmp.Or(cfg.Endpoints.EC2, cfg.Getenv(EnvEndpointEC2)),
+		"secretsmanager": cmp.Or(cfg.Endpoints.SecretsManager, cfg.Getenv(EnvEndpointSecretsManager), cfg.Getenv(envEndpointSecretsManagerSDK)),
+		"sts":            cmp.Or(cfg.Endpoints.STS, cfg.Getenv(EnvEndpointSTS)),
+		"imds":           cmp.Or(cfg.Endpoints.IMDS, cfg.Getenv(EnvEndpointIMDS), cfg.Getenv(envEndpointIMDSSDK)),
 	}
 	for name, v := range ep {
 		if v == "" {
@@ -175,15 +176,6 @@ func (c *Client) Region(ctx context.Context) (string, error) {
 	return r, nil
 }
 
-func firstNonEmpty(vs ...string) string {
-	for _, v := range vs {
-		if v != "" {
-			return v
-		}
-	}
-	return ""
-}
-
 // core is what the service clients share.
 type core struct {
 	cfg       Config
@@ -202,7 +194,7 @@ func (c *core) region(ctx context.Context) (string, error) {
 	if c.regionName != "" {
 		return c.regionName, nil
 	}
-	r := firstNonEmpty(c.cfg.Region, c.cfg.Getenv("AWS_REGION"), c.cfg.Getenv("AWS_DEFAULT_REGION"))
+	r := cmp.Or(c.cfg.Region, c.cfg.Getenv("AWS_REGION"), c.cfg.Getenv("AWS_DEFAULT_REGION"))
 	if r == "" {
 		var err error
 		if r, err = c.imds.Region(ctx); err != nil {
