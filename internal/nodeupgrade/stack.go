@@ -23,10 +23,14 @@ type StackOutcome struct {
 	// is not this node (AWS CloudShell, a laptop): the release's signed script, which also runs on
 	// its own.
 	Standalone string
+	// GuardLeftOn is a stack that was updated but still holds the script's temporary stack policy
+	// (the guard), which denies later replacements; the script printed the command that takes it off.
+	GuardLeftOn bool
 }
 
 // StackError is the stack update ending without success: the script's exit status (2 refused
-// the change set, 3 failed) and what it said.
+// the change set, 3 failed, including a guarded update that CloudFormation rolled back; 129, 130
+// or 143 interrupted, and -1 killed by a signal) and what it said.
 type StackError struct {
 	Code int
 	Err  error
@@ -66,11 +70,15 @@ func (r *run) stackStep(ctx context.Context, cand *Candidate) (todo string, err 
 	var se *StackError
 	switch {
 	case errors.As(err, &se):
-		what := "was refused"
-		if se.Code != 2 {
-			what = "failed"
+		switch se.Code {
+		case 2:
+			return "", &Failure{Code: ExitRefused, Err: fmt.Errorf("the AWS stack update was refused: %w; the node was not changed", se.Err)}
+		case -1, 129, 130, 143:
+			return "", &Failure{Code: ExitRefused, Err: fmt.Errorf("the AWS stack update was interrupted: %w; the node was not changed. "+
+				"The update may still be running in CloudFormation. If the script said that its guard (a temporary stack policy) is still on, "+
+				"run the command it printed once the stack has stopped updating, or run `supavise upgrade --aws` again, which takes it off", se.Err)}
 		}
-		return "", &Failure{Code: ExitRefused, Err: fmt.Errorf("the AWS stack update %s: %w; the node was not changed", what, se.Err)}
+		return "", &Failure{Code: ExitRefused, Err: fmt.Errorf("the AWS stack update failed: %w; the node was not changed", se.Err)}
 	case err != nil:
 		return "", refused("%v", err)
 	}
@@ -80,6 +88,12 @@ func (r *run) stackStep(ctx context.Context, cand *Candidate) (todo string, err 
 			o.say("or, where your credentials are (AWS CloudShell, your laptop), with the supavise-aws-deploy.sh attached to the release %s:\n\n  %s\n", cand.Tag, out.Standalone)
 		}
 		return out.Command, nil
+	}
+	if out.GuardLeftOn {
+		r.stackWarn = "The AWS stack was updated, but the script could not take its guard (a temporary stack policy) off, and while it is on, " +
+			"CloudFormation refuses to replace most resources of the stack. Run the set-stack-policy command the script printed, or run `supavise upgrade --aws` again, which takes it off."
+		o.say("%s", r.stackWarn)
+		return "", nil
 	}
 	o.say("The AWS stack is up to date")
 	return "", nil

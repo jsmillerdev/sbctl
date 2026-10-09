@@ -6,9 +6,11 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"regexp"
 	"strings"
+	"syscall"
 
 	"github.com/supavise/supavise/internal/awsapi"
 	"github.com/supavise/supavise/internal/config"
@@ -238,26 +240,66 @@ func (h *nodeHost) UpdateStack(ctx context.Context, c *nodeupgrade.Candidate, so
 	// terminal. It is run by bash, not executed, so a noexec /tmp does not matter. The script and the
 	// template are the bytes that AWSAssets checked against the signed list, so nothing is left for the
 	// script's own check of itself, which only runs on its download path.
-	cmd := exec.CommandContext(ctx, "bash", append([]string{script}, awsUpdateArgs(stack, template, so.Sets)...)...)
+	//
+	// It is not tied to ctx: a cancelled upgrade (Ctrl-C, SIGTERM) must not kill it, because while an
+	// update runs under its guard (a temporary stack policy) the script waits for the update to end and
+	// then takes the guard off. Killed, it would leave the guard on and the update running unseen.
+	// runStackScript passes the signals on instead, and the script decides.
+	if err := ctx.Err(); err != nil {
+		return nodeupgrade.StackOutcome{}, err
+	}
+	cmd := exec.Command("bash", append([]string{script}, awsUpdateArgs(stack, template, so.Sets)...)...)
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, h.out, h.errw
 	// The script takes its trust root (the release key, the download address) and the address of the
 	// metadata service it checks the node's identity against from these variables when they are set,
 	// for tests. `sudo -E` passes on whatever the caller exported, and the stack is changed with this
 	// script: the variables do not reach it.
 	cmd.Env = withoutEnv(os.Environ(), scriptTestHookVars...)
-	if err := cmd.Run(); err != nil {
+	// The script exits 0 (updated, or nothing to change), 2 (refused: nothing was changed), 3 (failed,
+	// also a guarded update that CloudFormation rolled back after the temporary stack policy denied a
+	// replacement), 4 (updated, but its temporary stack policy could not be taken off), or 129, 130 or
+	// 143 after an interrupt (HUP, INT, TERM). Its review's own statuses (10 refused, 11 blocked, 12
+	// guarded) stay inside it.
+	sigs := make(chan os.Signal, 2)
+	signal.Notify(sigs, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(sigs)
+	var out nodeupgrade.StackOutcome
+	if err := runStackScript(cmd, sigs); err != nil {
 		var ee *exec.ExitError
-		if errors.As(err, &ee) {
-			code := ee.ExitCode()
-			return nodeupgrade.StackOutcome{}, &nodeupgrade.StackError{Code: code, Err: fmt.Errorf("supavise-aws-deploy.sh update exited with status %d", code)}
+		if !errors.As(err, &ee) {
+			return out, fmt.Errorf("running supavise-aws-deploy.sh: %w", err)
 		}
-		return nodeupgrade.StackOutcome{}, fmt.Errorf("running supavise-aws-deploy.sh: %w", err)
+		code := ee.ExitCode()
+		if code != 4 {
+			return out, &nodeupgrade.StackError{Code: code, Err: fmt.Errorf("supavise-aws-deploy.sh update exited with status %d", code)}
+		}
+		out.GuardLeftOn = true
 	}
 	// The stack is known now: later runs and `supavise status` need not be told its name.
 	if err := writeAWSConfig(filepath.Dir(h.cfgPath), stack); err != nil {
 		fmt.Fprintf(h.errw, "warning: could not record the stack name in config.d: %v\n", err)
 	}
-	return nodeupgrade.StackOutcome{}, nil
+	return out, nil
+}
+
+// runStackScript runs the stack script and waits for it, passing on each signal from sigs. A Ctrl-C
+// at the terminal reaches the script by itself as well; it takes one that comes twice within two
+// seconds for one. A signal the script has no trap for (before its guard is set) ends it, as it would
+// end it at the terminal.
+func runStackScript(cmd *exec.Cmd, sigs <-chan os.Signal) error {
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	for {
+		select {
+		case err := <-done:
+			return err
+		case s := <-sigs:
+			_ = cmd.Process.Signal(s)
+		}
+	}
 }
 
 // scriptTestHookVars are the variables that replace what supavise-aws-deploy.sh trusts: the release

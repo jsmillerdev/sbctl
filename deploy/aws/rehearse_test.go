@@ -16,6 +16,19 @@ DIR="$(dirname "$0")"
 echo "$*" >> "$DIR/aws.log"
 arg() { local k=$1; shift; while [ $# -gt 0 ]; do if [ "$1" = "$k" ]; then echo "$2"; return; fi; shift; done; }
 case "$*" in
+  *"cloudformation create-stack"*) p=$(arg --parameters "$@"); cp "${p#file://}" "$DIR/console-params.json" ;;
+  *"ParameterKey=='AmiId'"*) if [ -f "$DIR/updated" ]; then echo ami-0bbbbbbbbbbbbbbbb; else echo; fi ;;
+  *"ec2 describe-instances"*"ImageId"*) echo ami-0bbbbbbbbbbbbbbbb ;;
+  *"describe-change-set"*) echo '{"Changes": [{"Type": "Resource", "ResourceChange": {"LogicalResourceId": "Instance"}}]}' ;;
+  *"ssm get-parameter"*) echo ami-0aaaaaaaaaaaaaaaa ;;
+  *"ec2 describe-images"*) printf 'ami-0aaaaaaaaaaaaaaaa\tami-0bbbbbbbbbbbbbbbb\tami-0cccccccccccccccc\tami-0dddddddddddddddd\n' ;;
+  *"cloudformation update-stack"*) p=$(arg --parameters "$@"); cp "${p#file://}" "$DIR/denial-params.json"; touch "$DIR/denied" ;;
+  *"Stacks[0].StackStatus"*) if [ -f "$DIR/denied" ]; then echo "${DENIAL_STATUS-UPDATE_ROLLBACK_COMPLETE}"; else echo CREATE_COMPLETE; fi ;;
+  *"describe-stack-events"*"UPDATE_FAILED"*) printf 'Instance\tUPDATE_FAILED\tAction denied by stack policy: Statement [#2] has a Deny effect\n' ;;
+  *"set-stack-policy"*) b=$(arg --stack-policy-body "$@"); k=$(grep -c 'set-stack-policy' "$DIR/aws.log"); cp "${b#file://}" "$DIR/policy-$k.json" ;;
+  *"get-stack-policy"*)
+    if [ -n "$POLICY_LEFT" ]; then echo '{"Statement": [{"Effect": "Allow", "Action": "Update:*", "Principal": "*", "Resource": "*"}, {"Effect": "Deny", "Action": "Update:Replace", "Principal": "*", "Resource": "*"}]}'
+    else echo '{"Statement": [{"Effect": "Allow", "Action": "Update:*", "Principal": "*", "Resource": "*"}]}'; fi ;;
   *"OutputKey=='InstanceId'"*) if [ -f "$DIR/replaced" ]; then echo i-0newnewnewnew0001; else echo i-0123456789abcdef0; fi ;;
   *"OutputKey=='BackupBucket'"*) echo supavise-rehearsal-backup ;;
   *"OutputKey=='ObjectsBucket'"*) echo supavise-rehearsal-objects ;;
@@ -40,10 +53,15 @@ DIR="$(dirname "$0")"
 echo "$*" >> "$DIR/deploy.log"
 echo "${SUPAVISE_IMDS_ENDPOINT-unset}" >> "$DIR/imds.log"
 case "$1" in
+  __params) echo '[]' ;;
+  __guard) echo '{"Statement": [{"Effect": "Allow", "Action": "Update:*", "Principal": "*", "Resource": "*"}, {"Effect": "Deny", "Action": "Update:Replace", "Principal": "*", "Resource": "*", "Condition": {"StringEquals": {"ResourceType": ["AWS::EC2::Instance"]}}}]}'
+    echo '{"Statement": [{"Effect": "Allow", "Action": "Update:*", "Principal": "*", "Resource": "*"}]}' >"$5" ;;
   update)
     n=$(grep -c '^update' "$DIR/deploy.log")
     if [ "$n" -ge 2 ]; then echo "Nothing to change: the stack already matches this template."; exit 0; fi
+    touch "$DIR/updated"
     echo "  add      ObjectsBucket (AWS::S3::Bucket)"
+    if [ -n "$UPDATE_GUARDED" ]; then echo "  guarded  Instance (AWS::EC2::Instance) may be replaced: Tags, ImageId, MetadataOptions; ImageId is resolved when the change set runs"; fi
     if [ -n "$UPDATE_REPLACES" ]; then echo "  REPLACE  Instance (AWS::EC2::Instance) would be replaced: ImageId"; touch "$DIR/replaced" "$DIR/recreated"; fi
     if [ -n "$UPDATE_REBOOTS" ]; then touch "$DIR/rebooted"; fi
     exit "${UPDATE_RC-0}" ;;
@@ -65,6 +83,7 @@ func rehearse(t *testing.T, env []string, args ...string) (result, string) {
 	script, _ := filepath.Abs("rehearse.sh")
 	cmd := exec.Command(bashes(t)[0], append([]string{script}, args...)...)
 	cmd.Env = append([]string{"PATH=" + dir + ":/usr/bin:/bin", "HOME=" + t.TempDir(), "TMPDIR=" + t.TempDir(), "SUPAVISE_REHEARSE_DEPLOY=" + filepath.Join(dir, "deploy.sh")}, env...)
+	cmd.Dir = dir // what it saves in the current directory lands here
 	var so, se strings.Builder
 	cmd.Stdout, cmd.Stderr = &so, &se
 	err := cmd.Run()
@@ -245,5 +264,129 @@ func TestRehearseKeepAndPurge(t *testing.T) {
 	}
 	if strings.Contains(r.stdout, "Left in your account") {
 		t.Errorf("--purge leaves nothing:\n%s", r.stdout)
+	}
+}
+
+// --console-stack: the stack is made as the CloudFormation console makes it, with AmiId empty, so
+// that the update has to pin the image and runs under deploy.sh's guard.
+func TestRehearseConsoleStack(t *testing.T) {
+	r, dir := rehearse(t, nil, "--region", "us-east-1", "--email", "a@b.co", "--dry-run", "--console-stack")
+	if r.code != 0 {
+		t.Fatalf("exit %d\n%s\n%s", r.code, r.stdout, r.stderr)
+	}
+	for _, want := range []string{"AmiId is left empty", "cloudformation create-stack --stack-name supavise-rehearsal-", "--template-body file://",
+		"testdata/supavise-v0.1.1.yaml --capabilities CAPABILITY_IAM", "wait stack-create-complete", "get-stack-policy --stack-name supavise-rehearsal-"} {
+		if !strings.Contains(r.stdout, want) {
+			t.Errorf("the plan lacks %q:\n%s", want, r.stdout)
+		}
+	}
+	if strings.Contains(r.stdout, "--version v0.1.1 --template") {
+		t.Errorf("the console's stack is not made by deploy.sh:\n%s", r.stdout)
+	}
+	if len(fileLines(t, filepath.Join(dir, "aws.log"))) != 0 || len(fileLines(t, filepath.Join(dir, "deploy.log"))) != 0 {
+		t.Error("a dry run called aws or deploy.sh")
+	}
+
+	r, dir = rehearse(t, []string{"UPDATE_GUARDED=1"}, "--region", "us-east-1", "--email", "a@b.co", "--yes", "--console-stack")
+	if r.code != 0 {
+		t.Fatalf("exit %d\n%s\n%s", r.code, r.stdout, r.stderr)
+	}
+	for _, want := range []string{"the console's way, AmiId empty", "PASS  the update ran", "PASS  the instance is the same",
+		"PASS  the stack was made with an empty AmiId", "PASS  the stack's AmiId is the image the instance runs (ami-0bbbbbbbbbbbbbbbb, instance: ami-0bbbbbbbbbbbbbbbb)",
+		"PASS  the stack policy allows every update again", "INFO  the review called the instance: guarded  Instance (AWS::EC2::Instance) may be replaced",
+		"== every check passed"} {
+		if !strings.Contains(r.stdout, want) {
+			t.Errorf("output lacks %q:\n%s", want, r.stdout)
+		}
+	}
+	// The stack is made with create-stack and the v0.1.1 template, and without AmiId; deploy.sh updates
+	// it twice and deletes it.
+	log := strings.Join(fileLines(t, filepath.Join(dir, "aws.log")), "\n")
+	if !strings.Contains(log, "cloudformation create-stack --stack-name supavise-rehearsal-") || !strings.Contains(log, "supavise-v0.1.1.yaml --capabilities CAPABILITY_IAM") {
+		t.Errorf("aws calls:\n%s", log)
+	}
+	b, err := os.ReadFile(filepath.Join(dir, "console-params.json"))
+	if err != nil || strings.Contains(string(b), "AmiId") || !strings.Contains(string(b), `"ParameterKey": "AdminEmail", "ParameterValue": "a@b.co"`) ||
+		!strings.Contains(string(b), `"ParameterKey": "SupaviseVersion", "ParameterValue": "v0.1.1"`) {
+		t.Errorf("the parameters of the console's stack: %s (%v)", b, err)
+	}
+	// deploy.sh builds the parameters of the change set that is saved (as AWS gave it), updates the
+	// stack twice and deletes it.
+	d := fileLines(t, filepath.Join(dir, "deploy.log"))
+	if len(d) != 4 || !strings.HasPrefix(d[0], "__params ") || !strings.Contains(d[0], " AmiId=ami-0bbbbbbbbbbbbbbbb Failover=on PeerCidr1=198.51.100.0/24") ||
+		!strings.HasPrefix(d[1], "update ") || !strings.HasPrefix(d[2], "update ") || !strings.Contains(d[3], "--delete --yes") {
+		t.Errorf("deploy.sh calls: %v", d)
+	}
+	if !strings.Contains(log, "cloudformation create-change-set --stack-name supavise-rehearsal-") || !strings.Contains(log, "--change-set-name rehearsal-capture --include-property-values --output json") ||
+		!strings.Contains(log, "delete-change-set --stack-name supavise-rehearsal-") || strings.Contains(log, "update-stack") {
+		t.Errorf("aws calls:\n%s", log)
+	}
+	if saved, _ := filepath.Glob(filepath.Join(dir, "rehearsal-changeset-supavise-rehearsal-*.json")); len(saved) != 1 || !strings.Contains(r.stdout, "INFO  the change set is saved in ") || !strings.Contains(r.stdout, filepath.Base(saved[0])) {
+		t.Errorf("saved %v; output:\n%s", saved, r.stdout)
+	} else if b, _ := os.ReadFile(saved[0]); !strings.Contains(string(b), `"LogicalResourceId": "Instance"`) {
+		t.Errorf("the saved change set: %s", b)
+	}
+
+	// A guard left on the stack is a failed check.
+	r, _ = rehearse(t, []string{"UPDATE_GUARDED=1", "POLICY_LEFT=1"}, "--region", "us-east-1", "--email", "a@b.co", "--yes", "--console-stack")
+	if r.code != 1 || !strings.Contains(r.stdout, "FAIL  the stack policy allows every update again") {
+		t.Errorf("exit %d\n%s", r.code, r.stdout)
+	}
+}
+
+// --force-denial: the guard is set by hand and an update with another image must fail and roll
+// back, before the update of the rehearsal.
+func TestRehearseForceDenial(t *testing.T) {
+	r, _ := rehearse(t, nil, "--region", "us-east-1", "--email", "a@b.co", "--force-denial")
+	if r.code != 2 || !strings.Contains(r.stderr, "--force-denial needs --console-stack") {
+		t.Errorf("exit %d\n%s", r.code, r.stderr)
+	}
+	r, _ = rehearse(t, nil, "--region", "us-east-1", "--email", "a@b.co", "--dry-run", "--console-stack", "--force-denial")
+	for _, want := range []string{"__guard", "set-stack-policy --stack-name supavise-rehearsal-", "update-stack --stack-name supavise-rehearsal-", "UPDATE_FAILED"} {
+		if r.code != 0 || !strings.Contains(r.stdout, want) {
+			t.Errorf("exit %d: the plan lacks %q:\n%s", r.code, want, r.stdout)
+		}
+	}
+
+	r, dir := rehearse(t, []string{"UPDATE_GUARDED=1"}, "--region", "us-east-1", "--email", "a@b.co", "--yes", "--console-stack", "--force-denial")
+	if r.code != 0 {
+		t.Fatalf("exit %d\n%s\n%s", r.code, r.stdout, r.stderr)
+	}
+	for _, want := range []string{"PASS  CloudFormation took the update that needs another image",
+		"PASS  the update failed and rolled back completely with the guard on (UPDATE_ROLLBACK_COMPLETE",
+		"PASS  an event of the update names the stack policy", "Instance\tUPDATE_FAILED\tAction denied by stack policy",
+		"PASS  the instance is the same after the denial", "PASS  the stack's policy is put back after the denial", "== every check passed"} {
+		if !strings.Contains(r.stdout, want) {
+			t.Errorf("output lacks %q:\n%s", want, r.stdout)
+		}
+	}
+	// The image is neither the instance's nor the current one; the guard comes first and the policy
+	// it saved is put back after.
+	d := fileLines(t, filepath.Join(dir, "deploy.log"))
+	if len(d) < 3 || !strings.HasPrefix(d[1], "__guard ") || !strings.Contains(d[2], "AmiId=ami-0cccccccccccccccc") {
+		t.Errorf("deploy.sh calls: %v", d)
+	}
+	log := fileLines(t, filepath.Join(dir, "aws.log"))
+	set, upd := -1, -1
+	for i, l := range log {
+		if strings.Contains(l, "set-stack-policy") && set < 0 {
+			set = i
+		}
+		if strings.Contains(l, "update-stack") {
+			upd = i
+		}
+	}
+	if set < 0 || upd < 0 || set > upd {
+		t.Errorf("the guard is not set before the update:\n%s", strings.Join(log, "\n"))
+	}
+	if b, _ := os.ReadFile(filepath.Join(dir, "policy-2.json")); !strings.Contains(string(b), `"Allow"`) || strings.Contains(string(b), "Deny") {
+		t.Errorf("the policy put back: %s", b)
+	}
+
+	// A rollback that stops is reported, and resumed without the guard.
+	r, _ = rehearse(t, []string{"UPDATE_GUARDED=1", "DENIAL_STATUS=UPDATE_ROLLBACK_FAILED"}, "--region", "us-east-1", "--email", "a@b.co", "--yes", "--console-stack", "--force-denial")
+	if r.code != 1 || !strings.Contains(r.stdout, "FAIL  the update failed and rolled back completely with the guard on (UPDATE_ROLLBACK_COMPLETE; got: UPDATE_ROLLBACK_FAILED)") ||
+		!strings.Contains(r.stdout, "resuming the rollback") {
+		t.Errorf("exit %d\n%s", r.code, r.stdout)
 	}
 }
