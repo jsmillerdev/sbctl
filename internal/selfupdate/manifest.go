@@ -9,11 +9,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"regexp"
+	"slices"
 )
 
 // ManifestAsset is the release manifest: a small JSON file attached to every release and listed
-// in SHA256SUMS, so the signature over the list covers it. Download it only through Fetch or
-// Verify, which check that.
+// in SHA256SUMS, so the signature over the list covers it. Download it only through Fetch, which
+// checks that.
 const ManifestAsset = "supavise-release.json"
 
 // ManifestSchema is the schema number this binary reads. A manifest with a higher number is
@@ -93,33 +94,18 @@ func (m *Manifest) Validate() error {
 	}
 	v, _ := ParseVersion(m.Version)
 	min, _ := ParseVersion(m.MinUpgradeFrom)
-	for i := range v {
-		if min[i] != v[i] {
-			if min[i] > v[i] {
-				return fmt.Errorf("release manifest min_upgrade_from %s is newer than its version %s", m.MinUpgradeFrom, m.Version)
-			}
-			break
-		}
+	if slices.Compare(min[:], v[:]) > 0 {
+		return fmt.Errorf("release manifest min_upgrade_from %s is newer than its version %s", m.MinUpgradeFrom, m.Version)
 	}
 	if m.MinPeerFrom != "" {
 		if !versionRe.MatchString(m.MinPeerFrom) {
 			return fmt.Errorf("release manifest min_peer_from %q is not vMAJOR.MINOR.PATCH[-suffix]", m.MinPeerFrom)
 		}
-		if peer, _ := ParseVersion(m.MinPeerFrom); newerParts(peer, v) {
+		if peer, _ := ParseVersion(m.MinPeerFrom); slices.Compare(peer[:], v[:]) > 0 {
 			return fmt.Errorf("release manifest min_peer_from %s is newer than its version %s", m.MinPeerFrom, m.Version)
 		}
 	}
 	return nil
-}
-
-// newerParts reports whether a is a later version than b (the numbers only).
-func newerParts(a, b [3]int) bool {
-	for i := range a {
-		if a[i] != b[i] {
-			return a[i] > b[i]
-		}
-	}
-	return false
 }
 
 // ParseManifest reads and validates a manifest. Unknown fields are ignored, so that a later
@@ -181,26 +167,18 @@ type Verified struct {
 	Key int
 }
 
-// Fetch resolves the release o selects (the latest stable one, or o.Tag) and verifies it as Verify
-// does. It is what `supavise upgrade` calls to read the manifest of the release it would install.
+// Fetch resolves the release o selects (the latest stable one, or o.Tag), downloads the checksum
+// list, its signature and the manifest, and checks all three: the signature of the list against
+// o's keys (the embedded current and next key when none are given), the manifest against the
+// checksum the signed list holds for it, and the manifest's version against the release tag. It
+// returns before anything else is downloaded. It is what `supavise upgrade` calls to read the
+// manifest of the release it would install.
 func Fetch(ctx context.Context, o Options) (*Verified, error) {
 	keys, err := o.keys()
 	if err != nil {
 		return nil, err
 	}
 	rel, err := Latest(ctx, o)
-	if err != nil {
-		return nil, err
-	}
-	return o.verify(ctx, rel, keys)
-}
-
-// Verify downloads the checksum list, its signature and the manifest of rel, and checks all
-// three: the signature of the list against o's keys (the embedded current and next key when none
-// are given), the manifest against the checksum the signed list holds for it, and the manifest's
-// version against the release tag. It returns before anything else is downloaded.
-func Verify(ctx context.Context, o Options, rel *Release) (*Verified, error) {
-	keys, err := o.keys()
 	if err != nil {
 		return nil, err
 	}
