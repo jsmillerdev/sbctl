@@ -4,6 +4,9 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"reflect"
+	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -118,6 +121,9 @@ type Controller struct {
 	// capacityAlerted holds the nodes that have a replica_capacity alert open.
 	capacityAlerted map[string]bool
 	warned          map[string]bool
+	// lastReport is the instances of each node's last report, by node, so that HandleReport wakes the
+	// pass for a report that says something new and not for one that repeats the last.
+	lastReport map[string][]peerapi.InstanceStatus
 
 	// runCtx is the context of Run while it runs; Restart's background call ends with it.
 	runCtx context.Context
@@ -149,7 +155,7 @@ func New(o Options) *Controller {
 	c := &Controller{
 		o: o, cfg: o.Config, reg: o.Registry, log: o.Log, to: o.Timeouts.withDefaults(), now: o.Now,
 		state: map[string]*replicaState{}, busy: map[string]bool{}, capacityAlerted: map[string]bool{},
-		warned: map[string]bool{}, wake: make(chan struct{}, 1), workers: make(chan struct{}, maxWorkers),
+		warned: map[string]bool{}, lastReport: map[string][]peerapi.InstanceStatus{}, wake: make(chan struct{}, 1), workers: make(chan struct{}, maxWorkers),
 	}
 	if c.log == nil {
 		c.log = slog.New(slog.DiscardHandler)
@@ -165,6 +171,16 @@ func (c *Controller) interval() time.Duration {
 		return c.o.Interval
 	}
 	return 10 * time.Second
+}
+
+// reportSlack is how late a node's report may come, past the period nodes send them at, and still be the
+// latest word on a replica.
+const reportSlack = 3 * time.Second
+
+// reportWindow is how old a node's report may be before monitor asks the node itself: the period nodes
+// report at (cluster.ReportEvery) plus slack, and never less than a pass interval less a second.
+func (c *Controller) reportWindow() time.Duration {
+	return max(cluster.ReportEvery+reportSlack, c.interval()-time.Second)
 }
 
 func (c *Controller) minGap() time.Duration {
@@ -400,10 +416,11 @@ func (c *Controller) work(ctx context.Context, r *registry.Replica, project regi
 }
 
 // HandleReport implements ReportSink: it takes the instances a node reports as observations, for
-// the replicas that really are on that node.
+// the replicas that really are on that node. A report that changes what the node said last time wakes
+// the pass at once; one that repeats it only refreshes the observations, which the periodic pass reads.
 func (c *Controller) HandleReport(ctx context.Context, rep peerapi.Report) {
 	if len(rep.Instances) == 0 {
-		c.kick()
+		c.reportChanged(rep.Node, nil) // the next report with instances is news
 		return
 	}
 	// The intake runs this in its own goroutine and must not wait long: one query for the node's
@@ -429,7 +446,29 @@ func (c *Controller) HandleReport(ctx context.Context, rep peerapi.Report) {
 		st.Ref = r.Ref
 		c.observed(r.Identifier, st)
 	}
-	c.kick()
+	if c.reportChanged(rep.Node, rep.Instances) {
+		c.kick()
+	}
+}
+
+// reportChanged remembers the instances node reported and says whether they differ from the ones it
+// reported before: the first report of a node does, and so does a change of any field but the time of
+// the observation.
+func (c *Controller) reportChanged(node string, instances []peerapi.InstanceStatus) bool {
+	next := slices.Clone(instances)
+	for i := range next {
+		next[i].At = time.Time{}
+	}
+	slices.SortFunc(next, func(a, b peerapi.InstanceStatus) int { return strings.Compare(a.Identifier, b.Identifier) })
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	prev, seen := c.lastReport[node]
+	if len(next) == 0 {
+		delete(c.lastReport, node)
+	} else {
+		c.lastReport[node] = next
+	}
+	return len(next) > 0 && (!seen || !reflect.DeepEqual(prev, next))
 }
 
 // nodeLabel is how a message names a node: the operator's name for it.

@@ -102,7 +102,7 @@ func (c *Controller) monitor(ctx context.Context, r *registry.Replica, project r
 	if paused(project) {
 		return // the replica stops and starts with its project
 	}
-	obs, ok := c.fresh(r.Identifier, c.interval()-time.Second)
+	obs, ok := c.fresh(r.Identifier, c.reportWindow())
 	if !ok {
 		st, err := c.o.Ops.Observe(ctx, r.NodeID, r.Identifier)
 		if err != nil {

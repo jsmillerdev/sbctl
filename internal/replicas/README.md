@@ -12,7 +12,7 @@ The registry rows are the desired state. The controller is level triggered: each
 | `Remover`: `RemoveAll(ref)`, `RemoveOn(node)` | a project delete or in-place restore (replicas first), `supavise node rm`; neither records an opt-out |
 | `ReportSink`: `HandleReport` | the peer API's `POST /peer/v1/report` intake (internal/mesh) |
 
-`HandleReport` trusts `Report.Node`: it takes an instance from a report only when the row is on that node and, when the status names a project, the row's own. It reads the node's replicas with one query per report, however many instances it holds. The intake must therefore set `Node` from the node's mutually authenticated identity, never from the request body (the mesh intake does), and hand the report over with a closure that supplies the context: `reports.Subscribe(func(rep peerapi.Report) { sink.HandleReport(ctx, rep) })`.
+`HandleReport` trusts `Report.Node`: it takes an instance from a report only when the row is on that node and, when the status names a project, the row's own. It reads the node's replicas with one query per report, however many instances it holds. A report wakes the pass only when its instances differ from the node's last report in a field other than the observation time (the first report of a node, and the first after an empty one, differ); an empty report or a repeat only refreshes the observations, and the periodic pass reads them. The intake must therefore set `Node` from the node's mutually authenticated identity, never from the request body (the mesh intake does), and hand the report over with a closure that supplies the context: `reports.Subscribe(func(rep peerapi.Report) { sink.HandleReport(ctx, rep) })`.
 
 The standby of the system cluster on a joining node is recorded by `replicaid.EnsureSystem` (`internal/replicas/replicaid`), which the cluster join calls. It lives in its own package because the controller depends on `internal/placement`, which depends on `internal/cluster`, so the join cannot import this package. `replicaid` also holds the naming rule (`Region`, `Short`, `Identifier`, `Create`) the controller and the CLI use.
 
@@ -56,7 +56,7 @@ The standby of the system cluster (`origin = "system"`) is the exception: the jo
 
 ## Status and lag
 
-For a replica past its setup, each pass takes the node's latest observation (a report, or a poll of `Observe` when the last report is older than the interval) and maps it (design 2.7.7):
+For a replica past its setup, each pass takes the node's latest observation (a report, or a poll of `Observe` when the last report is older than the reporting period, `cluster.ReportEvery`, plus 3 seconds, and never less than the interval less a second) and maps it (design 2.7.7):
 
 - `ACTIVE_HEALTHY`: Postgres up, PostgREST ready, the receiver streaming, lag at most `unhealthy_lag_seconds`.
 - `ACTIVE_UNHEALTHY`: the receiver not streaming for 2 minutes, PostgREST down, Postgres down, lag over the limit, or the node silent for 2 minutes. It raises `replica_unhealthy`, and resolves it when the replica is well again. A lag over 60 seconds (or half the limit, if lower) that is still within the limit raises `replica_lag`.

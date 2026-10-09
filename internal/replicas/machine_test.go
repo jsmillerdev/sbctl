@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/supavise/supavise/internal/alerts"
+	"github.com/supavise/supavise/internal/cluster"
 	"github.com/supavise/supavise/internal/lifecycle"
 	"github.com/supavise/supavise/internal/mesh"
 	"github.com/supavise/supavise/internal/placement"
@@ -526,6 +527,88 @@ func TestHandleReportRecordsOnlyTheNodesOwnInstances(t *testing.T) {
 	e.tick(1)
 	if got := e.nodes.callsMatching("observe n2 " + id); got != calls {
 		t.Fatalf("polled despite a fresh report: %d -> %d", calls, got)
+	}
+}
+
+// A report wakes the pass when it says something new: an empty one, or one that repeats the last report
+// of the node (but for the time of the observation), does not. It refreshes the observations all the same.
+func TestHandleReportWakesThePassOnlyForNews(t *testing.T) {
+	e := newEnv(t)
+	id := e.activeReplica().Identifier
+	woken := func() bool {
+		select {
+		case <-e.ctrl.wake:
+			return true
+		default:
+			return false
+		}
+	}
+	woken() // a pass that the setup asked for
+	st := fakeStatus(id, refA)
+	st.At = e.clock.Now()
+
+	e.ctrl.HandleReport(e.ctx, reportOf("n2"))
+	if woken() {
+		t.Fatal("an empty report woke the pass")
+	}
+	e.ctrl.HandleReport(e.ctx, reportOf("n2", st))
+	if !woken() {
+		t.Fatal("the first report of the node did not wake the pass")
+	}
+	e.clock.Advance(10 * time.Second)
+	again := st
+	again.At = e.clock.Now()
+	e.ctrl.HandleReport(e.ctx, reportOf("n2", again))
+	if woken() {
+		t.Fatal("a report that repeats the last woke the pass")
+	}
+	if _, ok := e.ctrl.fresh(id, time.Second); !ok {
+		t.Fatal("a report that repeats the last did not refresh the observation")
+	}
+	// A report of another node is its own.
+	e.ctrl.HandleReport(e.ctx, reportOf("n3", fakeStatus("zzz", refA)))
+	woken()
+	lag := 90.0
+	changed := again
+	changed.LagSeconds = &lag
+	e.ctrl.HandleReport(e.ctx, reportOf("n2", changed))
+	if !woken() {
+		t.Fatal("a report with a changed field did not wake the pass")
+	}
+	changed.PostgRESTReady = false
+	e.ctrl.HandleReport(e.ctx, reportOf("n2", changed))
+	if !woken() {
+		t.Fatal("a report with another field changed did not wake the pass")
+	}
+	// An instance that dropped out of the reports and came back is news.
+	e.ctrl.HandleReport(e.ctx, reportOf("n2"))
+	e.ctrl.HandleReport(e.ctx, reportOf("n2", changed))
+	if !woken() {
+		t.Fatal("an instance that came back did not wake the pass")
+	}
+}
+
+// The monitor takes a node's report for current for as long as the nodes' reporting period and some
+// slack, so that a pass between two reports does not ask the node.
+func TestMonitorTrustsAReportForThePeriodPlusSlack(t *testing.T) {
+	e := newEnv(t)
+	id := e.activeReplica().Identifier
+	report := func() {
+		e.ctrl.HandleReport(e.ctx, reportOf("n2", fakeStatus(id, refA)))
+	}
+	polls := func() int { return e.nodes.callsMatching("observe n2 " + id) }
+
+	report()
+	before := polls()
+	e.clock.Advance(cluster.ReportEvery + time.Second) // the next report is due: the pass comes first
+	e.tick(1)
+	if got := polls(); got != before {
+		t.Fatalf("asked the node although its report was %s old: %d -> %d", cluster.ReportEvery+time.Second, before, got)
+	}
+	e.clock.Advance(cluster.ReportEvery) // a report that never came
+	e.tick(1)
+	if got := polls(); got != before+1 {
+		t.Fatalf("a report from two periods ago was taken for current: %d -> %d", before, got)
 	}
 }
 
