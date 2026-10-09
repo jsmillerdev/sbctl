@@ -42,6 +42,14 @@ const (
 	KindHostNotConverged = "host_not_converged" // `supavise system converge` has not run for this release
 	KindStandbyBehind    = "standby_behind"     // the registry is newer than this binary, which leaves running instances alone
 
+	// OAuth sign-in for MCP clients. KindOAuthTokenReuse is raised by the OAuth service
+	// (internal/oauth) when a refresh token that was exchanged already, or an authorization code that
+	// was redeemed already, is presented again: it ends the grant the token belongs to and tells the
+	// operator, because a client that replays one is a stolen credential or a client that lost its state.
+	// It is a condition with a key per grant (oauth_token_reuse/<grant id>), so one grant alerts once
+	// however often its dead tokens knock. Nothing resolves it.
+	KindOAuthTokenReuse = "oauth_token_reuse"
+
 	KindTest = "test"
 )
 
