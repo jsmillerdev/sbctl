@@ -2,7 +2,10 @@ package oauth
 
 import (
 	"context"
+	"io"
 	"log/slog"
+	"strings"
+	"sync"
 	"time"
 )
 
@@ -14,7 +17,24 @@ import (
 // Store, Issuer and DashboardURL has a safe default. internal/api completes a Service it is given
 // (Deps.OAuth) or builds one from the registry; the operator CLI builds its own over a Store.
 //
-// This file is a stub: every method returns ErrNotImplemented until the rules are written.
+// # Rules the Service keeps (section 2 of the design)
+//
+//   - Registration (register.go): open RFC 7591 registration of dynamic apps, validated field by
+//     field; manual apps are published by an organization (CreateApp). Client names are cleaned, URLs
+//     are checked and never fetched, and a logo is stored and never returned.
+//   - Authorization (authorize.go): client_id and redirect_uri are validated before anything can
+//     redirect; PKCE (S256 only) is required of dynamic apps; scopes are narrowed to the app's; the
+//     resource must be this server's. Approval stores the SHA-256 of a one-time code.
+//   - Tokens (token.go): a code is redeemed once, in one transaction, bound to its client, its exact
+//     redirect_uri, its resource, its challenge, its approver and its organization; any mismatch burns
+//     it and a replay revokes the grant it created. A refresh token rotates on every use; a reuse after
+//     RefreshGrace revokes the grant. Whether the user may still hold a grant (Admit) is asked outside
+//     any transaction, so that no pooled connection waits for another.
+//   - Revocation (revoke.go): one path ends grants, writes the audit event and returns what it ended.
+//   - Housekeeping (prune.go): lazy, from Register and Exchange, at most once per PruneEvery per node.
+//
+// A secret is generated here, handed to its owner once and given to the Store only as its SHA-256.
+// Nothing secret reaches a log line, an audit payload, an alert or an error description.
 type Service struct {
 	// Store keeps the apps, authorizations, grants and tokens. Required.
 	Store Store
@@ -42,94 +62,68 @@ type Service struct {
 	Alert func(ctx context.Context, e AlertEvent)
 	// Log is the logger; nil discards. Dynamic registrations are logged at info level here.
 	Log *slog.Logger
+
+	// pruneMu guards lastPrune, the time of the last lazy prune on this node (prune.go).
+	pruneMu   sync.Mutex
+	lastPrune time.Time
 }
 
 var _ Authority = (*Service)(nil)
 
-func (s *Service) Register(ctx context.Context, req RegisterRequest) (*RegisteredApp, error) {
-	return nil, ErrNotImplemented
+var discardLog = slog.New(slog.NewTextHandler(io.Discard, nil))
+
+// now is the Service's clock. Every comparison with a stored time uses it, never time.Now.
+func (s *Service) now() time.Time {
+	if s.Now != nil {
+		return s.Now().UTC()
+	}
+	return time.Now().UTC()
 }
 
-func (s *Service) StartAuthorization(ctx context.Context, req AuthorizeRequest) (*AuthorizeResult, error) {
-	return nil, ErrNotImplemented
+func (s *Service) log() *slog.Logger {
+	if s.Log != nil {
+		return s.Log
+	}
+	return discardLog
 }
 
-func (s *Service) Describe(ctx context.Context, authID string) (*AuthorizationView, error) {
-	return nil, ErrNotImplemented
+// issuer is Issuer without a trailing slash: the "iss" of responses.
+func (s *Service) issuer() string { return strings.TrimRight(s.Issuer, "/") }
+
+// audit records an event. The payload never carries a token, code, secret, state or challenge.
+func (s *Service) audit(ctx context.Context, kind string, payload map[string]any) {
+	if s.Audit != nil {
+		s.Audit(ctx, kind, payload)
+	}
 }
 
-func (s *Service) Approve(ctx context.Context, req ApproveRequest) (*ApproveResult, error) {
-	return nil, ErrNotImplemented
+func (s *Service) alert(ctx context.Context, e AlertEvent) {
+	if s.Alert != nil {
+		s.Alert(ctx, e)
+	}
 }
 
-func (s *Service) Decline(ctx context.Context, req DeclineRequest) error { return ErrNotImplemented }
-
-func (s *Service) Exchange(ctx context.Context, req TokenRequest) (*TokenResponse, error) {
-	return nil, ErrNotImplemented
+// admit asks whether the user may hold a grant in the organization. Without an Admit nobody does.
+func (s *Service) admit(ctx context.Context, userID string, orgID int64) error {
+	if s.Admit == nil {
+		return ErrNotAdmitted
+	}
+	return s.Admit(ctx, userID, orgID)
 }
 
-func (s *Service) Revoke(ctx context.Context, req RevokeRequest) error { return ErrNotImplemented }
-
-func (s *Service) LookupAccess(ctx context.Context, token string) (*AccessInfo, error) {
-	return nil, ErrNotImplemented
+// serverError logs the cause of an internal failure of an endpoint that answers in OAuth JSON and
+// returns the generic error to send. The cause is a store or driver error; it holds no secret.
+func (s *Service) serverError(ctx context.Context, op string, err error) *Error {
+	s.log().ErrorContext(ctx, "oauth: internal error", "op", op, "error", err)
+	return &Error{Code: CodeServerError, Description: "the server could not complete the request"}
 }
 
-func (s *Service) TouchAccess(ctx context.Context, tokenID, grantID int64) error {
-	return ErrNotImplemented
-}
-
-func (s *Service) RevokeGrant(ctx context.Context, grantID int64, reason, actor string) error {
-	return ErrNotImplemented
-}
-
-func (s *Service) RevokeGrants(ctx context.Context, f GrantFilter, reason, actor string) (int, error) {
-	return 0, ErrNotImplemented
-}
-
-func (s *Service) RevokeUser(ctx context.Context, userID, reason, actor string) (int, error) {
-	return 0, ErrNotImplemented
-}
-
-func (s *Service) RevokeApp(ctx context.Context, req RevokeAppRequest) (*RevokedApp, error) {
-	return nil, ErrNotImplemented
-}
-
-func (s *Service) ListGrants(ctx context.Context, f GrantFilter) ([]GrantInfo, error) {
-	return nil, ErrNotImplemented
-}
-
-func (s *Service) ListAuthorizedApps(ctx context.Context, orgID int64) ([]AuthorizedApp, error) {
-	return nil, ErrNotImplemented
-}
-
-func (s *Service) ListPublishedApps(ctx context.Context, orgID int64) ([]App, error) {
-	return nil, ErrNotImplemented
-}
-
-func (s *Service) CreateApp(ctx context.Context, req CreateAppRequest) (*CreatedApp, error) {
-	return nil, ErrNotImplemented
-}
-
-func (s *Service) UpdateApp(ctx context.Context, req UpdateAppRequest) (*App, error) {
-	return nil, ErrNotImplemented
-}
-
-func (s *Service) DeleteApp(ctx context.Context, req DeleteAppRequest) (*App, error) {
-	return nil, ErrNotImplemented
-}
-
-func (s *Service) ListClientSecrets(ctx context.Context, orgID int64, appID string) ([]AppSecret, error) {
-	return nil, ErrNotImplemented
-}
-
-func (s *Service) CreateClientSecret(ctx context.Context, req CreateSecretRequest) (*CreatedSecret, error) {
-	return nil, ErrNotImplemented
-}
-
-func (s *Service) DeleteClientSecret(ctx context.Context, req DeleteSecretRequest) error {
-	return ErrNotImplemented
-}
-
-func (s *Service) Prune(ctx context.Context) (PruneResult, error) {
-	return PruneResult{}, ErrNotImplemented
+// redirectHost is the host name of a redirect URI, for audit payloads and the consent page; "" if
+// it does not parse.
+func redirectHost(redirectURI string) string {
+	u, err := parseRedirectURI(redirectURI)
+	if err != nil {
+		return ""
+	}
+	return u.Hostname()
 }
