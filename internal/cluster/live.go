@@ -259,6 +259,8 @@ func (l *Live) Refresh(ctx context.Context) {
 		// A fence stops the system cluster too, so a registry that cannot be read says nothing against it.
 		if l.Fenced() != nil {
 			l.publishFenced()
+		} else {
+			l.probeRole(ctx)
 		}
 		return
 	}
@@ -267,6 +269,8 @@ func (l *Live) Refresh(ctx context.Context) {
 		l.o.Log.Debug("membership: nodes not read", "error", err)
 		if l.Fenced() != nil {
 			l.publishFenced()
+		} else {
+			l.probeRole(ctx)
 		}
 		return
 	}
@@ -306,6 +310,30 @@ func (l *Live) Refresh(ctx context.Context) {
 		l.Set(snap)
 	}
 	l.watchRole(role)
+}
+
+// probeRole follows the recovery state of the system cluster alone, when the registry cannot be read. The
+// registry handle of a follower is a connection to its standby's socket, and the promotion of that standby
+// ends with a restart on the system port, which takes the socket away for good: the node has to restart in
+// the leader's role then, and the registry it would read the role from is the thing that is gone. The
+// demotion in place of a leader's system cluster stops the database in the same way. The snapshot is left
+// as it is; only a role that differs from the boot role on two polls in a row restarts the daemon.
+func (l *Live) probeRole(ctx context.Context) {
+	if l.o.InRecovery == nil {
+		return
+	}
+	rec, err := l.o.InRecovery(ctx)
+	if err != nil {
+		return
+	}
+	l.mu.Lock()
+	l.primary = !rec
+	l.mu.Unlock()
+	if rec {
+		l.watchRole(RoleFollower)
+	} else {
+		l.watchRole(RoleLeader)
+	}
 }
 
 // watchRole closes Changed when the role differs from the boot role on two polls in a row (one

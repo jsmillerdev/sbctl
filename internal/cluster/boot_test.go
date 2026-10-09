@@ -1097,3 +1097,47 @@ func TestLiveShowsThePromotedEpoch(t *testing.T) {
 		t.Fatalf("epoch %d", m.Epoch())
 	}
 }
+
+// The registry handle of a follower is a connection to its standby's socket. The promotion ends with a
+// restart on the system port that takes the socket away, so the cluster row cannot be read when the node
+// has to see that it leads: the recovery probe decides alone, and the daemon restarts in the new role.
+func TestLiveFollowsTheProbeWhenTheRegistryCannotBeRead(t *testing.T) {
+	p := &probe{rec: true}
+	l, reg, _ := newLive(t, BootDecision{Role: RoleFollower, SelfID: "n2"}, p)
+	l.o.Reg = unreadable{reg}
+	ctx := context.Background()
+	l.Refresh(ctx) // a standby, as it booted: nothing changes
+	select {
+	case <-l.Changed():
+		t.Fatal("a standby that is still one changed the role")
+	default:
+	}
+	p.set(false, errors.New("the socket is gone"))
+	l.Refresh(ctx) // the probe finds nothing to say
+	p.set(false, nil)
+	l.Refresh(ctx) // one poll of a primary is not yet a change
+	select {
+	case <-l.Changed():
+		t.Fatal("one poll was taken for a change")
+	default:
+	}
+	l.Refresh(ctx)
+	select {
+	case <-l.Changed():
+		if !strings.Contains(l.Why(), "started as follower and is now leader") {
+			t.Fatalf("why: %q", l.Why())
+		}
+	default:
+		t.Fatal("a primary on the system port did not restart a follower whose registry cannot be read")
+	}
+	if l.Role() != RoleFollower {
+		t.Fatalf("the snapshot is the registry's to publish, not the probe's: role %s", l.Role())
+	}
+}
+
+// unreadable is a registry whose cluster row cannot be read.
+type unreadable struct{ registry.Registry }
+
+func (unreadable) GetCluster(context.Context) (*registry.Cluster, error) {
+	return nil, errors.New("the socket of the standby is gone")
+}
