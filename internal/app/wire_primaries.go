@@ -3,19 +3,15 @@ package app
 import (
 	"cmp"
 	"context"
-	"errors"
 	"fmt"
 	"log/slog"
-	"os"
-	"strconv"
-	"strings"
-	"syscall"
 	"time"
 
 	"github.com/supavise/supavise/internal/config"
 	"github.com/supavise/supavise/internal/failover"
 	"github.com/supavise/supavise/internal/failover/fenced"
 	"github.com/supavise/supavise/internal/lifecycle"
+	"github.com/supavise/supavise/internal/procutil"
 	"github.com/supavise/supavise/internal/registry"
 	"github.com/supavise/supavise/internal/secrets"
 )
@@ -160,7 +156,7 @@ func (l *localPrimaries) Healthy(ctx context.Context, ref string) (bool, string,
 // cluster must not run: a directory renamed under a live postmaster is lost data.
 func (l *localPrimaries) SetAside(ctx context.Context, ref string, epoch int64) error {
 	data := l.cfg.Paths().PostgresData(ref)
-	if alive, pid := postmasterAlive(data); alive {
+	if pid, alive := procutil.PostmasterPID(data); alive {
 		return fmt.Errorf("the cluster of %s runs here (postmaster %d); stop it before its data is set aside", ref, pid)
 	}
 	control := ""
@@ -207,19 +203,4 @@ func (l *localPrimaries) project(ctx context.Context, ref string) (*registry.Pro
 		return nil, nil, fmt.Errorf("the system cluster is back, but the registry in it does not answer: %w", err)
 	}
 	return nil, nil, err
-}
-
-// postmasterAlive reports whether the postmaster.pid in dir names a process that exists.
-func postmasterAlive(dir string) (bool, int) {
-	b, err := os.ReadFile(dir + "/postmaster.pid")
-	if err != nil {
-		return false, 0
-	}
-	first, _, _ := strings.Cut(string(b), "\n")
-	pid, err := strconv.Atoi(strings.TrimSpace(first))
-	if err != nil || pid <= 0 {
-		return false, 0
-	}
-	err = syscall.Kill(pid, 0)
-	return err == nil || errors.Is(err, syscall.EPERM), pid
 }

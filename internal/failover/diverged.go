@@ -7,13 +7,12 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/supavise/supavise/internal/config"
 	"github.com/supavise/supavise/internal/failover/fenced"
+	"github.com/supavise/supavise/internal/procutil"
 )
 
 // What a node does with the data of an old primary that another node replaced (design 2.10.8):
@@ -55,7 +54,7 @@ func SetAsideDiverged(cfg *config.Config, ref string, epoch int64, controlLSN, f
 	} else if err != nil {
 		return Diverged{}, fmt.Errorf("failover: %w", err)
 	}
-	if pid := livePostmaster(data); pid > 0 {
+	if pid, alive := procutil.PostmasterPID(data); alive {
 		return Diverged{}, fmt.Errorf("failover: %s belongs to a running postmaster (pid %d): stop the cluster before its data is set aside", data, pid)
 	}
 	dest := fmt.Sprintf("%s.diverged-%d", data, epoch)
@@ -79,29 +78,6 @@ func SetAsideDiverged(cfg *config.Config, ref string, epoch int64, controlLSN, f
 		return d, err
 	}
 	return d, nil
-}
-
-// livePostmaster returns the pid in dataDir's postmaster.pid when that process is alive, else 0. A
-// pid file that is stale (the cluster crashed) names a process that is gone, or one that is not
-// Postgres; the first is the usual case, and the second makes this refuse until the file is removed.
-func livePostmaster(dataDir string) int {
-	b, err := os.ReadFile(filepath.Join(dataDir, "postmaster.pid"))
-	if err != nil {
-		return 0
-	}
-	line, _, _ := strings.Cut(string(b), "\n")
-	pid, err := strconv.Atoi(strings.TrimSpace(line))
-	if err != nil || pid <= 0 {
-		return 0
-	}
-	proc, err := os.FindProcess(pid)
-	if err != nil {
-		return 0
-	}
-	if err := proc.Signal(syscall.Signal(0)); err != nil && !errors.Is(err, syscall.EPERM) {
-		return 0
-	}
-	return pid
 }
 
 func exists(p string) bool {

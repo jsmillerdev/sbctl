@@ -99,6 +99,10 @@ func TestLocalPrimariesStopReturnsTheShutdownCheckpoint(t *testing.T) {
 	if lsn, err := l.Stop(context.Background(), primaryRef); err == nil || lsn != "" || !strings.Contains(err.Error(), "did not shut down cleanly") {
 		t.Fatalf("a cluster that is still in production gave %q, %v", lsn, err)
 	}
+	pl.info = lifecycle.ControlInfo{State: "shut down"}
+	if lsn, err := l.Stop(context.Background(), primaryRef); err == nil || lsn != "" {
+		t.Fatalf("a cluster with no checkpoint gave %q, %v", lsn, err)
+	}
 	pl.info, pl.infoErr = lifecycle.ControlInfo{}, errors.New("no pg_control")
 	if _, err := l.Stop(context.Background(), primaryRef); err == nil {
 		t.Fatal("an unreadable control file gave a position")
