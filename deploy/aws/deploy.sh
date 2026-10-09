@@ -1329,7 +1329,7 @@ wait_update() {
     if [[ $GIVE_UP -eq 1 ]]; then stop_waiter; return 2; fi
     tell_interrupted
     # A status over 128 with the waiter still there: a signal that did not stop the wait.
-    [[ $rc -gt 128 ]] && kill -0 "$WAIT_PID" 2>/dev/null || break
+    if [[ $rc -le 128 ]] || ! kill -0 "$WAIT_PID" 2>/dev/null; then break; fi
   done
   WAIT_PID=""
   [[ $rc -eq 0 ]] || return 1

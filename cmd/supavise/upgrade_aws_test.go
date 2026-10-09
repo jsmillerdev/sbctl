@@ -506,9 +506,9 @@ func TestUpdateStackLetsTheScriptFinishWhenTheUpgradeIsCancelled(t *testing.T) {
 		t.Errorf("the script was stopped: %q", b)
 	}
 	// A cancelled context before the start runs nothing.
-	rel = newAWSRelease(t)
+	rel2 := newAWSRelease(t)
 	t.Setenv("EXIT_CODE", "0")
-	if _, err := h.UpdateStack(ctx, rel.cand, nodeupgrade.StackOptions{Name: "supavise"}); err == nil {
+	if _, err := h.UpdateStack(ctx, rel2.cand, nodeupgrade.StackOptions{Name: "supavise"}); err == nil {
 		t.Error("a cancelled upgrade ran the script")
 	}
 }
