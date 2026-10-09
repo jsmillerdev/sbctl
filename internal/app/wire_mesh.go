@@ -485,16 +485,7 @@ func startCluster(ctx context.Context, w *Wire, boot cluster.BootDecision, dir s
 		if ok {
 			leader = l.ID
 		}
-		verdict := health.Healthy
-		if monitor != nil {
-			// The last report, never a new check: a peer pings every few seconds, and the alert checker
-			// refreshes the report. Without a recent one the node says it is degraded.
-			verdict = health.Degraded
-			if r, ok := monitor.Last(); ok {
-				verdict = r.Verdict
-			}
-		}
-		return peerapi.Ping{Node: selfID, Epoch: epoch, Leader: leader, Version: w.Options.Version, Schema: schema.get(), Health: string(verdict)}
+		return peerapi.Ping{Node: selfID, Epoch: epoch, Leader: leader, Version: w.Options.Version, Schema: schema.get(), Health: string(pingVerdict(monitor))}
 	}
 	registerPeerAPI(&cluster.PeerAPI{Authority: auth, Topology: live, Cfg: cfg, Reports: reports, Ping: ping}, mesh.Handle, peerAPIServedByOthers...)
 
@@ -645,6 +636,25 @@ func (s *skewState) changed(node string, skewed bool) bool {
 	}
 	s.skew[node] = skewed
 	return true
+}
+
+// pingVerdict is the health a ping reports. A peer pings every few seconds, so it answers from the last
+// report when one is recent (the alert checker refreshes it every [alerts] check_interval_seconds, 60 by
+// default) and runs a check, as the monitor does for any caller, only when there is none or it is too old.
+func pingVerdict(monitor *health.Monitor) health.Verdict {
+	if monitor == nil {
+		return health.Healthy
+	}
+	if r, ok := monitor.Last(); ok {
+		return r.Verdict
+	}
+	pctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	r, err := monitor.Report(pctx)
+	if err != nil {
+		return health.Degraded
+	}
+	return r.Verdict
 }
 
 // peerSeen records what a ping says about a peer. Every node raises node_version_skew while the peer's

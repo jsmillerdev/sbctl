@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -22,6 +23,7 @@ import (
 	"github.com/supavise/supavise/internal/backup"
 	"github.com/supavise/supavise/internal/cluster"
 	"github.com/supavise/supavise/internal/config"
+	"github.com/supavise/supavise/internal/health"
 	"github.com/supavise/supavise/internal/lifecycle"
 	"github.com/supavise/supavise/internal/mesh"
 	"github.com/supavise/supavise/internal/mesh/peerapi"
@@ -529,5 +531,30 @@ func TestPeerSeenReadsTheRegistryOnlyWhenTheVersionDiffers(t *testing.T) {
 	peerSeen(ctx, reg, follower, &skewState{}, "v0.2.0", "n1", peerapi.Ping{Node: "n1", Version: "v0.2.9"}, log)
 	if reg.gets != 1 || reg.updates != 1 {
 		t.Fatalf("a follower: %d reads, %d writes", reg.gets, reg.updates)
+	}
+}
+
+// The ping answers from the last health report; only when there is none does it run a check, as it
+// did before the report was shared.
+func TestPingVerdictUsesTheLastReportAndChecksWhenThereIsNone(t *testing.T) {
+	if got := pingVerdict(nil); got != health.Healthy {
+		t.Fatalf("no monitor: %q", got)
+	}
+	var checks atomic.Int32
+	m := health.NewMonitor(func(context.Context) (*health.Report, error) {
+		checks.Add(1)
+		return &health.Report{Verdict: health.Down}, nil
+	}, 0) // no reuse: only Last can avoid a second check
+	if got := pingVerdict(m); got != health.Down || checks.Load() != 1 {
+		t.Fatalf("with no report: %q after %d checks, want a check and its verdict", got, checks.Load())
+	}
+	for range 3 {
+		if got := pingVerdict(m); got != health.Down || checks.Load() != 1 {
+			t.Fatalf("with a report: %q after %d checks, want the report and no new check", got, checks.Load())
+		}
+	}
+	failing := health.NewMonitor(func(context.Context) (*health.Report, error) { return nil, errors.New("the check failed") }, 0)
+	if got := pingVerdict(failing); got != health.Degraded {
+		t.Fatalf("a check that fails with no report: %q", got)
 	}
 }
