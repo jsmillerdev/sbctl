@@ -20,7 +20,6 @@ import (
 	"github.com/supavise/supavise/internal/config"
 	"github.com/supavise/supavise/internal/fleet"
 	"github.com/supavise/supavise/internal/lifecycle"
-	"github.com/supavise/supavise/internal/registry"
 	"github.com/supavise/supavise/internal/secrets"
 )
 
@@ -39,7 +38,7 @@ func (t nodeTenants) Projects(ctx context.Context) ([]Project, error) {
 		if p.Ref == config.SystemRef {
 			continue
 		}
-		out = append(out, Project{Ref: p.Ref, Online: p.Status == registry.StatusActiveHealthy || p.Status == registry.StatusActiveUnhealthy})
+		out = append(out, Project{Ref: p.Ref, Online: p.Status.Running()})
 	}
 	return out, nil
 }
@@ -126,8 +125,7 @@ func (t nodeTenants) dsn(ctx context.Context, ref string) (string, error) {
 	port := cfg.PortsFor(ref, p.Seq).Postgres
 	sock := filepath.Join(cfg.Paths().ProjectService(ref, config.SvcPostgres), "sock")
 	if _, err := lstat(filepath.Join(sock, fmt.Sprintf(".s.PGSQL.%d", port))); err == nil {
-		return fmt.Sprintf("host=%s port=%d user=%s dbname=postgres sslmode=disable connect_timeout=5 application_name=supavise-storage-migrate",
-			kvQuote(sock), port, lifecycle.RoleAdmin), nil
+		return lifecycle.AdminSocketDSN(sock, port, "postgres", "supavise-storage-migrate"), nil
 	}
 	sealed, err := t.n.Registry.GetSecrets(ctx, ref)
 	if err != nil {
@@ -142,11 +140,7 @@ func (t nodeTenants) dsn(ctx context.Context, ref string) (string, error) {
 		return "", err
 	}
 	return fmt.Sprintf("host=127.0.0.1 port=%d user=%s password=%s dbname=postgres sslmode=disable connect_timeout=5 application_name=supavise-storage-migrate",
-		port, lifecycle.RoleAdmin, kvQuote(string(pw))), nil
-}
-
-func kvQuote(s string) string {
-	return "'" + strings.NewReplacer(`\`, `\\`, `'`, `\'`).Replace(s) + "'"
+		port, lifecycle.RoleAdmin, lifecycle.KVQuote(string(pw))), nil
 }
 
 // NodeService drives supavise-storage through a fleet manager that touches no other shared

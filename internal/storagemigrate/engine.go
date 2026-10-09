@@ -9,11 +9,14 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"time"
 
 	"github.com/supavise/supavise/internal/config"
+	"github.com/supavise/supavise/internal/ctxutil"
+	"github.com/supavise/supavise/internal/lifecycle"
 	"github.com/supavise/supavise/internal/secrets"
 )
 
@@ -38,39 +41,31 @@ type Deps struct {
 	Now   func() time.Time
 	Sleep func(ctx context.Context, d time.Duration) error
 
-	// Workers is how many files are sent at once (default 8). CatchUpWithin is how short a pass over
-	// the changes must be for the switch to begin (default 60 s) and MaxCatchUp how many passes are
-	// tried before it begins anyway (default 5). HoldFor is how long a write hold lasts without
-	// being renewed (default 2 minutes). VerifyAttempts rounds of verification are made, VerifyWait
-	// apart, before it fails (default 3 and 3 s).
-	Workers        int
-	CatchUpWithin  time.Duration
-	MaxCatchUp     int
-	HoldFor        time.Duration
-	VerifyAttempts int
-	VerifyWait     time.Duration
+	// Workers is how many files are sent at once (default 8). HoldFor is how long a write hold lasts
+	// without being renewed (default 2 minutes). VerifyWait is the time between rounds of
+	// verification (default 3 s).
+	Workers    int
+	HoldFor    time.Duration
+	VerifyWait time.Duration
 }
+
+const (
+	// catchUpWithin is how short a pass over the changes must be for the switch to begin, and
+	// maxCatchUp how many passes are tried before it begins anyway.
+	catchUpWithin = time.Minute
+	maxCatchUp    = 5
+	// verifyAttempts rounds of verification are made before it fails.
+	verifyAttempts = 3
+)
 
 // DefaultRateMiB is the copy's speed limit in MiB per second when the command gives none.
 const DefaultRateMiB = 32
 
 // Engine runs migrations. It is used by one command at a time.
 type Engine struct {
-	d     Deps
+	d     Deps // with the defaults filled in
 	paths config.Paths
-	log   *slog.Logger
-	files Files
-	open  OpenFunc
 	lim   *limiter
-	now   func() time.Time
-	sleep func(ctx context.Context, d time.Duration) error
-
-	workers        int
-	catchUpWithin  time.Duration
-	maxCatchUp     int
-	holdFor        time.Duration
-	verifyAttempts int
-	verifyWait     time.Duration
 
 	// The run in progress. inv is the inventory of each project's last pass; it is empty in a
 	// process that continues a run, and the first pass then asks the bucket.
@@ -82,57 +77,45 @@ type Engine struct {
 
 // New builds an Engine.
 func New(d Deps) *Engine {
-	e := &Engine{d: d, paths: d.Cfg.Paths(), log: d.Log, files: d.Files, open: d.Open, now: d.Now, sleep: d.Sleep,
-		workers: d.Workers, catchUpWithin: d.CatchUpWithin, maxCatchUp: d.MaxCatchUp, holdFor: d.HoldFor,
-		verifyAttempts: d.VerifyAttempts, verifyWait: d.VerifyWait, inv: map[string]inventory{}}
-	if e.log == nil {
-		e.log = slog.New(slog.NewTextHandler(io.Discard, nil))
+	if d.Log == nil {
+		d.Log = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
-	if e.d.Out == nil {
-		e.d.Out = io.Discard
+	if d.Out == nil {
+		d.Out = io.Discard
 	}
-	if e.files == nil {
-		e.files = OSFiles{}
+	if d.Files == nil {
+		d.Files = OSFiles{}
 	}
-	if e.open == nil {
-		e.open = OpenS3
+	if d.Open == nil {
+		d.Open = OpenS3
 	}
-	if e.now == nil {
-		e.now = time.Now
+	if d.Now == nil {
+		d.Now = time.Now
 	}
-	if e.sleep == nil {
-		e.sleep = sleepCtx
+	if d.Sleep == nil {
+		d.Sleep = ctxutil.Sleep
 	}
-	if e.workers <= 0 {
-		e.workers = 8
+	if d.Workers <= 0 {
+		d.Workers = 8
 	}
-	if e.catchUpWithin <= 0 {
-		e.catchUpWithin = time.Minute
+	if d.HoldFor <= 0 {
+		d.HoldFor = 2 * time.Minute
 	}
-	if e.maxCatchUp <= 0 {
-		e.maxCatchUp = 5
+	if d.VerifyWait <= 0 {
+		d.VerifyWait = 3 * time.Second
 	}
-	if e.holdFor <= 0 {
-		e.holdFor = 2 * time.Minute
-	}
-	if e.verifyAttempts <= 0 {
-		e.verifyAttempts = 3
-	}
-	if e.verifyWait <= 0 {
-		e.verifyWait = 3 * time.Second
-	}
-	return e
+	return &Engine{d: d, paths: d.Cfg.Paths(), inv: map[string]inventory{}}
 }
 
 func (e *Engine) say(format string, args ...any) {
 	fmt.Fprintf(e.d.Out, format+"\n", args...)
-	e.log.Debug(fmt.Sprintf(format, args...))
+	e.d.Log.Debug(fmt.Sprintf(format, args...))
 }
 
 // Status returns the record of the last run, or nil.
 func (e *Engine) Status() (*State, error) { return ReadState(e.paths) }
 
-func (e *Engine) save() error { return saveState(e.paths, e.st, e.now()) }
+func (e *Engine) save() error { return saveState(e.paths, e.st, e.d.Now()) }
 
 // destination is where the bucket is, from the request and the [fleet] settings.
 func (e *Engine) destination(req Request) Destination {
@@ -156,7 +139,7 @@ func (e *Engine) begin(req Request) {
 	if rate == 0 {
 		rate = DefaultRateMiB
 	}
-	e.lim = &limiter{now: e.now, sleep: e.sleep}
+	e.lim = &limiter{now: e.d.Now, sleep: e.d.Sleep}
 	if rate > 0 {
 		e.lim.rate = float64(rate) * (1 << 20)
 	}
@@ -165,7 +148,7 @@ func (e *Engine) begin(req Request) {
 
 // connect opens the bucket and hands it the limiter of the copy.
 func (e *Engine) connect(ctx context.Context, d Destination, c Credentials) (Bucket, error) {
-	b, err := e.open(ctx, d, c)
+	b, err := e.d.Open(ctx, d, c)
 	if err != nil {
 		return nil, err
 	}
@@ -245,8 +228,8 @@ func (e *Engine) Migrate(ctx context.Context, req Request) error {
 	if err := e.preflight(ctx, b, dest, req.Credentials); err != nil {
 		return err
 	}
-	e.st = &State{ID: fmt.Sprintf("%x", e.now().UnixNano()), Phase: PhaseCopying, Dest: dest, Credentials: req.Credentials.Source,
-		CredentialsFile: req.CredentialsFile, RoleARN: req.Credentials.RoleARN, PrevBackend: backend, StartedAt: e.now().UTC()}
+	e.st = &State{ID: fmt.Sprintf("%x", e.d.Now().UnixNano()), Phase: PhaseCopying, Dest: dest, Credentials: req.Credentials.Source,
+		CredentialsFile: req.CredentialsFile, RoleARN: req.Credentials.RoleARN, PrevBackend: backend, StartedAt: e.d.Now().UTC()}
 	e.inv = map[string]inventory{}
 	if err := e.save(); err != nil {
 		return err
@@ -263,7 +246,7 @@ func (e *Engine) preflight(ctx context.Context, b Bucket, dest Destination, c Cr
 	if plainRemote(dest.Endpoint) {
 		e.say("warning: %s is not TLS: the objects and the signed requests cross the network unencrypted", dest.Endpoint)
 	}
-	key := fmt.Sprintf(".supavise-migrate-probe/%x", e.now().UnixNano())
+	key := fmt.Sprintf(".supavise-migrate-probe/%x", e.d.Now().UnixNano())
 	body := []byte("supavise storage migrate")
 	if err := b.Put(ctx, key, strings.NewReader(string(body)), int64(len(body)), FileMeta{ContentType: "text/plain"}); err != nil {
 		return fmt.Errorf("the bucket does not take a write with these credentials: %w", err)
@@ -364,7 +347,7 @@ func (e *Engine) fail(err error) error {
 		e.st.Error = "interrupted"
 	}
 	if serr := e.save(); serr != nil {
-		e.log.Warn("could not save the migration state", "err", serr)
+		e.d.Log.Warn("could not save the migration state", "err", serr)
 	}
 	return err
 }
@@ -416,14 +399,14 @@ func (e *Engine) syncOne(ctx context.Context, b Bucket, ref string) error {
 
 // pass runs one pass over every project and says how long it took.
 func (e *Engine) pass(ctx context.Context, b Bucket, what string) (time.Duration, error) {
-	start := e.now()
+	start := e.d.Now()
 	refs, err := e.diskRefs()
 	if err != nil {
 		return 0, err
 	}
 	// A project whose directory is gone has no files left: its inventory empties and its keys go.
 	for ref := range e.inv {
-		if !contains(refs, ref) {
+		if !slices.Contains(refs, ref) {
 			refs = append(refs, ref)
 		}
 	}
@@ -441,22 +424,13 @@ func (e *Engine) pass(ctx context.Context, b Bucket, what string) (time.Duration
 	// What a pass leaves out is the same every time; the state keeps the last pass's view.
 	e.st.SkippedTotal, e.st.Skipped = len(total.Skipped), first(total.Skipped, maxSkippedKept)
 	e.st.Passes++
-	dur := e.now().Sub(start)
+	dur := e.d.Now().Sub(start)
 	files := 0
 	for _, inv := range e.inv {
 		files += len(inv)
 	}
-	e.say("%s: %d files in %d projects, %d sent (%s), %d removed from the bucket, %s", what, files, len(refs), total.Uploaded.Files, bytesString(total.Uploaded.Bytes), total.Deleted, dur.Round(time.Millisecond))
+	e.say("%s: %d files in %d projects, %d sent (%s), %d removed from the bucket, %s", what, files, len(refs), total.Uploaded.Files, lifecycle.HumanBytes(total.Uploaded.Bytes), total.Deleted, dur.Round(time.Millisecond))
 	return dur, e.save()
-}
-
-func contains(s []string, v string) bool {
-	for _, x := range s {
-		if x == v {
-			return true
-		}
-	}
-	return false
 }
 
 func (e *Engine) copyAll(ctx context.Context, b Bucket) error {
@@ -477,10 +451,10 @@ func (e *Engine) catchUp(ctx context.Context, b Bucket) error {
 		if err != nil {
 			return err
 		}
-		if dur <= e.catchUpWithin {
+		if dur <= catchUpWithin {
 			break
 		}
-		if i >= e.maxCatchUp {
+		if i >= maxCatchUp {
 			e.say("catch-up passes still take %s after %d passes; the switch will hold writes for about that long", dur.Round(time.Second), i)
 			break
 		}
@@ -508,11 +482,11 @@ func (e *Engine) verifyAll(ctx context.Context, b Bucket) error {
 		for attempt := 1; ; attempt++ {
 			t, err = e.verifyTenant(ctx, b, ref, byRef[ref])
 			var verr *VerifyError
-			if err == nil || !errors.As(err, &verr) || attempt >= e.verifyAttempts {
+			if err == nil || !errors.As(err, &verr) || attempt >= verifyAttempts {
 				break
 			}
 			e.say("project %s: %v; checking again", ref, err)
-			if serr := e.sleep(ctx, e.verifyWait); serr != nil {
+			if serr := e.d.Sleep(ctx, e.d.VerifyWait); serr != nil {
 				return serr
 			}
 		}
@@ -520,7 +494,7 @@ func (e *Engine) verifyAll(ctx context.Context, b Bucket) error {
 			return err
 		}
 		tenants = append(tenants, t)
-		e.say("project %s: %d objects (%s) are in the bucket%s", ref, t.Rows, bytesString(t.Bytes), t.note())
+		e.say("project %s: %d objects (%s) are in the bucket%s", ref, t.Rows, lifecycle.HumanBytes(t.Bytes), t.note())
 	}
 	e.st.Tenants = tenants
 	return e.next(PhaseFlipping)
@@ -553,7 +527,7 @@ func (e *Engine) refs(byRef map[string]Project) ([]string, error) {
 		return nil, err
 	}
 	for ref := range byRef {
-		if !contains(refs, ref) && secrets.ValidRef(ref) {
+		if !slices.Contains(refs, ref) && secrets.ValidRef(ref) {
 			refs = append(refs, ref)
 		}
 	}

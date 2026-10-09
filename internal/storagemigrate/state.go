@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"github.com/supavise/supavise/internal/config"
+	"github.com/supavise/supavise/internal/fsutil"
+	"github.com/supavise/supavise/internal/lifecycle"
 	"github.com/supavise/supavise/internal/storagemigrate/hold"
 )
 
@@ -61,58 +63,20 @@ func saveState(p config.Paths, st *State, now time.Time) error {
 }
 
 // writeJSON replaces path with v atomically. The file is not secret; the daemon and the CLI can
-// run as different users.
+// run as different users. The directory is created owned like its parent when this process runs as
+// root: the daemon, which runs as the supavise user, removes an expired write hold from it.
 func writeJSON(path string, v any) error {
-	b, err := json.MarshalIndent(v, "", "  ")
-	if err != nil {
+	if err := fsutil.MkdirAllOwned(filepath.Dir(path), 0o750); err != nil {
 		return err
 	}
-	if err := ensureDir(filepath.Dir(path)); err != nil {
-		return err
-	}
-	tmp, err := os.CreateTemp(filepath.Dir(path), ".migrate.")
-	if err != nil {
-		return err
-	}
-	defer os.Remove(tmp.Name())
-	if err := tmp.Chmod(0o644); err != nil {
-		tmp.Close()
-		return err
-	}
-	if _, err := tmp.Write(append(b, '\n')); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	return os.Rename(tmp.Name(), path)
-}
-
-// ensureDir creates dir (and what is missing above it), owned like its parent when this process
-// runs as root: the daemon, which runs as the supavise user, removes an expired write hold from it.
-func ensureDir(dir string) error {
-	if _, err := os.Lstat(dir); err == nil {
-		return nil
-	}
-	if err := os.MkdirAll(dir, 0o750); err != nil {
-		return err
-	}
-	if os.Geteuid() == 0 {
-		if fi, err := os.Stat(filepath.Dir(dir)); err == nil {
-			if st, ok := fi.Sys().(*syscall.Stat_t); ok {
-				_ = os.Chown(dir, int(st.Uid), int(st.Gid))
-			}
-		}
-	}
-	return nil
+	return fsutil.WriteJSON(path, v, 0o644, fsutil.Options{})
 }
 
 // lock takes the run lock; a second run on the node (or a rollback during a migration) finds it
 // held. The kernel drops it when the process dies, so a crashed run never blocks --resume.
 func lock(p config.Paths) (release func(), err error) {
 	path := filepath.Join(runDir(p), lockFile)
-	if err := ensureDir(filepath.Dir(path)); err != nil {
+	if err := fsutil.MkdirAllOwned(filepath.Dir(path), 0o750); err != nil {
 		return nil, err
 	}
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
@@ -120,10 +84,8 @@ func lock(p config.Paths) (release func(), err error) {
 		return nil, err
 	}
 	if os.Geteuid() == 0 {
-		if fi, err := os.Stat(filepath.Dir(path)); err == nil {
-			if st, ok := fi.Sys().(*syscall.Stat_t); ok {
-				_ = f.Chown(int(st.Uid), int(st.Gid))
-			}
+		if uid, gid, ok := fsutil.OwnerOf(filepath.Dir(path)); ok {
+			_ = f.Chown(uid, gid)
 		}
 	}
 	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
@@ -151,7 +113,7 @@ func Describe(st *State, now time.Time) string {
 	}
 	line("started", st.StartedAt.Format(time.RFC3339))
 	if st.Passes > 0 {
-		line("copied", fmt.Sprintf("%d objects, %s, in %d passes", st.Uploaded.Files, bytesString(st.Uploaded.Bytes), st.Passes))
+		line("copied", fmt.Sprintf("%d objects, %s, in %d passes", st.Uploaded.Files, lifecycle.HumanBytes(st.Uploaded.Bytes), st.Passes))
 	}
 	if len(st.Tenants) > 0 {
 		var rows, files, offline, unversioned int
@@ -165,7 +127,7 @@ func Describe(st *State, now time.Time) string {
 				offline++
 			}
 		}
-		line("verified", fmt.Sprintf("%d objects (%s) in %d projects; %d files in the directories", rows, bytesString(bytes), len(st.Tenants)-offline, files))
+		line("verified", fmt.Sprintf("%d objects (%s) in %d projects; %d files in the directories", rows, lifecycle.HumanBytes(bytes), len(st.Tenants)-offline, files))
 		if offline > 0 {
 			line("", fmt.Sprintf("%d projects had no running database; only their copy was checked", offline))
 		}
@@ -180,7 +142,7 @@ func Describe(st *State, now time.Time) string {
 		}
 	}
 	if st.Phase == PhaseRolledBack || st.Downloaded.Files > 0 || st.Removed > 0 {
-		line("rolled back", fmt.Sprintf("%d objects (%s) copied back, %d removed", st.Downloaded.Files, bytesString(st.Downloaded.Bytes), st.Removed))
+		line("rolled back", fmt.Sprintf("%d objects (%s) copied back, %d removed", st.Downloaded.Files, lifecycle.HumanBytes(st.Downloaded.Bytes), st.Removed))
 	}
 	if st.RefusedKeys > 0 {
 		line("refused", fmt.Sprintf("%d keys in the bucket cannot be files below the project's directory and were left there", st.RefusedKeys))
@@ -209,17 +171,4 @@ func Describe(st *State, now time.Time) string {
 		}
 	}
 	return b.String()
-}
-
-func bytesString(n int64) string {
-	const unit = 1024
-	if n < unit {
-		return fmt.Sprintf("%d B", n)
-	}
-	div, exp := int64(unit), 0
-	for m := n / unit; m >= unit; m /= unit {
-		div *= unit
-		exp++
-	}
-	return fmt.Sprintf("%.1f %ciB", float64(n)/float64(div), "KMGTPE"[exp])
 }

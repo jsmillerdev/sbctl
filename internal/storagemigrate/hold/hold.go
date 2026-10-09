@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/supavise/supavise/internal/config"
+	"github.com/supavise/supavise/internal/fsutil"
 )
 
 // File is the name of the marker.
@@ -57,27 +58,7 @@ func Write(p config.Paths, m Marker) error {
 	if err != nil {
 		return err
 	}
-	dir := filepath.Dir(Path(p))
-	if err := os.MkdirAll(dir, 0o750); err != nil {
-		return err
-	}
-	tmp, err := os.CreateTemp(dir, ".hold.")
-	if err != nil {
-		return err
-	}
-	defer os.Remove(tmp.Name())
-	if err := tmp.Chmod(0o644); err != nil {
-		tmp.Close()
-		return err
-	}
-	if _, err := tmp.Write(append(b, '\n')); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	return os.Rename(tmp.Name(), Path(p))
+	return fsutil.WriteFile(Path(p), append(b, '\n'), 0o644, fsutil.Options{MkdirMode: 0o750})
 }
 
 // Remove deletes the marker; a marker that is not there is not an error.

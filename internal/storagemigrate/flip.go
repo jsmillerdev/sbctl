@@ -10,11 +10,12 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"golang.org/x/sync/errgroup"
 
+	"github.com/supavise/supavise/internal/fsutil"
+	"github.com/supavise/supavise/internal/lifecycle"
 	"github.com/supavise/supavise/internal/secrets"
 )
 
@@ -81,7 +82,7 @@ func (e *Engine) flip(ctx context.Context, b Bucket) error {
 	if !done(stepStopped) {
 		e.say("stopping supavise-storage: reads fail until it runs again, for a time that grows with the number of files")
 		stopped = true // a stop that fails may still have stopped it
-		stoppedAt = e.now()
+		stoppedAt = e.d.Now()
 		if err := e.d.Storage.Stop(ctx); err != nil {
 			return e.abortFlip(ctx, err, stopped, switched)
 		}
@@ -123,7 +124,7 @@ func (e *Engine) flip(ctx context.Context, b Bucket) error {
 			return fmt.Errorf("Storage runs on the bucket, but the run could not record it: %w", err)
 		}
 		if !stoppedAt.IsZero() {
-			e.say("supavise-storage was stopped for %s: the pass over the files, the check of the rows, the new configuration and the start", e.now().Sub(stoppedAt).Round(100*time.Millisecond))
+			e.say("supavise-storage was stopped for %s: the pass over the files, the check of the rows, the new configuration and the start", e.d.Now().Sub(stoppedAt).Round(100*time.Millisecond))
 		}
 	} else if err := e.d.Storage.Healthy(ctx); err != nil {
 		// An earlier attempt got Storage onto the bucket and it is not answering now.
@@ -145,7 +146,7 @@ func (e *Engine) flip(ctx context.Context, b Bucket) error {
 	if err != nil {
 		return fmt.Errorf("Storage runs on the bucket, but the files could not be moved aside: %w", err)
 	}
-	now := e.now().UTC()
+	now := e.d.Now().UTC()
 	st.Phase, st.Step, st.FlippedAt, st.Error = PhaseDone, "", now, ""
 	if kept != "" {
 		st.Retained, st.RetainUntil = kept, now.Add(RetainFor)
@@ -266,7 +267,7 @@ func (e *Engine) probe(ctx context.Context, from string) error {
 			if last == nil {
 				break
 			}
-			if serr := e.sleep(ctx, time.Second); serr != nil {
+			if serr := e.d.Sleep(ctx, time.Second); serr != nil {
 				return serr
 			}
 		}
@@ -289,7 +290,7 @@ func (e *Engine) probe(ctx context.Context, from string) error {
 func (e *Engine) keepFiles() (string, error) {
 	st := e.st
 	if st.KeepAs == "" {
-		day := e.now().UTC().Format("20060102")
+		day := e.d.Now().UTC().Format("20060102")
 		name := retainedPrefix + day
 		for i := 2; ; i++ {
 			if _, err := os.Lstat(filepath.Join(serviceDir(e.paths), name)); errors.Is(err, fs.ErrNotExist) {
@@ -481,7 +482,7 @@ func (e *Engine) doRollback(ctx context.Context, b Bucket) error {
 	if err := e.save(); err != nil {
 		return err
 	}
-	e.say("Storage keeps its objects as files again: %d objects (%s) were copied back and %d removed", st.Downloaded.Files, bytesString(st.Downloaded.Bytes), st.Removed)
+	e.say("Storage keeps its objects as files again: %d objects (%s) were copied back and %d removed", st.Downloaded.Files, lifecycle.HumanBytes(st.Downloaded.Bytes), st.Removed)
 	e.say("restart supavise.service when convenient so that the daemon reads the setting too")
 	return nil
 }
@@ -561,7 +562,7 @@ func (e *Engine) pullAll(ctx context.Context, b Bucket, what string) error {
 	e.st.Downloaded.Bytes += got.Bytes
 	e.st.Removed += removed
 	e.st.RefusedKeys = refused // what a pass leaves out is the same every time
-	e.say("%s: %d objects (%s) copied back, %d removed from the files", what, got.Files, bytesString(got.Bytes), removed)
+	e.say("%s: %d objects (%s) copied back, %d removed from the files", what, got.Files, lifecycle.HumanBytes(got.Bytes), removed)
 	return e.save()
 }
 
@@ -645,7 +646,7 @@ func (e *Engine) pullTenant(ctx context.Context, b Bucket, ref string) (pulled, 
 	}
 	var mu sync.Mutex
 	g, gctx := errgroup.WithContext(ctx)
-	g.SetLimit(e.workers)
+	g.SetLimit(e.d.Workers)
 	for _, en := range fetch {
 		g.Go(func() error {
 			n, err := e.download(gctx, b, ref, en)
@@ -722,10 +723,10 @@ func (e *Engine) download(ctx context.Context, b Bucket, ref string, en Entry) (
 	if err != nil {
 		return 0, fmt.Errorf("%s: %w", quote(en.Key), err)
 	}
-	if ok, err := e.files.SetMeta(tmp.Name(), meta); err != nil {
+	if ok, err := e.d.Files.SetMeta(tmp.Name(), meta); err != nil {
 		return 0, fmt.Errorf("%s: write extended attributes: %w", quote(en.Key), err)
 	} else if !ok && (meta.ContentType != "" || meta.CacheControl != "") {
-		e.log.Warn("this file system has no extended attributes: objects copied back lose their content type and cache control", "path", dst)
+		e.d.Log.Warn("this file system has no extended attributes: objects copied back lose their content type and cache control", "path", dst)
 	}
 	if !en.ModTime.IsZero() {
 		_ = os.Chtimes(tmp.Name(), en.ModTime, en.ModTime)
@@ -777,11 +778,7 @@ func (e *Engine) chownLikeParent(f *os.File) {
 	if os.Geteuid() != 0 {
 		return
 	}
-	fi, err := os.Stat(serviceDir(e.paths))
-	if err != nil {
-		return
-	}
-	if st, ok := fi.Sys().(*syscall.Stat_t); ok {
-		_ = f.Chown(int(st.Uid), int(st.Gid))
+	if uid, gid, ok := fsutil.OwnerOf(serviceDir(e.paths)); ok {
+		_ = f.Chown(uid, gid)
 	}
 }
