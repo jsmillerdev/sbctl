@@ -805,6 +805,9 @@ func (m *Manager) serveStreams(sess Session, node, remote string) {
 			// else (its CloseChan fires on a local Close or the keepalive timeout), so the session is
 			// closed now: watch then drops it from the table, and a node that restarted is not shut out
 			// by its own dead session when the tie-break prefers it.
+			if node != "" {
+				m.o.Log.Info("mesh: a session ended", "node", node, "error", err)
+			}
 			_ = sess.Close()
 			return
 		}
