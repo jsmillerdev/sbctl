@@ -329,7 +329,7 @@ Before you start:
    curl -fsSL https://github.com/supavise/supavise/releases/latest/download/install.sh | sudo bash -s -- --join-token-file /root/join-token --firewall ufw
    ```
 
-   The installer prepares the host without creating a system project, then runs `supavise node join`. The server receives its certificate, the master key, the cluster's settings and the first copy of the registry. The domain, the TLS settings and the backup settings come from the leader (`/etc/supavise/config.d/10-cluster.toml`; change them on the leader). The node is `joining` until its copy streams, then `active`.
+   The installer prepares the host without creating a system project, then runs `supavise node join` as the `supavise` user and converges the host again, now that it has its cluster identity. Before the join spends the token it downloads the Postgres release (nothing else downloads artifacts for a server that creates no system project); after the exchange it downloads the other services' artifacts, which a follower runs or keeps ready for a promotion, and serves the WAL relay of the system cluster itself, because the first copy replays the archive before it streams and no daemon runs yet. The server receives its certificate, the master key, the cluster's settings and the first copy of the registry. The domain, the TLS settings and the backup settings come from the leader (`/etc/supavise/config.d/10-cluster.toml`; change them on the leader). The node is `joining` until its copy streams, then `active`.
 3. On the leader, check that the node is `active`:
 
    ```bash

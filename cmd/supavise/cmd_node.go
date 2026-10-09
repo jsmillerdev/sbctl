@@ -104,7 +104,10 @@ master key derives); the daemon restarts once to listen on the peer port.`,
 		Long: `Connects to the leader named in the token, checks that it presents the cluster CA the token
 pins, proves it holds the token's secret, and receives a node certificate, the master key, the cluster's
 settings and the first copy of the system cluster. The node is "joining" until its copy streams, then
-"active".
+"active". The copy is built by the supavise user (a command started with sudo becomes that user once it has
+read its inputs); the Postgres release is downloaded before the token is spent, the other services'
+artifacts after, and the copy replays the leader's archive through a WAL relay this command serves until it
+returns.
 
 A join that stopped after the certificate was issued continues with --resume, which needs no token.
 A server that holds the identity of a join that was given up on (the leader removes a node that is still
