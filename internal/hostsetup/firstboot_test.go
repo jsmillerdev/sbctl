@@ -72,7 +72,7 @@ func newInstance(t *testing.T) *instance {
 
 	in.fake = awsfake.New(t)
 	d := in.fake.IMDS()
-	d.InstanceID, d.Tags = "i-0joiner", map[string]string{"supavise:stack-name": "supavise-b"}
+	d.InstanceID, d.Tags = "i-0joiner", map[string]string{"supavise:stack-name": "supavise-b", "supavise:storage-role": "arn:aws:iam::123456789012:role/supavise-b-storage"}
 	in.fake.SetIMDS(d)
 
 	in.runner = &fakeRunner{do: in.answer}
@@ -160,7 +160,7 @@ func TestFirstBootFormatsABlankVolumeAndMounts(t *testing.T) {
 	if err != nil {
 		t.Fatalf("%v\n%s", err, in.out.String())
 	}
-	if res.InstanceID != "i-0joiner" || res.StackName != "supavise-b" || res.Device != in.dataDev() || !res.Formatted {
+	if res.InstanceID != "i-0joiner" || res.StackName != "supavise-b" || res.StorageRoleARN != "arn:aws:iam::123456789012:role/supavise-b-storage" || res.Device != in.dataDev() || !res.Formatted {
 		t.Errorf("result = %+v", res)
 	}
 	if in.runner.ran("mkfs.xfs -L supavise "+in.dataDev()) != 1 {

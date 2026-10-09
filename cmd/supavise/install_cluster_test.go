@@ -337,3 +337,45 @@ func TestJoinAndConvergeConvergesAfterTheJoin(t *testing.T) {
 		t.Fatalf("err = %v", err)
 	}
 }
+
+// First boot on AWS writes the stack's storage role from the instance tag, once, and not over what the
+// operator set; a tag that is no role ARN is not written.
+func TestApplyStorageRoleWritesTheTagsRoleToTheConfig(t *testing.T) {
+	const arn = "arn:aws:iam::123456789012:role/supavise-StorageRole-1A2B3C"
+	cfg := config.Default()
+	note, err := applyStorageRole(cfg, arn)
+	if err != nil || cfg.Fleet.StorageS3RoleARN != arn || !strings.Contains(note, arn) {
+		t.Fatalf("role = %q, note %q, err %v", cfg.Fleet.StorageS3RoleARN, note, err)
+	}
+	// It lands in config.toml, and the file still loads: a role is valid on its own.
+	body, err := renderConfig(cfg)
+	if err != nil || !strings.Contains(string(body), "storage_s3_role_arn = '"+arn+"'") && !strings.Contains(string(body), `storage_s3_role_arn = "`+arn+`"`) {
+		t.Fatalf("rendered:\n%s\n%v", body, err)
+	}
+	path := filepath.Join(t.TempDir(), "config.toml")
+	if err := os.WriteFile(path, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if loaded, err := config.Load(path); err != nil || loaded.Fleet.StorageS3RoleARN != arn {
+		t.Fatalf("the written config: %+v, %v", loaded, err)
+	}
+
+	// A role the operator set stays, and so does a static key, which excludes a role.
+	own := config.Default()
+	own.Fleet.StorageS3RoleARN = "arn:aws:iam::123456789012:role/mine"
+	if note, err := applyStorageRole(own, arn); err != nil || note != "" || own.Fleet.StorageS3RoleARN != "arn:aws:iam::123456789012:role/mine" {
+		t.Fatalf("over the operator's role: %q %q %v", own.Fleet.StorageS3RoleARN, note, err)
+	}
+	keyed := config.Default()
+	keyed.Fleet.StorageS3AccessKeyID, keyed.Fleet.StorageS3SecretAccessKey = "AKIAEXAMPLE", "secret"
+	if note, err := applyStorageRole(keyed, arn); err != nil || keyed.Fleet.StorageS3RoleARN != "" || !strings.Contains(note, "static key") {
+		t.Fatalf("with a static key: role %q, note %q, err %v", keyed.Fleet.StorageS3RoleARN, note, err)
+	}
+
+	for _, bad := range []string{"", "not-an-arn", "arn:aws:iam::123:role/x", "arn:aws:iam::123456789012:user/x", "arn:aws:iam::123456789012:role/x\"\nstorage_backend = \"s3", "arn:aws:iam::123456789012:role/x y"} {
+		c := config.Default()
+		if _, err := applyStorageRole(c, bad); err == nil || c.Fleet.StorageS3RoleARN != "" {
+			t.Errorf("%q was taken: role %q, err %v", bad, c.Fleet.StorageS3RoleARN, err)
+		}
+	}
+}

@@ -112,6 +112,10 @@ type FirstBootResult struct {
 	// StackName is the CloudFormation stack, from the instance's supavise:stack-name tag; empty
 	// when the instance has no tags.
 	StackName string
+	// StorageRoleARN is the instance's supavise:storage-role tag as it stands: the IAM role Storage's
+	// credentials come from. Empty when the instance has none. It is not checked here; the installer
+	// checks that it is a role ARN before it writes it to the configuration.
+	StorageRoleARN string
 	// Formatted is true when the volume was blank and first boot made the file system.
 	Formatted bool
 }
@@ -174,6 +178,7 @@ func (f *FirstBoot) Run(ctx context.Context) (*FirstBootResult, error) {
 	}
 	if tags, err := f.IMDS.Tags(ctx); err == nil {
 		res.StackName = tags["supavise:stack-name"]
+		res.StorageRoleARN = tags["supavise:storage-role"]
 	}
 	f.say("EC2 instance %s", res.InstanceID)
 

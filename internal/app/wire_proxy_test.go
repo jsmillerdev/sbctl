@@ -30,8 +30,8 @@ func (rttMesh) Dial(context.Context, string, mesh.Header) (net.Conn, error) {
 func (rttMesh) Call(context.Context, string, string, string, any, any) error {
 	return mesh.ErrNoSession
 }
-func (rttMesh) Connected(string) bool { return true }
-func (rttMesh) Peers() []string       { return []string{"n2"} }
+func (rttMesh) Connected(node string) bool { return node == "n1" } // a session to n1 only
+func (rttMesh) Peers() []string            { return []string{"n2"} }
 func (rttMesh) RTT(node string) (time.Duration, bool) {
 	if node == "n2" {
 		return 7 * time.Millisecond, true
@@ -97,6 +97,14 @@ func TestWireProxyGivesTheProxyItsClusterAndFollowsTheRole(t *testing.T) {
 	if d, ok := c.RTT("n2"); !ok || d != 7*time.Millisecond {
 		t.Errorf("RTT = %v %v", d, ok)
 	}
+	// What the proxy asks of the cluster follows the membership and the mesh: this node is connected to itself
+	// and to the nodes it has a session with, a follower is not the leader, and nothing is fenced yet.
+	if c.Leader == nil || c.Connected == nil || c.Fenced == nil {
+		t.Fatalf("Leader, Connected and Fenced are not set: %+v", c)
+	}
+	if c.Leader() || c.Fenced() || !c.Connected("n2") || !c.Connected("n1") || c.Connected("n3") {
+		t.Errorf("a follower: leader %v, fenced %v, connected n2/n1/n3 %v/%v/%v", c.Leader(), c.Fenced(), c.Connected("n2"), c.Connected("n1"), c.Connected("n3"))
+	}
 	role, ok := Get[*proxy.CertRole](w)
 	if !ok || role != c.Certs.Role {
 		t.Fatal("the certificate role is not provided")
@@ -122,8 +130,14 @@ func TestWireProxyGivesTheProxyItsClusterAndFollowsTheRole(t *testing.T) {
 	}
 	ms.Set(snapshotOf(cluster.RoleLeader))
 	eventually("the promotion", true)
+	if !c.Leader() || c.Fenced() {
+		t.Errorf("after the promotion: leader %v, fenced %v", c.Leader(), c.Fenced())
+	}
 	ms.Set(cluster.Snapshot{Self: registry.Node{ID: "n1"}, Leader: "n2", Epoch: 4, Role: cluster.RoleFenced})
 	eventually("the fence", false)
+	if c.Leader() || !c.Fenced() {
+		t.Errorf("after the fence: leader %v, fenced %v", c.Leader(), c.Fenced())
+	}
 	cancel()
 	if err := g.Wait(); err != nil {
 		t.Fatal(err)

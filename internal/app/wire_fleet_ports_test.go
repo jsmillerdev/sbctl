@@ -332,3 +332,24 @@ func TestArtifactsCheckLooksAtTheTargetOnlyWhenItIsThisNode(t *testing.T) {
 		t.Fatalf("a manager that cannot render blocks the move: %+v", got)
 	}
 }
+
+// A project that is moving stays RESTARTING until the move ends, and the move registers it at the new home
+// through this adapter meanwhile: the adapter does not ask whether the project is active.
+func TestProjectTenantsEnsureRegistersAProjectThatIsRestarting(t *testing.T) {
+	fl, deps, logs, _ := tenantFixture(t)
+	peers := &recPeers{}
+	pt := &projectTenants{fleet: fl, deps: deps, peers: peers, log: quiet()}
+	const ref = "abcdefghijklmnopqrst"
+	for _, s := range []registry.Status{registry.StatusRestarting, registry.StatusComingUp} {
+		if err := deps.Registry.SetProjectStatus(context.Background(), ref, s); err != nil {
+			t.Fatal(err)
+		}
+		*logs, peers.tenants = nil, nil
+		if err := pt.EnsureTenant(context.Background(), ref); err != nil {
+			t.Fatal(err)
+		}
+		if len(*logs) != 2 || len(peers.tenants) != 1 {
+			t.Fatalf("a %s project: calls %v, peers %v", s, *logs, peers.tenants)
+		}
+	}
+}

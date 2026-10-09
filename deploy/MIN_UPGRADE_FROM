@@ -3,6 +3,7 @@
 # `supavise upgrade` and `supavise self-update` refuse to skip past it: a node on an older
 # version installs this version first. Raise it in the commit that makes a release depend on
 # something the previous ones did not do (a data migration that is not backward compatible, a
-# removed unit, a changed on-disk layout); leave it alone otherwise. Nothing is released yet, so
-# every version may upgrade.
+# removed unit, a changed on-disk layout); leave it alone otherwise. v0.1.0, v0.1.1 and v0.1.3 are
+# released and each may upgrade straight to the release being built (a v0.1.x registry is migrated
+# by the first start of the new daemon), so no version is excluded.
 v0.0.0

@@ -596,6 +596,8 @@ wait_daemon; [[ $(daemon_version) == *v0.0.10* ]] || fail "the daemon runs $(dae
 wait_status "$REF" ACTIVE_HEALTHY 180; wait_status "$REF2" ACTIVE_HEALTHY 180
 journalctl --no-pager -u supavise.service | grep -q "postgres settings changed; the restart waits for the upgrade's rollout" || fail "the daemon did not hold the restart of the clusters back for the rollout"
 for r in "$REF" "$REF2"; do
+  # A cluster the rollout restarted last may still be coming up when the upgrade returns: look for a minute.
+  for ((i = 0; i < 60; i++)); do [[ $(pg_sock "$r" "show max_connections" 2>/dev/null || true) == 61 ]] && break; sleep 1; done
   [[ $(pg_sock "$r" "show max_connections") == 61 ]] || fail "$r: PostgreSQL still runs its old settings"
 done
 [[ $(pg_pid "$REF") != "$PG_PID" && $(pg_pid "$REF2") != "$PG_PID2" ]] || fail "a project's PostgreSQL was not restarted by the rollout"

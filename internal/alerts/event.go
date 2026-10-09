@@ -21,12 +21,11 @@ const (
 	KindUpgradeFailed    = "upgrade_failed"
 
 	// Read replicas and the second server. A replica's Ref is the project it copies.
-	KindReplicaUnhealthy    = "replica_unhealthy"     // a replica is behind the limit, its receiver is down or its PostgREST does not answer
-	KindReplicaLag          = "replica_lag"           // replication lag is high but the replica is still within its limit
-	KindReplicaNeedsRebuild = "replica_needs_rebuild" // a replica fell behind the WAL archive and no base backup can reseed it
-	KindReplicaCapacity     = "replica_capacity"      // a node has no room for a replica that [replicas] default = "all" wants
-	KindNodeUnreachable     = "node_unreachable"      // a peer node does not answer the mesh
-	KindNodeVersionSkew     = "node_version_skew"     // a peer runs a release outside the window this one can work with
+	KindReplicaUnhealthy = "replica_unhealthy" // a replica is behind the limit, its receiver is down or its PostgREST does not answer
+	KindReplicaLag       = "replica_lag"       // replication lag is high but the replica is still within its limit
+	KindReplicaCapacity  = "replica_capacity"  // a node has no room for a replica that [replicas] default = "all" wants
+	KindNodeUnreachable  = "node_unreachable"  // a peer node does not answer the mesh
+	KindNodeVersionSkew  = "node_version_skew" // a peer runs a release outside the window this one can work with
 
 	// Failover. These three are announcements, like the upgrade ones.
 	KindFailoverStarted   = "failover_started"
@@ -42,7 +41,6 @@ const (
 	KindInfraBehind      = "infra_behind"       // the AWS stack lacks resources this release needs
 	KindHostNotConverged = "host_not_converged" // `supavise system converge` has not run for this release
 	KindStandbyBehind    = "standby_behind"     // the registry is newer than this binary, which leaves running instances alone
-	KindStorageNotS3     = "storage_not_s3"     // a cluster feature needs Storage on S3 and the node still uses files
 
 	KindTest = "test"
 )

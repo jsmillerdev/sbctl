@@ -1101,7 +1101,10 @@ func (e *Engine) ensureTenantsOf(ctx context.Context, ref string, peers bool) er
 	if err != nil {
 		return err
 	}
-	if !active(p.Status) {
+	// A project that is moving to another home stays RESTARTING until the move ends, and the move registers
+	// it at the new home while it is (peers is the call of a move). The sweep at start leaves every project
+	// that is not active to its own operation.
+	if !active(p.Status) && !(peers && p.Status == registry.StatusRestarting) {
 		return nil // paused, upgrading or being restored since the list: its own operation registers it
 	}
 	keys, err := e.loadKeys(ctx, ref)

@@ -39,6 +39,14 @@ func OpenStandbyPlane(cfg *config.Config, o OpenOptions) (pl *PostgresPlane, clo
 	return NewPostgresPlane(cfg, sup, arts, registry.NewMemory(), o.planeOptions()), closeUnits, nil
 }
 
+// StartSystemDatabase starts the system cluster from the files it was rendered with and waits until it
+// answers. It reads neither the registry nor a credential: the registry is this cluster, and its
+// credentials are in it. A move that stopped the system cluster starts it again this way (the old leader of
+// `supavise failover --abort` and of a resume), when nothing can be read yet.
+func (pl *PostgresPlane) StartSystemDatabase(ctx context.Context) error {
+	return pl.startRendered(ctx, systemProject(pl.cfg, nil))
+}
+
 // SystemStandbyPlan describes the standby of the system cluster to build (peerapi.SystemBootstrap).
 type SystemStandbyPlan struct {
 	// Identifier is the replica row of the system cluster on this node ("system-rr-<region>-<id6>").

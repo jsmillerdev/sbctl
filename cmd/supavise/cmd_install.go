@@ -195,14 +195,14 @@ func runInstall(cmd *cobra.Command, o installOptions) error {
 	}
 	// The data volume and the bind mount of /etc/supavise come before anything reads or writes
 	// either: a replacement instance finds config.toml and the master key on the volume.
-	var stackName string
+	var stackName, storageRole string
 	if o.AWSFirstBoot {
 		in.step("preparing the EC2 data volume")
 		res, err := firstBootAWS(in.ctx, in.out, o)
 		if err != nil {
 			return err
 		}
-		stackName = res.StackName
+		stackName, storageRole = res.StackName, res.StorageRoleARN
 	}
 	// A bad passphrase file fails here, before the install changes anything.
 	var keyPass []byte
@@ -220,6 +220,14 @@ func runInstall(cmd *cobra.Command, o installOptions) error {
 	o.Fresh = !existed
 	if err := applyInstall(cfg, o, changed); err != nil {
 		return err
+	}
+	// On AWS Storage gets short-lived credentials from the stack's role, not a stored key.
+	if storageRole != "" {
+		if note, err := applyStorageRole(cfg, storageRole); err != nil {
+			in.warn("the instance's supavise:storage-role tag is not used: %v", err)
+		} else if note != "" {
+			in.step("%s", note)
+		}
 	}
 	in.cfg = cfg
 	publicIP := cfg.PublicIP
