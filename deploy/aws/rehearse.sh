@@ -239,8 +239,8 @@ stack_status() {
   "${AWS[@]}" cloudformation describe-stacks --stack-name "$STACK" --query 'Stacks[0].StackStatus' --output text
 }
 settled_status() { # waits up to 30 minutes for the stack to stop changing and prints its status
-  local st="" i
-  for i in $(seq 1 120); do
+  local st=""
+  for _ in $(seq 1 120); do
     st=$(stack_status || true)
     case $st in
       *_IN_PROGRESS) sleep 15 ;;
