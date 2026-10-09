@@ -362,6 +362,7 @@ func NewServer(d Deps) (*Server, error) {
 	s.auth.sso = s.sso.Admit
 	s.auth.ssoUser = s.sso.AdmitUser
 	s.oauth = s.oauthService(d.OAuth)
+	s.auth.oauth = newOAuthAuthn(s)
 	h, err := s.build()
 	if err != nil {
 		return nil, err

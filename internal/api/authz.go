@@ -20,6 +20,10 @@ import (
 // Default deny: a write that no rule names needs the permission to update the organization
 // (Owner) or the project's settings (Administrator), and a write outside any organization or
 // project needs the Owner role somewhere.
+//
+// An OAuth access token passes one more gate before any of this, the scope gate (oauth_scopes.go),
+// and then is checked like its user: its Access is the user's live one restricted to the grant's
+// organization (oauth_authn.go).
 
 type needKind int
 
@@ -162,6 +166,9 @@ var routeRules = []routeRule{
 	rule("", "/platform/organizations/preview-creation", nAny),
 	rule("", "/platform/organizations/onboarding-survey", nAny),
 	rule("", "/v1/oauth/**", nAny),
+	// Describing an authorization request is the first call of Studio's consent page: Owners and
+	// Administrators only, because only they may approve (the spec: organization_admin_read).
+	rule("R", "/platform/oauth/authorizations/{id}", nOperator),
 	rule("", "/v1/snippets/**", nAny),
 	rule("R", "/platform/integrations/{slug}", nAny),
 	// The node's health in detail: node-wide, so no organization or project to check against.
@@ -393,6 +400,10 @@ var errMFARequired = errf(http.StatusForbidden, "MFA required: sign in with a se
 // the request context carrying the loaded access. key is the route in "METHOD /template"
 // form, empty for a path that no spec lists.
 func (s *Server) authorize(r *http.Request, key string, p *Principal) (context.Context, error) {
+	// An OAuth token first: the scope gate decides whether the route is open to it at all.
+	if err := s.oauthScopeGate(key, p); err != nil {
+		return r.Context(), err
+	}
 	method, tmpl := r.Method, r.URL.Path
 	if key != "" {
 		method, tmpl, _ = strings.Cut(key, " ")
@@ -515,8 +526,9 @@ func (s *Server) branchParent(ctx context.Context, idOrRef string) (*registry.Pr
 }
 
 // gateOrg refuses callers who do not belong to the organization, and dashboard sessions
-// without a second factor when the organization requires MFA. Personal access tokens are not
-// interactive sessions and carry no aal; they are not held to the requirement.
+// without a second factor when the organization requires MFA. Personal access tokens and OAuth
+// access tokens are not interactive sessions and carry no aal; they are not held to the
+// requirement (the second factor is checked when they are minted).
 func (s *Server) gateOrg(ctx context.Context, p *Principal, a *members.Access, org members.OrgRef) error {
 	if !a.IsMember(org.ID) {
 		return errf(http.StatusForbidden, "You are not a member of this organization")

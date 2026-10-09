@@ -14,6 +14,7 @@ behavior are documented in `internal/api/README.md` (Members, roles and permissi
 | `permission.go` | `Permission` (the spec's `AccessControlPermission`), `Check` with the semantics of Studio's `doPermissionsCheck`, a small json-logic evaluator |
 | `store.go`, `memory.go`, `pg.go` | the `Store` interface, a memory and a Postgres implementation (registry migration `0900_members.sql`); `Store.Update` runs a change in a transaction that locks the organization |
 | `service.go` | `Service`: `Access` (what a user may do), role changes with the checks Studio's Team page implies, the last-Owner rule, invitations (token hash, expiry, single use), the legacy-account rule, SSO default roles |
+| `access_restrict.go` | `Access.Restrict(orgID)`: a copy of an `Access` that knows one organization, for credentials bound to an organization. The API applies it to OAuth access tokens (`internal/api`, `oauth_authn.go`) on every request, from the user's live roles, so a token never sees another organization and a role change applies to the next call |
 
 ```go
 svc := &members.Service{Store: members.NewPG(pool), Orgs: listOrgs, AccountCreatedAt: lookup}
