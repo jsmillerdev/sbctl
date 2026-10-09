@@ -96,7 +96,7 @@ sudo -u supavise supavise users list                                       # who
 sudo -u supavise supavise users role dev@example.com administrator         # change a role (or restore an owner)
 sudo -u supavise supavise users remove dev@example.com                     # ends their access at once, removes memberships and the access tokens they made
 sudo -u supavise supavise orgs list
-sudo -u supavise supavise orgs delete acme --yes    # deletes its projects (each with a final backup), members, invitations and SSO setup; without --yes it only lists them
+sudo -u supavise supavise orgs delete acme --yes    # deletes its projects (read replicas first, then a final backup each), members, invitations and SSO setup; without --yes it only lists them
 ```
 
 An address with no account gets the claim page with the token filled in (the invitee picks a password and joins with the invited role); one with an account gets the dashboard's invitation page. An organization always keeps one owner (`users remove` refuses to delete the only owner without `--force`), and the node's last organization is never deleted.
