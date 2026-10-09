@@ -2,7 +2,6 @@ package app
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log/slog"
 	"reflect"
@@ -15,7 +14,6 @@ import (
 	"github.com/supavise/supavise/internal/config"
 	"github.com/supavise/supavise/internal/failover"
 	"github.com/supavise/supavise/internal/lifecycle"
-	"github.com/supavise/supavise/internal/notimpl"
 	"github.com/supavise/supavise/internal/placement"
 	"github.com/supavise/supavise/internal/proxy"
 	"github.com/supavise/supavise/internal/registry"
@@ -143,16 +141,11 @@ func Get[T any](w *Wire) (T, bool) {
 	return v, ok
 }
 
-// run calls the hooks in order, then checks the ports of the cluster (verifyPorts). A hook that
-// returns notimpl.Err is skipped; any other error stops the daemon before it serves.
+// run calls the hooks in order, then checks the ports of the cluster (verifyPorts). An error from
+// a hook stops the daemon before it serves.
 func (w *Wire) run(ctx context.Context) error {
 	for _, h := range wireHooks {
-		err := h.fn(ctx, w)
-		switch {
-		case err == nil:
-		case errors.Is(err, notimpl.Err):
-			w.Log.Debug("wire hook not implemented", "hook", h.name)
-		default:
+		if err := h.fn(ctx, w); err != nil {
 			return fmt.Errorf("serve: %s: %w", h.name, err)
 		}
 	}

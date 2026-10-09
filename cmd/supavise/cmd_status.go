@@ -18,7 +18,6 @@ import (
 	"github.com/supavise/supavise/internal/health"
 	"github.com/supavise/supavise/internal/infra"
 	"github.com/supavise/supavise/internal/lifecycle"
-	"github.com/supavise/supavise/internal/notimpl"
 	"github.com/supavise/supavise/internal/units"
 )
 
@@ -113,13 +112,10 @@ type statusJSON struct {
 }
 
 // collectStatusSections reads each block. A block that cannot be read is named in Errors and
-// does not stop the others; a stub that is not implemented yet is skipped.
+// does not stop the others.
 func collectStatusSections(ctx context.Context, cfg *config.Config) statusSections {
 	var s statusSections
 	fail := func(name string, err error) {
-		if errors.Is(err, notimpl.Err) {
-			return
-		}
 		if s.Errors == nil {
 			s.Errors = map[string]string{}
 		}

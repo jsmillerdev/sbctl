@@ -13,7 +13,6 @@ import (
 	"github.com/supavise/supavise/internal/health"
 	"github.com/supavise/supavise/internal/hostsetup"
 	"github.com/supavise/supavise/internal/infra"
-	"github.com/supavise/supavise/internal/notimpl"
 )
 
 // run executes the CLI with args and returns what it printed and the error. The commands are
@@ -72,9 +71,9 @@ func hasCommandLine(help, name string) bool {
 	return false
 }
 
-// replicas add needs a region of its own: a missing flag is a usage error, not a stub.
+// replicas add needs a region of its own: a missing flag is a usage error.
 func TestReplicasAddNeedsARegion(t *testing.T) {
-	if _, err := run(t, "replicas", "add", "abcdefghijklmnopqrst"); err == nil || errors.Is(err, notimpl.Err) {
+	if _, err := run(t, "replicas", "add", "abcdefghijklmnopqrst"); err == nil {
 		t.Errorf("replicas add without --region: %v", err)
 	}
 }
