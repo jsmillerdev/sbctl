@@ -32,7 +32,7 @@ const (
 	// route takes 8 MB.
 	mcpMaxBody = 8 << 20
 	// mcpRatePerMinute and mcpMaxInFlight are the limits of one grant or personal access token on this
-	// node (section 2.14 of the plan).
+	// node.
 	mcpRatePerMinute = 600
 	mcpMaxInFlight   = 8
 	mcpRateWindow    = time.Minute
@@ -57,7 +57,7 @@ const mcpAllow = "GET, POST, DELETE, OPTIONS"
 // client sends, an access_token included, is dropped.
 var mcpQueryKeys = [...]string{"project_ref", "read_only", "features", "skip_elicitations"}
 
-// mcpOAuthTokenRe is the shape of an OAuth access token (secrets/oauth_tokens.go).
+// mcpOAuthTokenRe is the shape of an OAuth access token: "sbp_oauth_" and 40 hex digits.
 var mcpOAuthTokenRe = regexp.MustCompile(`^sbp_oauth_[a-f0-9]{40}$`)
 
 // MCPGate is proxy.Options.MCPGate: the gate in front of the remote MCP endpoint (api.<domain>/mcp)
@@ -80,8 +80,9 @@ func (s *Server) MCPGate(w http.ResponseWriter, r *http.Request) (rawQuery strin
 		writeError(w, errf(http.StatusNotFound, "Not Found"))
 		return "", false
 	}
-	// The open CORS policy of the OAuth endpoints (section 2.2), so that browser clients can read the
-	// refusals, WWW-Authenticate included. The proxy strips Studio's own Access-Control headers.
+	// The open CORS policy of the OAuth endpoints (any origin, no credentials), so that browser clients
+	// can read the refusals, WWW-Authenticate included. The proxy strips Studio's own Access-Control
+	// headers.
 	h := w.Header()
 	h.Set("Access-Control-Allow-Origin", "*")
 	h.Set("Access-Control-Expose-Headers", "WWW-Authenticate, Mcp-Session-Id")
@@ -101,6 +102,11 @@ func (s *Server) MCPGate(w http.ResponseWriter, r *http.Request) (rawQuery strin
 	token := mcpBearer(r)
 	if token == "" {
 		s.mcpUnauthorized(w, "")
+		return "", false
+	}
+	// Two credentials are not one request: the gate would check the first and Studio might read the other.
+	if len(r.Header.Values("Authorization")) > 1 {
+		s.mcpUnauthorized(w, mcpMsgBadToken)
 		return "", false
 	}
 	caller, desc, err := s.mcpAuthenticate(r.Context(), token)
@@ -195,7 +201,7 @@ func (s *Server) mcpOAuthCaller(ctx context.Context, token string) (*mcpCaller, 
 	}
 	info, err := s.oauth.LookupAccess(ctx, token)
 	switch {
-	case errors.Is(err, oauth.ErrNotFound):
+	case errors.Is(err, oauth.ErrNotFound), err == nil && info == nil:
 		return nil, mcpMsgBadToken, nil
 	case err != nil:
 		return nil, "", err

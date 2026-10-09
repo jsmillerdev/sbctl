@@ -81,6 +81,11 @@ func (a *mcpAuthority) revocations() []mcpRevocation {
 	return append([]mcpRevocation(nil), a.revoked...)
 }
 
+// mcpNilInfo is a service whose lookup finds nothing and reports no error.
+type mcpNilInfo struct{ oauth.Authority }
+
+func (mcpNilInfo) LookupAccess(context.Context, string) (*oauth.AccessInfo, error) { return nil, nil }
+
 const (
 	mcpResourceMetadata = "https://api.example.test/.well-known/oauth-protected-resource/mcp"
 	mcpResource         = "https://api.example.test/mcp"
@@ -248,9 +253,29 @@ func TestMCPGateAuth(t *testing.T) {
 				t.Errorf("%s: a challenge on success", name)
 			}
 		}
+		// Two Authorization headers are refused even when both are good: Studio might read the other.
+		req := httptest.NewRequest("POST", "https://api.example.test/mcp", strings.NewReader(`{}`))
+		req.Header.Add("Authorization", "Bearer "+f.oauth)
+		req.Header.Add("Authorization", "Bearer "+f.pat)
+		rec := httptest.NewRecorder()
+		if _, ok := f.srv.MCPGate(rec, req); ok || rec.Code != 401 || rec.Header().Get("WWW-Authenticate") != mcpBadChallenge {
+			t.Errorf("two credentials: ok=%v %d %v", ok, rec.Code, rec.Header())
+		}
 		// The scheme is case-insensitive; the token is not trimmed of anything but spaces.
 		if g := f.gate("GET", "/mcp", "", "Authorization", "bearer "+f.oauth); !g.ok {
 			t.Errorf("lower-case scheme: %d %q", g.rec.Code, g.body())
+		}
+	})
+
+	t.Run("a lookup with no answer refuses", func(t *testing.T) {
+		g := f.gate("POST", "/mcp", `{}`, mcpAuthz("sbp_oauth_"+strings.Repeat("00", 20))...)
+		if g.ok || g.rec.Code != 401 {
+			t.Errorf("ok=%v %d", g.ok, g.rec.Code)
+		}
+		f.srv.oauth = mcpNilInfo{}
+		defer func() { f.srv.oauth = f.auth }()
+		if g := f.gate("POST", "/mcp", `{}`, mcpAuthz(f.oauth)...); g.ok || g.rec.Code != 401 {
+			t.Errorf("a store that returns neither a token nor an error: ok=%v %d", g.ok, g.rec.Code)
 		}
 	})
 
