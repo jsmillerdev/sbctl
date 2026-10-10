@@ -6,7 +6,7 @@ artifacts:
   auth: auth-v2.195.0-r1
   postgrest: postgrest-v16.4-r0
   pooler: pooler-v2.9.13-r1
-  realtime: realtime-v2.140.10-r0
+  realtime: realtime-v2.143.3-r0
   storage: storage-v1.79.36-r0
   pgmeta: pgmeta-v0.100.0-r0
   imgproxy: imgproxy-v3.26.0-r0
