@@ -3,7 +3,7 @@
 # conformance suite gates the merge. Never hand-guess a tag: copy it from the releases page.
 artifacts:
   postgres: postgres-17.11.0.004-r1
-  auth: auth-v2.195.0-r1
+  auth: auth-v2.197.0-r0
   postgrest: postgrest-v16.4-r0
   pooler: pooler-v2.9.13-r1
   realtime: realtime-v2.140.10-r0
