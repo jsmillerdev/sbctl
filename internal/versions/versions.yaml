@@ -7,7 +7,7 @@ artifacts:
   postgrest: postgrest-v16.4-r0
   pooler: pooler-v2.9.13-r1
   realtime: realtime-v2.140.10-r0
-  storage: storage-v1.79.36-r0
+  storage: storage-v1.81.0-r0
   pgmeta: pgmeta-v0.100.0-r0
   imgproxy: imgproxy-v3.26.0-r0
   edge-runtime: edge-runtime-v1.77.4-r0
